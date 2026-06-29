@@ -58,6 +58,7 @@ def _install_mocks(monkeypatch):
         return "068000000000001AAA"
 
     monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch)
+    monkeypatch.setattr(server.sf_client, "fetch_watermark_png", lambda account_id=None, sf=None: None)
     monkeypatch.setattr(server.sf_client, "upload_masked_pdf", fake_upload)
     return captured
 

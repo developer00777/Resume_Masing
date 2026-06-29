@@ -139,15 +139,21 @@ def fetch_watermark_png(
     # 1) Per-client: File linked to the Account record.
     if account_id:
         safe_id = account_id.replace("'", "")
-        res = sf.query(
-            "SELECT cv.Id, cv.VersionData FROM ContentDocumentLink cdl "
-            "JOIN ContentVersion cv ON cv.ContentDocumentId = cdl.ContentDocumentId "
-            f"WHERE cdl.LinkedEntityId = '{safe_id}' AND cv.Title = '{safe_title}' "
-            "AND cv.IsLatest = true ORDER BY cv.CreatedDate DESC LIMIT 1"
+        links = sf.query(
+            "SELECT ContentDocumentId FROM ContentDocumentLink "
+            f"WHERE LinkedEntityId = '{safe_id}'"
         )
-        recs = res.get("records", [])
-        if recs:
-            return _download_version_data(sf, recs[0]["VersionData"])
+        doc_ids = [r["ContentDocumentId"] for r in links.get("records", [])]
+        if doc_ids:
+            in_list = ",".join(f"'{d}'" for d in doc_ids)
+            res = sf.query(
+                "SELECT Id, VersionData FROM ContentVersion "
+                f"WHERE ContentDocumentId IN ({in_list}) AND Title = '{safe_title}' "
+                "AND IsLatest = true ORDER BY CreatedDate DESC LIMIT 1"
+            )
+            recs = res.get("records", [])
+            if recs:
+                return _download_version_data(sf, recs[0]["VersionData"])
 
     # 2) Global fallback: any ContentVersion with this title.
     res = sf.query(
