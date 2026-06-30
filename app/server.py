@@ -177,199 +177,153 @@ def popup_page() -> str:
 _POPUP_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Resume Masking</title>
+<title>Mask Profile</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #fff; color: #1a1a2e; padding: 24px; }
-  h1 { font-size: 20px; margin-bottom: 8px; color: #2563eb; }
-  h2 { font-size: 15px; margin: 20px 0 12px; color: #374151; }
-  .section { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .section-header h3 { font-size: 14px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
-  label { display: block; font-size: 13px; color: #374151; margin-bottom: 4px; }
-  input, select { width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; margin-bottom: 12px; }
-  input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,0.15); }
-  .btn { padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer; font-size: 14px; font-weight: 500; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #f5f7fa; color: #1a1a2e; padding: 24px; }
+  h1 { font-size: 22px; margin-bottom: 16px; color: #1a1a2e; font-weight: 600; }
+
+  .card { background: #fff; border: 1px solid #e2e6ef; border-radius: 10px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card-title { font-size: 14px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; font-weight: 600; }
+
+  .btn { display: inline-block; padding: 10px 24px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; font-weight: 600; text-align: center; width: 100%; }
   .btn-primary { background: #2563eb; color: white; }
   .btn-primary:hover { background: #1d4ed8; }
-  .btn-secondary { background: #e5e7eb; color: #374151; }
-  .btn-secondary:hover { background: #d1d5db; }
-  .btn-row { display: flex; gap: 8px; margin-top: 8px; }
-  .file-upload { border: 2px dashed #d1d5db; border-radius: 8px; padding: 20px; text-align: center; cursor: pointer; }
-  .file-upload:hover { border-color: #2563eb; background: #f0f4ff; }
-  table { width: 100%; border-collapse: collapse; }
-  th { padding: 8px 12px; text-align: left; font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #e5e7eb; }
-  td { padding: 10px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
-  .badge-green { background: #d1fae5; color: #065f46; }
-  .badge-yellow { background: #fef3c7; color: #92400e; }
-  .badge-gray { background: #f3f4f6; color: #6b7280; }
-  .badge-red { background: #fee2e2; color: #991b1b; }
-  .empty { padding: 24px; text-align: center; color: #9ca3af; font-size: 13px; }
-  .mono { font-family: monospace; font-size: 12px; }
-  #preview-img { max-width: 200px; max-height: 100px; margin-top: 8px; display: none; border: 1px solid #e5e7eb; border-radius: 4px; }
-  .success { color: #065f46; background: #d1fae5; padding: 8px 12px; border-radius: 6px; margin-top: 8px; font-size: 13px; display: none; }
-  .error { color: #991b1b; background: #fee2e2; padding: 8px 12px; border-radius: 6px; margin-top: 8px; font-size: 13px; display: none; }
-</style></head>
-<body>
-<h1>🔒 Resume Masking</h1>
-<p style="color:#6b7280;font-size:13px;margin-bottom:16px;">Redact PII + overlay client watermark</p>
+  .btn-primary:disabled { background: #93b4f5; cursor: not-allowed; }
 
-<!-- Watermark Upload Section -->
-<div class="section">
-  <div class="section-header"><h3>Client Watermark</h3></div>
+  table { width: 100%; border-collapse: collapse; }
+  th { padding: 10px 12px; text-align: left; font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid #e2e6ef; font-weight: 600; }
+  td { padding: 10px 12px; border-bottom: 1px solid #f0f2f5; font-size: 13px; color: #374151; }
+  .empty { padding: 24px; text-align: center; color: #9ca3af; font-size: 13px; }
+
+  .status { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; display: inline-block; }
+  .status-pending { background: #fef3c7; color: #92400e; }
+  .status-done { background: #d1fae5; color: #065f46; }
+  .status-failed { background: #fee2e2; color: #991b1b; }
+
+  .file-upload { border: 2px dashed #d1d5db; border-radius: 8px; padding: 20px; text-align: center; cursor: pointer; margin-bottom: 12px; }
+  .file-upload:hover { border-color: #2563eb; background: #f0f4ff; }
+
+  #preview-img { max-width: 200px; max-height: 80px; margin: 8px auto; display: none; border: 1px solid #e2e6ef; border-radius: 4px; }
+  .success { color: #065f46; background: #d1fae5; padding: 10px 14px; border-radius: 6px; margin-top: 10px; font-size: 13px; display: none; }
+  .error { color: #991b1b; background: #fee2e2; padding: 10px 14px; border-radius: 6px; margin-top: 10px; font-size: 13px; display: none; }
+
+  input, select { width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; margin-bottom: 10px; }
+  input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,0.15); }
+  label { display: block; font-size: 12px; color: #6b7280; margin-bottom: 4px; font-weight: 500; }
+</style>
+</head>
+<body>
+
+<h1>Mask Profile</h1>
+
+<!-- Watermark Upload -->
+<div class="card">
+  <div class="card-title">Upload Watermark</div>
   <label for="account-id">Account ID</label>
-  <input type="text" id="account-id" placeholder="Salesforce Account Id (e.g. 001...)" />
+  <input type="text" id="account-id" placeholder="Salesforce Account Id" />
   <div class="file-upload" id="upload-zone">
-    <p style="color:#6b7280;font-size:14px;margin-bottom:4px;">Drop watermark image here or click to upload</p>
-    <p style="color:#9ca3af;font-size:12px;">PNG or JPEG, recommended 800x800px max</p>
+    <p style="color:#6b7280;font-size:14px;margin-bottom:4px;">Click to upload custom watermark</p>
+    <p style="color:#9ca3af;font-size:12px;">PNG or JPEG — recommended 800x800px</p>
     <input type="file" id="file-input" accept="image/png,image/jpeg" style="display:none" />
   </div>
   <img id="preview-img" />
-  <div class="btn-row">
-    <button class="btn btn-primary" id="upload-btn" disabled>Upload Watermark</button>
-  </div>
+  <button class="btn btn-primary" id="upload-btn" disabled>Upload Watermark</button>
   <div id="upload-success" class="success"></div>
   <div id="upload-error" class="error"></div>
 </div>
 
-<!-- Job Applicants Table -->
-<div class="section">
-  <div class="section-header"><h3>Job Applicants</h3></div>
+<!-- Job Applicants -->
+<div class="card">
+  <div class="card-title">Job Applicant</div>
   <table><thead><tr>
-    <th>Name</th><th>Job</th><th>Status</th><th>Action</th>
+    <th>Job Applicant</th><th>Status</th>
   </tr></thead><tbody id="applicants-table">
-    <tr><td colspan="4" class="empty">No applicants loaded. Fetch from Salesforce.</td></tr>
+    <tr><td colspan="2" class="empty">No status found!</td></tr>
   </tbody></table>
-  <div style="margin-top:12px;text-align:right;">
-    <button class="btn btn-secondary" id="fetch-applicants">Refresh</button>
-  </div>
 </div>
 
-<!-- Mask Selected -->
-<div class="section" style="display:none;" id="mask-section">
-  <h3>Mask Profile</h3>
-  <p style="font-size:13px;color:#6b7280;margin-bottom:12px;">Click below to mask the selected candidate's resume.</p>
-  <div class="btn-row">
-    <button class="btn btn-primary" id="mask-btn">Mask Profile</button>
-  </div>
-  <div id="mask-result" class="success"></div>
+<!-- Mask Profile Button -->
+<div class="card" style="text-align:center;">
+  <p style="font-size:13px;color:#6b7280;margin-bottom:12px;">Click Below To Mask Candidate Profile:</p>
+  <button class="btn btn-primary" id="mask-btn">Mask Profile</button>
+  <div id="mask-success" class="success"></div>
   <div id="mask-error" class="error"></div>
 </div>
 
 <script>
-const SF_MASK_URL = window.location.origin;
+const SF = window.location.origin;
 
-// File upload handling
+// File upload
 const uploadZone = document.getElementById('upload-zone');
 const fileInput = document.getElementById('file-input');
 const previewImg = document.getElementById('preview-img');
-const accountIdInput = document.getElementById('account-id');
+const accountId = document.getElementById('account-id');
 const uploadBtn = document.getElementById('upload-btn');
 
 uploadZone.addEventListener('click', () => fileInput.click());
-uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.style.borderColor = '#2563eb'; });
-uploadZone.addEventListener('dragleave', () => { uploadZone.style.borderColor = '#d1d5db'; });
-uploadZone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  uploadZone.style.borderColor = '#d1d5db';
-  if (e.dataTransfer.files.length) fileInput.files = e.dataTransfer.files;
-  handleFileSelect();
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = e => { previewImg.src = e.target.result; previewImg.style.display = 'block'; };
+  r.readAsDataURL(f);
+  uploadBtn.disabled = !accountId.value.trim();
+});
+accountId.addEventListener('input', () => {
+  uploadBtn.disabled = !(accountId.value.trim() && fileInput.files.length);
 });
 
-fileInput.addEventListener('change', handleFileSelect);
-
-function handleFileSelect() {
-  const file = fileInput.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    previewImg.src = e.target.result;
-    previewImg.style.display = 'block';
-    uploadZone.querySelector('p:first-child').textContent = file.name;
-    uploadBtn.disabled = !accountIdInput.value.trim();
-  };
-  reader.readAsDataURL(file);
-}
-
-accountIdInput.addEventListener('input', () => {
-  uploadBtn.disabled = !(accountIdInput.value.trim() && fileInput.files.length);
-});
-
-// Upload watermark
 uploadBtn.addEventListener('click', async () => {
-  const formData = new FormData();
-  formData.append('account_id', accountIdInput.value.trim());
-  formData.append('file', fileInput.files[0]);
-  document.getElementById('upload-error').style.display = 'none';
-  document.getElementById('upload-success').style.display = 'none';
-  uploadBtn.disabled = true;
-  uploadBtn.textContent = 'Uploading...';
-
+  const fd = new FormData();
+  fd.append('account_id', accountId.value.trim());
+  fd.append('file', fileInput.files[0]);
+  ['upload-success','upload-error'].forEach(id => document.getElementById(id).style.display = 'none');
+  uploadBtn.disabled = true; uploadBtn.textContent = 'Uploading...';
   try {
-    const resp = await fetch(`${SF_MASK_URL}/watermark/upload`, { method: 'POST', body: formData });
-    const data = await resp.json();
-    if (data.status === 'ok') {
-      document.getElementById('upload-success').textContent = '✅ Watermark uploaded successfully!';
+    const r = await fetch(SF + '/watermark/upload', {method:'POST', body:fd});
+    const d = await r.json();
+    if (d.status === 'ok') {
+      document.getElementById('upload-success').textContent = '✅ Watermark uploaded!';
       document.getElementById('upload-success').style.display = 'block';
     } else {
-      document.getElementById('upload-error').textContent = '❌ ' + (data.detail || 'Upload failed.');
+      document.getElementById('upload-error').textContent = '❌ ' + (d.detail || 'Failed');
       document.getElementById('upload-error').style.display = 'block';
     }
-  } catch (err) {
-    document.getElementById('upload-error').textContent = '❌ Network error: ' + err.message;
+  } catch(e) {
+    document.getElementById('upload-error').textContent = '❌ ' + e.message;
     document.getElementById('upload-error').style.display = 'block';
   } finally {
-    uploadBtn.disabled = false;
-    uploadBtn.textContent = 'Upload Watermark';
+    uploadBtn.disabled = false; uploadBtn.textContent = 'Upload Watermark';
   }
 });
 
-// Fetch applicants (placeholder — real impl queries SF)
-document.getElementById('fetch-applicants').addEventListener('click', async () => {
-  const tbody = document.getElementById('applicants-table');
-  tbody.innerHTML = '<tr><td colspan="4" class="empty">Loading...</td></tr>';
-  // In production: query Salesforce via REST API or parent window
-  // This is a stub — real integration passes data from Salesforce LWC
-  setTimeout(() => {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty">Integrate with Salesforce data source to populate.</td></tr>';
-  }, 500);
-});
-
-// Mask profile button
+// Mask Profile
 document.getElementById('mask-btn').addEventListener('click', async () => {
+  ['mask-success','mask-error'].forEach(id => document.getElementById(id).style.display = 'none');
   const btn = document.getElementById('mask-btn');
-  const result = document.getElementById('mask-result');
-  const error = document.getElementById('mask-error');
-  result.style.display = 'none';
-  error.style.display = 'none';
-  btn.disabled = true;
-  btn.textContent = 'Masking...';
-
+  btn.disabled = true; btn.textContent = 'Masking...';
   try {
-    const resp = await fetch(`${SF_MASK_URL}/mask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const r = await fetch(SF + '/mask', {
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        job_applicant_id: '__SELECTED_ID__',
-        account_id: accountIdInput.value.trim() || null,
-        watermark_text: '',
+        job_applicant_id: document.querySelector('#applicants-table td')?.textContent || 'demo_id',
+        account_id: accountId.value.trim() || null,
       }),
     });
-    const data = await resp.json();
-    if (data.status === 'ok') {
-      result.textContent = `✅ Masked. Regions redacted: ${data.redacted_regions}. Watermark: ${data.watermark_used}`;
-      result.style.display = 'block';
+    const d = await r.json();
+    if (d.status === 'ok') {
+      document.getElementById('mask-success').textContent = '✅ Masked — ' + d.redacted_regions + ' regions, watermark: ' + d.watermark_used;
+      document.getElementById('mask-success').style.display = 'block';
     } else {
-      error.textContent = '❌ ' + (data.detail || 'Masking failed.');
-      error.style.display = 'block';
+      document.getElementById('mask-error').textContent = '❌ ' + (d.detail || 'Failed');
+      document.getElementById('mask-error').style.display = 'block';
     }
-  } catch (err) {
-    error.textContent = '❌ Network error: ' + err.message;
-    error.style.display = 'block';
+  } catch(e) {
+    document.getElementById('mask-error').textContent = '❌ ' + e.message;
+    document.getElementById('mask-error').style.display = 'block';
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Mask Profile';
+    btn.disabled = false; btn.textContent = 'Mask Profile';
   }
 });
 </script>
