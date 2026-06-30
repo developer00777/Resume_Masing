@@ -1,67 +1,85 @@
-"""Resume masking core — TRUE-redact specific PII strings + centered watermark. Offline, no Salesforce.
+"""Resume masking core — TRUE-redact PII + centered watermark IMAGE overlay.
 
-Fixes the freelancer service's two complaints:
-  • TRUE redaction (PyMuPDF apply_redactions) DELETES the glyphs, so masked text can't be copied out
-    (not a black box drawn over selectable text).
-  • Masks ONLY the exact strings you pass (name/phone/email from the on-prem parser) — so it never
-    over-masks experience or academic marks (the client's exact bug).
+Watermark is a client-specific PNG image (logo/brand) stored in Salesforce,
+fetched at mask-time, stamped center-aligned on every page of the resume PDF.
 """
 from __future__ import annotations
-import fitz  # PyMuPDF
+
+import fitz
 
 
-def mask_pdf(in_path: str, out_path: str, mask_strings, watermark_png: bytes | None = None,
-             watermark_text: str = "CONFIDENTIAL") -> int:
-    """Redact every occurrence of each string in `mask_strings`, stamp a centered watermark on every
-    page, save to out_path. Returns the number of redacted regions."""
-    doc = fitz.open(in_path)
-    hits = 0
-    for page in doc:
-        for s in mask_strings:
-            if not s:
-                continue
-            for rect in page.search_for(str(s)):
-                page.add_redact_annot(rect, fill=(0, 0, 0))
-                hits += 1
-        page.apply_redactions()                 # <-- deletes the underlying text, not a cosmetic box
-        _watermark(page, watermark_png, watermark_text)
-    doc.save(out_path, garbage=4, deflate=True)
-    doc.close()
-    return hits
+def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
+                   watermark_png: bytes | None = None,
+                   watermark_text: str = "") -> tuple[bytes, int]:
+    """True-redact PII strings + overlay centered watermark image.
 
+    Args:
+        pdf_bytes: Raw resume PDF bytes.
+        mask_strings: Exact strings to redact (name, phone, email from parser).
+        watermark_png: Client watermark image bytes (PNG/JPEG). Centered on every page.
+        watermark_text: Fallback text watermark if no image provided.
 
-def mask_pdf_bytes(pdf_bytes: bytes, mask_strings, watermark_png: bytes | None = None,
-                   watermark_text: str = "CONFIDENTIAL") -> tuple[bytes, int]:
-    """In-memory variant of mask_pdf for the service: takes the raw PDF as bytes (fetched from
-    Salesforce), redacts every occurrence of each string in `mask_strings`, stamps a centered
-    watermark on every page, returns (masked_pdf_bytes, redacted_region_count).
-
-    Nothing touches disk — the resume never leaves memory (security requirement)."""
+    Returns:
+        (masked_pdf_bytes, redacted_region_count)
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     hits = 0
+
     for page in doc:
+        # Redact each PII string
         for s in mask_strings:
             if not s:
                 continue
             for rect in page.search_for(str(s)):
                 page.add_redact_annot(rect, fill=(0, 0, 0))
                 hits += 1
-        page.apply_redactions()                  # <-- deletes the underlying text, not a cosmetic box
-        _watermark(page, watermark_png, watermark_text)
+        page.apply_redactions()
+
+        # Apply watermark
+        if watermark_png:
+            _watermark_image(page, watermark_png)
+        elif watermark_text:
+            _watermark_text(page, watermark_text)
+
     out = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     return out, hits
 
 
-def _watermark(page, png: bytes | None, text: str):
-    r = page.rect
-    cx, cy = r.width / 2, r.height / 2
-    if png:                                      # real run: client logo PNG bytes fetched from SF
-        w = r.width * 0.45
-        page.insert_image(fitz.Rect(cx - w / 2, cy - w / 2, cx + w / 2, cy + w / 2),
-                          stream=png, overlay=True, keep_proportion=True)
-    else:                                        # fallback: faint centered text watermark
-        tw = fitz.TextWriter(r)
-        fs = 36
-        tw.append(fitz.Point(cx - len(text) * fs * 0.27, cy), text, fontsize=fs)
-        tw.write_text(page, opacity=0.18, color=(0.5, 0.5, 0.5))
+def _watermark_image(page: fitz.Page, png_bytes: bytes) -> None:
+    """Stamp a centered watermark image overlay on the page.
+
+    Image is scaled to ~50% of page width, centered both axes.
+    For semi-transparency, the PNG itself should have an alpha channel.
+    """
+    rect = page.rect
+    target_w = rect.width * 0.50
+    target_h = rect.height * 0.50
+
+    page.insert_image(
+        fitz.Rect(
+            rect.width / 2 - target_w / 2,
+            rect.height / 2 - target_h / 2,
+            rect.width / 2 + target_w / 2,
+            rect.height / 2 + target_h / 2,
+        ),
+        stream=png_bytes,
+        overlay=True,
+        keep_proportion=True,
+    )
+
+
+def _watermark_text(page: fitz.Page, text: str) -> None:
+    """Fallback: centered watermark text if no image provided."""
+    rect = page.rect
+    font_size = rect.width / max(len(text), 1) * 1.5
+    font_size = min(max(font_size, 18), 72)
+
+    page.insert_textbox(
+        rect,
+        text,
+        fontsize=font_size,
+        color=(0.4, 0.4, 0.4),
+        overlay=True,
+        align=fitz.TEXT_ALIGN_CENTER,
+    )
