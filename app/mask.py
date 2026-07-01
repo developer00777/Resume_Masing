@@ -5,7 +5,62 @@ fetched at mask-time, stamped center-aligned on every page of the resume PDF.
 """
 from __future__ import annotations
 
+import re
+
 import fitz
+
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _digits(s: str) -> str:
+    return "".join(_DIGITS_RE.findall(s))
+
+
+def _is_phone_like(s: str) -> bool:
+    return len(_digits(s)) >= 7
+
+
+def _phone_rects(page: fitz.Page, target: str) -> list[fitz.Rect]:
+    """Locate a phone number by its digits, not its literal formatting.
+
+    page.search_for() is an exact substring match, so it misses a phone number
+    whenever mask_strings' formatting differs from what the PDF actually renders
+    (e.g. the on-prem parser stores it normalized as E.164 "+919876543210" while
+    the resume shows "+91 98765 43210" — the original client complaint about
+    phone digits leaking through). This walks each line's words and matches on
+    concatenated digits instead, tolerant of a missing/extra country code or
+    trunk-prefix digit.
+    """
+    target_digits = _digits(target)
+    if len(target_digits) < 7:
+        return []
+
+    words = page.get_text("words")  # (x0, y0, x1, y1, text, block_no, line_no, word_no)
+    lines: dict[tuple[int, int], list] = {}
+    for w in words:
+        lines.setdefault((w[5], w[6]), []).append(w)
+
+    out: list[fitz.Rect] = []
+    for line in lines.values():
+        n = len(line)
+        for i in range(n):
+            if not _digits(line[i][4]):
+                continue  # only start a window on a word that itself has digits —
+                          # otherwise a match can grow backwards into a label like "Phone:"
+            digits = ""
+            for j in range(i, min(i + 6, n)):
+                digits += _digits(line[j][4])
+                if len(digits) > len(target_digits) + 4:
+                    break
+                close_enough = abs(len(digits) - len(target_digits)) <= 3
+                if digits and close_enough and (target_digits in digits or digits in target_digits):
+                    x0 = min(line[k][0] for k in range(i, j + 1))
+                    y0 = min(line[k][1] for k in range(i, j + 1))
+                    x1 = max(line[k][2] for k in range(i, j + 1))
+                    y1 = max(line[k][3] for k in range(i, j + 1))
+                    out.append(fitz.Rect(x0, y0, x1, y1))
+                    break
+    return out
 
 
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
@@ -30,7 +85,10 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         for s in mask_strings:
             if not s:
                 continue
-            for rect in page.search_for(str(s)):
+            rects = page.search_for(str(s))
+            if not rects and _is_phone_like(str(s)):
+                rects = _phone_rects(page, str(s))
+            for rect in rects:
                 page.add_redact_annot(rect, fill=(0, 0, 0))
                 hits += 1
         page.apply_redactions()

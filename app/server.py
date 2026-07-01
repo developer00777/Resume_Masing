@@ -3,27 +3,51 @@
 Custom watermark IMAGE per client, stored in Salesforce as a File
 titled 'ResumeWatermark' on the Account record. Falls back to text.
 
-Flow:
-  Salesforce popup page → POST /mask {job_applicant_id, account_id, mask_strings}
+Flow (RecruitChamp: Job list -> click Job Id -> joined view of that job's requirements
++ eligible professionals -> Mask button on each row of that joined view):
+  join-view Mask button → POST /mask {job_applicant_id, account_id?, mask_strings}
     1. Fetch resume PDF from Salesforce
-    2. Fetch client's watermark image from Salesforce (by account_id)
-    3. True-redact PII strings + overlay centered watermark image
-    4. Upload masked PDF back to Salesforce
-    5. Return {status, masked_content_version_id}
+    2. Resolve the client Account: use account_id if the button passed one, else
+       look it up from Job Applicant's own Account lookup (SCSCHAMPS__Account__c) —
+       the join view already has both the job and the client in scope, so callers
+       don't have to also pass account_id explicitly.
+    3. Fetch that client's watermark image from Salesforce (by the resolved Account)
+    4. True-redact PII strings + overlay centered watermark image
+    5. Upload masked PDF back to Salesforce
+    6. Return {status, masked_content_version_id}
 
-  Admin uploads watermark:
+  Per-client watermark upload (once per client, reused for every job/applicant
+  under that client):
     POST /watermark/upload {account_id, image_file} → stores as 'ResumeWatermark'
+    on the client's Account record.
+
+Auth: this is a public Railway URL (same pattern as RecruitChamp/LakeStream's other
+Salesforce-facing services), so /mask and /watermark/upload are gated by a shared
+secret (MASK_API_KEY, Railway env) checked via the X-API-Key header — otherwise
+anyone with the URL could trigger a masking job or overwrite a client's watermark.
+Off (unenforced) when MASK_API_KEY isn't set, so existing deploys aren't broken
+mid-rollout; /health stays open for Railway's healthcheck.
 """
 from __future__ import annotations
 
+import os
 import re
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import Depends, FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app import mask, sf_client
 
-app = FastAPI(title="Salesforce Resume Masking Service", version="1.2.0")
+app = FastAPI(title="Salesforce Resume Masking Service", version="1.3.0")
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    expected = os.environ.get("MASK_API_KEY", "").strip()
+    if not expected:
+        return  # not configured yet -> unenforced (see module docstring)
+    if x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key.")
 
 
 # --- PII detection fallback ---
@@ -78,7 +102,7 @@ def health() -> dict:
     return {"status": "ok", "salesforce_configured": sf_client.creds_configured()}
 
 
-@app.post("/mask", response_model=MaskResponse)
+@app.post("/mask", response_model=MaskResponse, dependencies=[Depends(require_api_key)])
 def mask_endpoint(req: MaskRequest) -> MaskResponse:
     if not sf_client.creds_configured():
         return MaskResponse(status="error", detail="Salesforce credentials not configured.")
@@ -91,7 +115,7 @@ def mask_endpoint(req: MaskRequest) -> MaskResponse:
     # 1) Fetch resume PDF
     try:
         pdf_bytes = sf_client.fetch_resume_pdf(req.job_applicant_id, sf=sf)
-    except sf_client.ResumeNotFoundError as e:
+    except (sf_client.ResumeNotFoundError, sf_client.InvalidIdError) as e:
         return MaskResponse(status="error", detail=str(e))
 
     # 2) Determine PII to mask
@@ -99,24 +123,30 @@ def mask_endpoint(req: MaskRequest) -> MaskResponse:
     if not mask_strings:
         return MaskResponse(status="error", detail="No PII strings to mask.")
 
-    # 3) Fetch client watermark image from Salesforce
+    # 3) Resolve the client Account (per-client watermark) — if the caller (the
+    #    join-view mask button) didn't already pass account_id, look it up from
+    #    the Job Applicant's own Account lookup. Best-effort: falls through to
+    #    the global/text watermark if it can't be resolved.
+    account_id = req.account_id or sf_client.resolve_account_id(req.job_applicant_id, sf=sf)
+
+    # 4) Fetch client watermark image from Salesforce
     watermark_png = None
     watermark_used = "none"
     try:
-        watermark_png = sf_client.fetch_watermark_png(account_id=req.account_id, sf=sf)
+        watermark_png = sf_client.fetch_watermark_png(account_id=account_id, sf=sf)
         if watermark_png:
-            watermark_used = f"image:account_{req.account_id}" if req.account_id else "image:global"
+            watermark_used = f"image:account_{account_id}" if account_id else "image:global"
     except Exception:
         watermark_png = None
 
-    # 4) True-redact + overlay watermark
+    # 5) True-redact + overlay watermark
     masked_bytes, hits = mask.mask_pdf_bytes(
         pdf_bytes, mask_strings,
         watermark_png=watermark_png,
         watermark_text=req.watermark_text or "CONFIDENTIAL",
     )
 
-    # 5) Upload masked PDF back to Salesforce
+    # 6) Upload masked PDF back to Salesforce
     filename = f"masked_{req.job_applicant_id}.pdf"
     new_id = sf_client.upload_masked_pdf(req.job_applicant_id, masked_bytes, filename, sf=sf)
 
@@ -128,7 +158,8 @@ def mask_endpoint(req: MaskRequest) -> MaskResponse:
     )
 
 
-@app.post("/watermark/upload", response_model=WatermarkUploadResponse)
+@app.post("/watermark/upload", response_model=WatermarkUploadResponse,
+         dependencies=[Depends(require_api_key)])
 async def watermark_upload(
     account_id: str = Form(..., description="Salesforce Account Id."),
     file: UploadFile = File(..., description="Watermark image (PNG/JPEG)."),
@@ -165,13 +196,23 @@ async def watermark_upload(
         return WatermarkUploadResponse(status="error", detail=str(e)[:200])
 
 
-@app.get("/popup")
-def popup_page() -> str:
+@app.get("/popup", response_class=HTMLResponse)
+def popup_page() -> HTMLResponse:
     """HTML popup page for Salesforce embed (Lightning Component / iframe).
 
     Shows: watermark upload form, job applicants table, Mask Profile button.
+    Was returning a bare str, which FastAPI JSON-encodes by default (content-type
+    application/json) -- the iframe would render escaped JSON text, not the page.
+
+    The API key (if MASK_API_KEY is set) is templated in here server-side so the
+    page's own fetch() calls to /mask and /watermark/upload authenticate. Trust
+    boundary: only Salesforce-authenticated users viewing this Lightning page can
+    reach this HTML in the first place; the key still blocks blind internet abuse
+    of the bare Railway URL.
     """
-    return _POPUP_HTML
+    api_key = os.environ.get("MASK_API_KEY", "").strip()
+    html = _POPUP_HTML.replace("__MASK_API_KEY__", api_key)
+    return HTMLResponse(content=html)
 
 
 _POPUP_HTML = """<!DOCTYPE html>
@@ -253,6 +294,8 @@ _POPUP_HTML = """<!DOCTYPE html>
 
 <script>
 const SF = window.location.origin;
+const API_KEY = "__MASK_API_KEY__";  // server-templated; empty string when MASK_API_KEY unset
+const authHeaders = API_KEY ? {'X-API-Key': API_KEY} : {};
 
 // File upload
 const uploadZone = document.getElementById('upload-zone');
@@ -281,7 +324,7 @@ uploadBtn.addEventListener('click', async () => {
   ['upload-success','upload-error'].forEach(id => document.getElementById(id).style.display = 'none');
   uploadBtn.disabled = true; uploadBtn.textContent = 'Uploading...';
   try {
-    const r = await fetch(SF + '/watermark/upload', {method:'POST', body:fd});
+    const r = await fetch(SF + '/watermark/upload', {method:'POST', headers: authHeaders, body:fd});
     const d = await r.json();
     if (d.status === 'ok') {
       document.getElementById('upload-success').textContent = '✅ Watermark uploaded!';
@@ -305,7 +348,7 @@ document.getElementById('mask-btn').addEventListener('click', async () => {
   btn.disabled = true; btn.textContent = 'Masking...';
   try {
     const r = await fetch(SF + '/mask', {
-      method:'POST', headers:{'Content-Type':'application/json'},
+      method:'POST', headers: Object.assign({'Content-Type':'application/json'}, authHeaders),
       body: JSON.stringify({
         job_applicant_id: document.querySelector('#applicants-table td')?.textContent || 'demo_id',
         account_id: accountId.value.trim() || null,

@@ -93,12 +93,29 @@ def _test_no_pii():
     print(f"  [EMPTY] OK — 0 redactions, watermark applied")
 
 
+def _test_phone_format_mismatch():
+    """Parser hands back a normalized phone (E.164, no spaces) that doesn't literally
+    match the formatted phone on the page -- this used to leak the phone entirely
+    (the client's original complaint) because search_for() is exact-substring only."""
+    d = tempfile.mkdtemp()
+    src = f"{d}/in.pdf"
+    _make_sample(src)  # renders "Phone: +91 98765 43210"
+    with open(src, "rb") as f:
+        pdf_bytes = f.read()
+    masked, hits = mask_pdf_bytes(pdf_bytes, ["+919876543210"])  # no spaces
+    txt = "".join(pg.get_text() for pg in fitz.open(stream=masked, filetype="pdf"))
+    assert "98765" not in txt and "43210" not in txt, "phone leaked on format mismatch"
+    assert "Phone:" in txt, "over-masked the label, not just the digits"
+    print(f"  [PHONE FORMAT MISMATCH] OK — {hits} redactions, digits gone, label intact")
+
+
 def main():
     print("MASK TESTS")
     _test_basic_redact()
     _test_watermark_image()
     _test_fallback_text()
     _test_no_pii()
+    _test_phone_format_mismatch()
     print("\nALL PASSED")
 
 

@@ -107,21 +107,77 @@ Repoint the existing **"Generate Masking"** button (Apex / Flow / external actio
 ```
 POST  https://<your-railway-app>.up.railway.app/mask
 Content-Type: application/json
+X-API-Key: <MASK_API_KEY, if you've set one — see below>
 
-{ "job_applicant_id": "{!JobApplicant.Id}" }
+{ "job_applicant_id": "{!SCSCHAMPS__Job_Applicant__c.Id}" }
 ```
+
+(`SCSCHAMPS__Job_Applicant__c` is the RecruitChamp managed-package object — confirmed against the
+live org. Adjust if a different client org uses a different namespace.)
 
 Optionally include `"mask_strings": [...]` (the exact name/phone/email values from the on-prem resume
 parser — preferred, most accurate) and/or `"masking_profile": "<id>"`.
 
 **Security:** Salesforce creds live in the **service env** (Railway secrets), **never** in the button
-URL — the button passes only the Job Applicant Id. The service returns:
+URL — the button passes only the Job Applicant Id. Set `MASK_API_KEY` (Railway env, see
+`.env.example`) once this leaves the pilot client — without it, `/mask` and `/watermark/upload` are
+open to anyone with the Railway URL. Named Credential in Apex lets you attach the header without the
+secret touching Flow/button config. The `/popup` page (browser-embedded) picks up the key
+automatically once it's set — nothing else to wire there. The service returns:
 
 ```json
 { "status": "ok", "masked_content_version_id": "068...", "redacted_regions": 3 }
 ```
 
 The masked PDF appears as a new file on the record. No redirect, no popup.
+
+---
+
+## 5. Custom watermark per client (RecruitChamp flow)
+
+RecruitChamp's page hierarchy: **Job list (per client/company) → click a Job Id → joined view of
+that job's requirements + the eligible professionals matched to it.** The Mask button lives on each
+row of that joined view — one candidate, one job, one client, in scope together.
+
+**One-time setup per client** — upload their logo once:
+
+```
+POST /watermark/upload
+Content-Type: multipart/form-data
+X-API-Key: <MASK_API_KEY>
+
+account_id=<client's Salesforce Account Id>
+file=<their logo, PNG/JPEG>
+```
+
+This stores the image as a Salesforce File titled `ResumeWatermark` on that Account. Re-upload to
+swap the logo later — no code change, no redeploy.
+
+**Every mask call after that just works** — the button only needs to send `job_applicant_id`:
+
+```json
+{ "job_applicant_id": "{!SCSCHAMPS__Job_Applicant__c.Id}" }
+```
+
+The service resolves the client itself: `SCSCHAMPS__Job_Applicant__c.SCSCHAMPS__Account__c` (that
+field already sits on the join row — confirmed against the live org's schema) → fetch that Account's
+`ResumeWatermark` File → stamp it centered on the masked PDF. If the join view already has the
+Account Id handy, pass it explicitly as `"account_id": "..."` and the lookup is skipped. No watermark
+uploaded for that client yet → falls back to the global `ResumeWatermark` File (org-wide default) →
+falls back to plain text (`watermark_text`, default `"CONFIDENTIAL"`).
+
+```
+Job list (per client) ──click Job Id──▶ joined view: job requirements × eligible professionals
+                                              │  Mask button on a row
+                                              ▼
+                                   POST /mask {job_applicant_id}
+                                              │
+                             resolve client Account (auto, from the join row)
+                                              │
+                          fetch that Account's ResumeWatermark File (or fall back)
+                                              │
+                              redact PII + stamp watermark + write back
+```
 
 ---
 

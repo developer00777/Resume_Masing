@@ -57,8 +57,13 @@ def _install_mocks(monkeypatch):
         captured["job_applicant_id"] = job_applicant_id
         return "068000000000001AAA"
 
+    def fake_watermark(account_id=None, sf=None):
+        captured["watermark_account_id"] = account_id
+        return None
+
     monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch)
-    monkeypatch.setattr(server.sf_client, "fetch_watermark_png", lambda account_id=None, sf=None: None)
+    monkeypatch.setattr(server.sf_client, "resolve_account_id", lambda jaid, sf=None: None)
+    monkeypatch.setattr(server.sf_client, "fetch_watermark_png", fake_watermark)
     monkeypatch.setattr(server.sf_client, "upload_masked_pdf", fake_upload)
     return captured
 
@@ -120,3 +125,100 @@ def test_mask_errors_when_creds_missing(monkeypatch):
     body = resp.json()
     assert body["status"] == "error"
     assert "not configured" in body["detail"].lower()
+
+
+def test_fetch_resume_pdf_rejects_bad_salesforce_id():
+    """SOQL-injection guard: a malformed Id (e.g. containing a quote) is rejected
+    before it ever reaches a query string — validated before sf.query() is called,
+    so no Salesforce connection needs mocking here."""
+    import pytest
+    with pytest.raises(sf_client.InvalidIdError):
+        sf_client.fetch_resume_pdf("x' OR Id != '", sf=object())
+
+
+def test_mask_endpoint_surfaces_invalid_id_as_error(monkeypatch):
+    """The /mask route itself turns InvalidIdError into a clean {status: error},
+    not a 500."""
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda: True)
+    monkeypatch.setattr(server.sf_client, "connect", lambda: object())
+    client = TestClient(server.app)
+    resp = client.post("/mask", json={"job_applicant_id": "x' OR Id != '", "mask_strings": ["x"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "invalid" in body["detail"].lower()
+
+
+def test_mask_unenforced_without_api_key(monkeypatch):
+    """MASK_API_KEY unset -> no auth required (back-compat default)."""
+    monkeypatch.delenv("MASK_API_KEY", raising=False)
+    _install_mocks(monkeypatch)
+    client = TestClient(server.app)
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000001", "mask_strings": SAMPLE_PII})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_mask_requires_api_key_when_configured(monkeypatch):
+    monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
+    _install_mocks(monkeypatch)
+    client = TestClient(server.app)
+
+    no_key = client.post("/mask", json={"job_applicant_id": "a0X000000000001", "mask_strings": SAMPLE_PII})
+    assert no_key.status_code == 401
+
+    wrong_key = client.post(
+        "/mask", json={"job_applicant_id": "a0X000000000001", "mask_strings": SAMPLE_PII},
+        headers={"X-API-Key": "nope"},
+    )
+    assert wrong_key.status_code == 401
+
+    right_key = client.post(
+        "/mask", json={"job_applicant_id": "a0X000000000001", "mask_strings": SAMPLE_PII},
+        headers={"X-API-Key": "s3cr3t"},
+    )
+    assert right_key.status_code == 200
+    assert right_key.json()["status"] == "ok"
+
+
+def test_popup_is_real_html_and_carries_the_key(monkeypatch):
+    monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
+    client = TestClient(server.app)
+    resp = client.get("/popup")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "<!DOCTYPE html>" in resp.text  # not JSON-escaped
+    assert 'const API_KEY = "s3cr3t"' in resp.text
+
+
+def test_mask_auto_resolves_account_id_for_per_client_watermark(monkeypatch):
+    """The join-view button only passes job_applicant_id (no account_id) -- the
+    service should resolve the client Account itself (SCSCHAMPS__Account__c on
+    the Job Applicant row) and use it to look up that client's watermark."""
+    captured = _install_mocks(monkeypatch)
+    monkeypatch.setattr(server.sf_client, "resolve_account_id",
+                        lambda jaid, sf=None: "001RESOLVEDACCT001")
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000001", "mask_strings": SAMPLE_PII})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["watermark_account_id"] == "001RESOLVEDACCT001"
+
+
+def test_mask_explicit_account_id_skips_auto_resolve(monkeypatch):
+    """If the caller already passes account_id, don't override it with a lookup."""
+    captured = _install_mocks(monkeypatch)
+
+    def _should_not_be_called(jaid, sf=None):
+        raise AssertionError("resolve_account_id should not run when account_id is given")
+
+    monkeypatch.setattr(server.sf_client, "resolve_account_id", _should_not_be_called)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={
+        "job_applicant_id": "a0X000000000001", "account_id": "001EXPLICIT0001AA",
+        "mask_strings": SAMPLE_PII,
+    })
+    assert resp.status_code == 200
+    assert captured["watermark_account_id"] == "001EXPLICIT0001AA"
