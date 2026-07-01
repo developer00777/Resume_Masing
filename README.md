@@ -15,6 +15,29 @@ experience or academic marks), and it writes back in-record instead of redirecti
 
 ---
 
+## Changelog
+
+**2026-07-01** — phone-masking leak, SOQL injection, endpoint auth, per-client watermark auto-resolve
+
+- **Phone-masking leak fixed** (digit-aware fallback matcher in `app/mask.py`) — verified against a
+  real sample resume (`ORIGINAL.pdf`); masked output saved as `MASKED_fixed_demo.pdf` alongside it.
+- **SOQL injection fixed** — Salesforce-Id validation at the boundary (`app/sf_client.py`).
+- **`/mask` + `/watermark/upload` now gated** by an optional `MASK_API_KEY` shared secret; `/popup`
+  bug fixed (was serving JSON-escaped text instead of real HTML — would never have rendered in the
+  Salesforce iframe) and now carries the key automatically.
+- **Per-client watermark now auto-resolves.** Confirmed against the live org that
+  `SCSCHAMPS__Job_Applicant__c` (the join row the "click Job Id → requirements × eligible
+  professionals" view sits on) already carries `SCSCHAMPS__Account__c`. The mask button only needs
+  `job_applicant_id` — the service looks up the client itself, fetches that Account's
+  `ResumeWatermark` file, falls back to global/text if none uploaded yet.
+- 11 pytest + 5 offline checks, all green.
+
+**Setup you still need to do, per client:** one `POST /watermark/upload` with their logo + Account
+Id (see "Custom watermark per client" below) — after that it's automatic for every job/applicant
+under that client.
+
+---
+
 ## Layout
 
 | File | Purpose |
