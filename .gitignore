@@ -10,3 +10,8 @@ __pycache__/
 # Local test resumes / masked outputs -- real PII, never commit
 *.pdf
 masked_output_samples/
+
+# Unrelated CopilotKit agent-skills bundle, not part of this service
+agent/
+.agents/
+skills-lock.json
