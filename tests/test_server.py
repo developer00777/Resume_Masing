@@ -513,3 +513,148 @@ def test_mask_inline_requires_api_key_when_configured(monkeypatch):
         "mask_strings": SAMPLE_PII,
     })
     assert resp.status_code == 401
+
+
+# ── Admin API (/admin/clients) ──────────────────────────────────────────────
+
+def test_admin_routes_fail_closed_without_admin_api_key(monkeypatch):
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    client = TestClient(server.app)
+    assert client.get("/admin/clients").status_code == 503
+    assert client.put("/admin/clients/00D000000000001AAA", json={
+        "client_id": "x", "client_secret": "y",
+        "token_url": "https://x/token", "instance_url": "https://x",
+    }).status_code == 503
+    assert client.delete("/admin/clients/00D000000000001AAA").status_code == 503
+
+
+def test_admin_routes_reject_wrong_admin_api_key(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "correct-admin-key")
+    client = TestClient(server.app)
+    resp = client.get("/admin/clients", headers={"X-Admin-API-Key": "wrong-key"})
+    assert resp.status_code == 401
+
+
+def test_admin_list_clients_delegates_and_omits_secret(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "correct-admin-key")
+    monkeypatch.setattr(server.sf_client, "list_registered_clients", lambda: [
+        {"client_key": "00D000000000001AAA", "client_id": "acme-id",
+         "token_url": "https://acme/token", "instance_url": "https://acme", "source": "db"},
+    ])
+    client = TestClient(server.app)
+    resp = client.get("/admin/clients", headers={"X-Admin-API-Key": "correct-admin-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["clients"][0]["client_key"] == "00D000000000001AAA"
+    assert "client_secret" not in body["clients"][0]
+
+
+def test_admin_upsert_client_delegates_with_allow_overwrite_true(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "correct-admin-key")
+    captured = {}
+
+    def fake_register(client_key, client_id, client_secret, token_url, instance_url, allow_overwrite=True):
+        captured.update(locals())
+
+    monkeypatch.setattr(server.sf_client, "register_client", fake_register)
+    client = TestClient(server.app)
+    resp = client.put("/admin/clients/00D000000000001AAA",
+                      headers={"X-Admin-API-Key": "correct-admin-key"},
+                      json={"client_id": "acme-id", "client_secret": "acme-secret",
+                            "token_url": "https://acme/token", "instance_url": "https://acme"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["client_key"] == "00D000000000001AAA"
+    assert captured["allow_overwrite"] is True
+
+
+def test_admin_delete_client_returns_error_when_not_found(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "correct-admin-key")
+    monkeypatch.setattr(server.sf_client, "remove_client", lambda client_key: False)
+    client = TestClient(server.app)
+    resp = client.delete("/admin/clients/00D000000000001AAA",
+                         headers={"X-Admin-API-Key": "correct-admin-key"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "error"
+
+
+def test_admin_upsert_client_surfaces_postgres_not_configured(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "correct-admin-key")
+
+    def fake_register(*a, **k):
+        raise server.sf_client.PostgresNotConfiguredError("Postgres isn't provisioned.")
+
+    monkeypatch.setattr(server.sf_client, "register_client", fake_register)
+    client = TestClient(server.app)
+    resp = client.put("/admin/clients/00D000000000001AAA",
+                      headers={"X-Admin-API-Key": "correct-admin-key"},
+                      json={"client_id": "x", "client_secret": "y",
+                            "token_url": "https://x/token", "instance_url": "https://x"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "error"
+
+
+# ── Self-service registration (/clients/self-register) ─────────────────────
+
+def test_self_register_delegates_with_allow_overwrite_false(monkeypatch):
+    captured = {}
+
+    def fake_register(client_key, client_id, client_secret, token_url, instance_url, allow_overwrite=True):
+        captured.update(locals())
+
+    monkeypatch.setattr(server.sf_client, "register_client", fake_register)
+    client = TestClient(server.app)
+    resp = client.post("/clients/self-register", json={
+        "client_key": "00D000000000001AAA", "client_id": "acme-id", "client_secret": "acme-secret",
+        "token_url": "https://acme/token", "instance_url": "https://acme",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["allow_overwrite"] is False
+
+
+def test_self_register_uses_mask_api_key_not_admin_key(monkeypatch):
+    """Self-registration must be gated by MASK_API_KEY (require_api_key), not
+    ADMIN_API_KEY -- it's reachable from inside Salesforce at the same trust
+    boundary as /mask, deliberately not the higher-privilege admin lane."""
+    monkeypatch.setenv("MASK_API_KEY", "the-mask-key")
+    monkeypatch.setattr(server.sf_client, "register_client", lambda *a, **k: None)
+    client = TestClient(server.app)
+
+    # Missing X-API-Key -> 401 (require_api_key), not 503 (require_admin_api_key)
+    resp = client.post("/clients/self-register", json={
+        "client_key": "00D000000000001AAA", "client_id": "id", "client_secret": "secret",
+        "token_url": "https://x/token", "instance_url": "https://x",
+    })
+    assert resp.status_code == 401
+
+    resp = client.post("/clients/self-register", headers={"X-API-Key": "the-mask-key"}, json={
+        "client_key": "00D000000000001AAA", "client_id": "id", "client_secret": "secret",
+        "token_url": "https://x/token", "instance_url": "https://x",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_self_register_surfaces_already_registered_error(monkeypatch):
+    def fake_register(*a, **k):
+        raise server.sf_client.ClientAlreadyRegisteredError("already there")
+
+    monkeypatch.setattr(server.sf_client, "register_client", fake_register)
+    client = TestClient(server.app)
+    resp = client.post("/clients/self-register", json={
+        "client_key": "00D000000000001AAA", "client_id": "id", "client_secret": "secret",
+        "token_url": "https://x/token", "instance_url": "https://x",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "already registered" in body["detail"].lower()
+
+
+def test_health_includes_registry_backend(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "registry_backend", lambda: "db+env")
+    client = TestClient(server.app)
+    resp = client.get("/health")
+    assert resp.json()["registry_backend"] == "db+env"

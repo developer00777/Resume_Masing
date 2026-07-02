@@ -1,12 +1,20 @@
-"""Thin Salesforce wrapper (simple-salesforce). ALL creds from ENV.
+"""Thin Salesforce wrapper (simple-salesforce). ALL creds from ENV or Postgres.
 
 Auth, in priority order:
-  A. Multi-client OAuth2 Client Credentials (SF_CLIENTS_JSON) — headless, per-client
-     Connected App, no username/password. Select a client per-request via client_key.
+  A. Multi-client OAuth2 Client Credentials — headless, per-client Connected
+     App, no username/password. Select a client per-request via client_key,
+     which by convention is the org's own Salesforce Organization Id (Apex:
+     UserInfo.getOrganizationId()) so callers never have to invent/coordinate
+     a label. Entries come from two merged sources:
+       - SF_CLIENTS_JSON (env var, static, requires a redeploy to change)
+       - Postgres client_orgs table (dynamic, via register_client()/DATABASE_URL) —
+         wins on client_key collision. Fully optional: behaves exactly like
+         env-only mode when DATABASE_URL isn't set.
   B. Username + Password + Consumer Key/Secret (simple-salesforce's OAuth2 username-password flow).
   C. Username + Password + Security Token (simplest, single client).
 
-Handles: resume fetch, watermark image fetch/upload, masked PDF upload.
+Handles: resume fetch, watermark image fetch/upload, masked PDF upload,
+dynamic client-org registration (register_client/remove_client).
 """
 from __future__ import annotations
 
@@ -20,6 +28,8 @@ from typing import Callable, TypeVar
 import requests
 from simple_salesforce import Salesforce
 from simple_salesforce.exceptions import SalesforceExpiredSession
+
+from app import crypto_util, db
 
 T = TypeVar("T")
 
@@ -51,6 +61,14 @@ class UnknownClientError(RuntimeError):
     pass
 
 
+class PostgresNotConfiguredError(RuntimeError):
+    pass
+
+
+class ClientAlreadyRegisteredError(RuntimeError):
+    pass
+
+
 def _safe_id(value: str | None, field: str) -> str:
     if not value or not _SF_ID_RE.match(value):
         raise InvalidIdError(f"Invalid Salesforce Id for {field}: {value!r}")
@@ -67,30 +85,38 @@ def _require(*names: str) -> dict[str, str]:
 
 # ── Multi-client Connected App registry (OAuth2 Client Credentials) ─────────
 #
-# SF_CLIENTS_JSON is a JSON object keyed by an arbitrary "client_key" your
-# Salesforce button / caller passes in. Each entry needs:
-#   client_id, client_secret, token_url, instance_url
+# Two merged sources, keyed by "client_key" (by convention, the org's own
+# Salesforce Organization Id). Each entry needs: client_id, client_secret,
+# token_url, instance_url.
 #
-# Example:
-#   SF_CLIENTS_JSON={
-#     "acme": {
-#       "client_id": "3MVG9...",
-#       "client_secret": "64585...",
-#       "token_url": "https://acme.my.salesforce.com/services/oauth2/token",
-#       "instance_url": "https://acme.my.salesforce.com"
-#     },
-#     "beta_corp": { ... }
-#   }
+#   1. SF_CLIENTS_JSON (env var, static) -- example:
+#      SF_CLIENTS_JSON={
+#        "00D5f000000ABCDEAU": {
+#          "client_id": "3MVG9...",
+#          "client_secret": "64585...",
+#          "token_url": "https://acme.my.salesforce.com/services/oauth2/token",
+#          "instance_url": "https://acme.my.salesforce.com"
+#        }
+#      }
+#   2. Postgres client_orgs table (dynamic, via register_client()) -- wins on
+#      client_key collision. Absent entirely if DATABASE_URL isn't set.
 _REQUIRED_CLIENT_FIELDS = ("client_id", "client_secret", "token_url", "instance_url")
 
 # In-memory access-token cache: client_key -> {"access_token": ..., "expires_at": epoch_seconds}
 _token_cache: dict[str, dict] = {}
 
+# In-memory merged-registry cache. Not a pure TTL cache -- writes made through
+# register_client()/remove_client() call invalidate_registry_cache() so the
+# writer's own process sees the change on its very next read; the TTL is only
+# a backstop for other processes/replicas to converge without needing pub/sub.
+_registry_cache: dict[str, dict] | None = None
+_registry_cache_at: float = 0.0
+_REGISTRY_CACHE_TTL = 30  # seconds
 
-def _load_client_registry() -> dict[str, dict]:
+
+def _load_env_registry() -> dict[str, dict]:
     raw = os.environ.get("SF_CLIENTS_JSON")
     if not raw:
-        _token_cache.clear()
         return {}
     try:
         registry = json.loads(raw)
@@ -102,12 +128,56 @@ def _load_client_registry() -> dict[str, dict]:
         if not isinstance(entry, dict) or any(f not in entry for f in _REQUIRED_CLIENT_FIELDS):
             raise MissingCredentialsError(
                 f"SF_CLIENTS_JSON['{key}'] must include: " + ", ".join(_REQUIRED_CLIENT_FIELDS))
-    # Drop cached tokens for client_keys no longer in the registry (e.g. a client
-    # was removed or renamed in SF_CLIENTS_JSON) so stale entries don't linger
-    # in memory for the life of the process.
-    for stale_key in _token_cache.keys() - registry.keys():
-        del _token_cache[stale_key]
     return registry
+
+
+def _load_db_registry() -> dict[str, dict]:
+    """Never raises -- a Postgres hiccup degrades to "env entries still work",
+    not a full outage of every /mask call across every client org."""
+    if not db.is_configured():
+        return {}
+    try:
+        rows = db.list_entries()
+        return {
+            key: {
+                "client_id": row["client_id"],
+                "client_secret": crypto_util.decrypt_secret(row["encrypted_client_secret"]),
+                "token_url": row["token_url"],
+                "instance_url": row["instance_url"],
+            }
+            for key, row in rows.items()
+        }
+    except Exception:
+        return {}
+
+
+def _load_client_registry(force: bool = False) -> dict[str, dict]:
+    global _registry_cache, _registry_cache_at
+    now = time.time()
+    if not force and _registry_cache is not None and (now - _registry_cache_at) < _REGISTRY_CACHE_TTL:
+        return _registry_cache
+
+    env_entries = _load_env_registry()  # raises MissingCredentialsError on malformed SF_CLIENTS_JSON
+    db_entries = _load_db_registry()    # never raises; {} on any failure
+    merged = {**env_entries, **db_entries}  # DB wins on key collision
+
+    # Drop cached tokens for client_keys no longer in the merged registry (e.g.
+    # a client was removed from SF_CLIENTS_JSON or deleted from Postgres) so
+    # stale entries don't linger in memory for the life of the process.
+    for stale_key in _token_cache.keys() - merged.keys():
+        del _token_cache[stale_key]
+
+    _registry_cache = merged
+    _registry_cache_at = now
+    return merged
+
+
+def invalidate_registry_cache() -> None:
+    """Called after every admin/self-service registry write so the next read
+    in this process reflects it immediately, without waiting out the TTL."""
+    global _registry_cache, _registry_cache_at
+    _registry_cache = None
+    _registry_cache_at = 0.0
 
 
 def list_client_keys() -> list[str]:
@@ -247,6 +317,84 @@ def connect_kwargs_present(client_key: str | None = None) -> None:
         _require("SF_USERNAME", "SF_PASSWORD", "SF_CONSUMER_KEY", "SF_CONSUMER_SECRET")
     else:
         _require("SF_USERNAME", "SF_PASSWORD", "SF_SECURITY_TOKEN")
+
+
+# ── Dynamic client-org registration (Postgres-backed) ───────────────────────
+
+def registry_backend() -> str:
+    """"db+env" if Postgres is provisioned, else "env-only" -- surfaced on
+    /health so operators can confirm the DB is wired without hitting /admin."""
+    return "db+env" if db.is_configured() else "env-only"
+
+
+def register_client(client_key: str, client_id: str, client_secret: str,
+                    token_url: str, instance_url: str,
+                    allow_overwrite: bool = True) -> None:
+    """Persist a client org's Connected App credentials to Postgres.
+
+    allow_overwrite=False makes this create-only -- used by the self-service
+    registration route (gated by MASK_API_KEY, reachable by the client
+    themselves) so a resubmission can't clobber another org's already-working
+    credentials, only fail loudly with ClientAlreadyRegisteredError. The
+    admin route (gated by the separate, higher-privilege ADMIN_API_KEY) calls
+    this with allow_overwrite=True to support credential rotation.
+    """
+    client_key = _safe_id(client_key, "client_key")
+    missing = [n for n, v in (
+        ("client_id", client_id), ("client_secret", client_secret),
+        ("token_url", token_url), ("instance_url", instance_url),
+    ) if not v]
+    if missing:
+        raise MissingCredentialsError("Missing required field(s): " + ", ".join(missing))
+    if not db.is_configured():
+        raise PostgresNotConfiguredError(
+            "Postgres isn't provisioned on this deployment (DATABASE_URL unset) "
+            "-- dynamic client registration is unavailable. Use SF_CLIENTS_JSON instead.")
+
+    if not allow_overwrite and db.get_entry(client_key) is not None:
+        raise ClientAlreadyRegisteredError(
+            f"client_key '{client_key}' is already registered.")
+
+    encrypted = crypto_util.encrypt_secret(client_secret)
+    db.upsert_entry(client_key, client_id, encrypted, token_url, instance_url)
+    invalidate_registry_cache()
+
+
+def remove_client(client_key: str) -> bool:
+    """Delete a Postgres-backed client org entry. Returns whether one existed.
+    Does not touch SF_CLIENTS_JSON entries -- those aren't DB-managed."""
+    if not db.is_configured():
+        raise PostgresNotConfiguredError(
+            "Postgres isn't provisioned on this deployment (DATABASE_URL unset).")
+    deleted = db.delete_entry(client_key)
+    invalidate_registry_cache()
+    return deleted
+
+
+def list_registered_clients() -> list[dict]:
+    """Admin-listing view of the merged registry, secrets never included.
+    [{client_key, client_id, token_url, instance_url, source: "db"|"env"}, ...]
+    Additive -- does not change list_client_keys()'s existing list[str] shape."""
+    env_entries = _load_env_registry()
+    db_entries = {}
+    if db.is_configured():
+        try:
+            db_entries = db.list_entries()
+        except Exception:
+            db_entries = {}
+
+    out: list[dict] = []
+    for key in sorted(set(env_entries) | set(db_entries)):
+        source = "db" if key in db_entries else "env"
+        entry = db_entries.get(key) or env_entries[key]
+        out.append({
+            "client_key": key,
+            "client_id": entry["client_id"],
+            "token_url": entry["token_url"],
+            "instance_url": entry["instance_url"],
+            "source": source,
+        })
+    return out
 
 
 # ── Client (Account) resolution ─────────────────────────────────────────────

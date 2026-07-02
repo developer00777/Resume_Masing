@@ -42,12 +42,14 @@ too (recommended — see `mask_strings` below):
   regex scan of the PDF text (email + phone patterns), which is good but not
   as precise as exact values from your data.
 
-If instead you'd prefer **we** do the Salesforce I/O (i.e. Apex just passes
-an Id and we fetch/write), that's also possible — but then we do need the
-object/field answers from the table this section used to have. Tell us and
-we'll follow up with those specific questions; the inline approach above
-avoids the whole conversation, so we'd lead with that unless there's a reason
-Apex can't own the Notes & Attachments read/write itself.
+If instead you'd prefer **we** do the Salesforce I/O (i.e. Apex just passes an
+Id and we fetch/write, like `/mask` does today for Job Applicant), that's also
+possible — but then we need to know your Job/Contact/Applicant object and
+field API names, and whether "Notes & Attachments" means modern Files
+(`ContentDocumentLink`/`ContentVersion`) or the legacy `Attachment` object.
+Tell us and we'll follow up with the specific questions; the inline approach
+above avoids that whole conversation, so we'd lead with it unless there's a
+reason Apex can't own the Notes & Attachments read/write itself.
 
 ---
 
@@ -57,7 +59,7 @@ Apex can't own the Notes & Attachments read/write itself.
 Base URL: https://<your-railway-app>.up.railway.app
 ```
 
-Every write endpoint (`/mask`, `/mask/batch`, `/watermark/upload`) requires a shared-secret header once `MASK_API_KEY` is set on our side:
+Every write endpoint (`/mask`, `/mask/batch`, `/mask/inline`, `/watermark/upload`, `/clients/self-register`) requires a shared-secret header once `MASK_API_KEY` is set on our side (`/admin/clients` uses a separate key, see §3b):
 
 ```
 X-API-Key: <the key we give you>
@@ -77,8 +79,10 @@ req.setHeader('Content-Type', 'application/json');
 
 ```bash
 curl https://<your-railway-app>.up.railway.app/health
-# {"status":"ok","salesforce_configured":true,"client_keys":["acme","beta_corp"]}
+# {"status":"ok","salesforce_configured":true,"client_keys":["00D5f000000ABCDEAU"],"registry_backend":"db+env"}
 ```
+
+`registry_backend` tells you whether dynamic org registration (§3b below) is available on this deployment: `"db+env"` means yes, `"env-only"` means orgs can only be added via a static config change on our side.
 
 ---
 
@@ -101,10 +105,60 @@ To connect this service to your org, we need **one** of the following. Option C 
 - That execution user's profile needs **API Only** + these object permissions:
   - Read: `ContentDocumentLink`, `ContentVersion`
   - Create: `ContentVersion`
-  - Read: whatever object holds the source resume (today: `SCSCHAMPS__Job_Applicant__c`; pending your answer to open item #1–4 above)
-- Send us per org: `client_id`, `client_secret`, `token_url` (`https://<org>.my.salesforce.com/services/oauth2/token`), `instance_url`
+  - Read: whatever object holds the source resume (today: `SCSCHAMPS__Job_Applicant__c`; not needed at all if you use `/mask/inline`, §1/§4b)
 
-For Option C, your Apex/Flow passes a `client_key` (an arbitrary short name we agree on per org, e.g. `"acme"`) in the request body so the service knows which org's credentials to use.
+For Option C, your Apex/Flow passes a `client_key` in the request body so the
+service knows which org's credentials to use. **By convention, `client_key` is
+your org's own Salesforce Organization Id** (Setup → Company Information, or
+in Apex: `UserInfo.getOrganizationId()`) — not a name you have to invent or
+that we have to hand you. This means every org's Apex/Flow config looks
+identical; nothing org-specific is hardcoded anywhere on your side.
+
+### 3a. Getting your Connected App credentials to us
+
+Once you have the Consumer Key/Secret from step above, there are two ways to
+register them — pick whichever fits your process. Both require `registry_backend: "db+env"`
+on `GET /health` (see §2); if it says `"env-only"`, dynamic registration isn't
+available yet on this deployment and you should send us the credentials
+directly instead.
+
+**Self-service (recommended — no round-trip with us):**
+```
+POST /clients/self-register
+X-API-Key: <the same key used for /mask>
+Content-Type: application/json
+
+{
+  "client_key": "00D5f000000ABCDEAU",
+  "client_id": "<Consumer Key>",
+  "client_secret": "<Consumer Secret>",
+  "token_url": "https://yourorg.my.salesforce.com/services/oauth2/token",
+  "instance_url": "https://yourorg.my.salesforce.com"
+}
+```
+Or use the form on `GET /popup` ("Connect Your Org") if you're already
+embedding that page — same effect, no API call needed on your end.
+
+This is **create-only**: if `client_key` is already registered, you'll get
+back `{"status": "error", "detail": "This org is already registered. Contact us to rotate credentials."}`
+instead of silently overwriting a working connection. If you need to rotate
+credentials for an org that's already connected, ask us to do it via the
+admin route (§3b) — self-service intentionally can't overwrite.
+
+**Manual (we do it for you):** send us the four fields above plus your
+Organization Id, and we'll register it via the admin API.
+
+### 3b. Admin API (for us, or your own internal tooling)
+
+```
+GET    /admin/clients                     — list all registered orgs (no secrets returned)
+PUT    /admin/clients/{client_key}        — register or rotate credentials for an org
+DELETE /admin/clients/{client_key}        — deregister an org
+```
+All three require `X-Admin-API-Key` — a separate, higher-privilege secret from
+the `X-API-Key` used everywhere else, since these routes can add/rotate/remove
+any org's access. We hold this key; you generally won't need it unless you're
+managing your own multi-tenant deployment of this service.
 
 ---
 
@@ -143,7 +197,7 @@ join-view "Mask" button
   "mask_strings": ["John Doe", "+91 98765 43210", "john.doe@example.com"],
   "watermark_text": "CONFIDENTIAL",
   "watermark_base64": "<base64 PNG/JPEG, optional>",
-  "client_key": "acme"
+  "client_key": "00D5f000000ABCDEAU"
 }
 ```
 
@@ -154,7 +208,7 @@ join-view "Mask" button
 | `mask_strings` | no | Exact PII strings to redact. If omitted, the service runs a regex fallback (email/phone) over the extracted PDF text — less accurate than passing exact values from your data. |
 | `watermark_text` | no | Fallback text watermark if no image is found. Default `"CONFIDENTIAL"`. |
 | `watermark_base64` | no | Inline watermark image — skips an extra Salesforce round-trip. See §5. |
-| `client_key` | conditional | Required only if we're using multi-org auth (Option C above). Omit for Option A/B. |
+| `client_key` | conditional | Required only if we're using multi-org auth (Option C above) — your org's Organization Id (`UserInfo.getOrganizationId()`). Omit for Option A/B. Must be registered first, see §3a. |
 
 **Response:**
 ```json
@@ -177,7 +231,7 @@ per call; split into multiple batch calls for different orgs.
 
 ```json
 {
-  "client_key": "acme",
+  "client_key": "00D5f000000ABCDEAU",
   "watermark_text": "CONFIDENTIAL",
   "items": [
     { "job_applicant_id": "a0X000000000001" },
@@ -250,12 +304,66 @@ Stores the image as a File titled `ResumeWatermark` on that Account. Every
 subsequent `/mask` call for that client picks it up automatically — no code
 change, no redeploy. Re-upload to swap the logo.
 
+### `POST /clients/self-register` — connect a new org (see §3a)
+
+Auth: `X-API-Key` (same key as `/mask` — **not** `X-Admin-API-Key`).
+
+**Request:**
+```json
+{
+  "client_key": "00D5f000000ABCDEAU",
+  "client_id": "<Connected App Consumer Key>",
+  "client_secret": "<Connected App Consumer Secret>",
+  "token_url": "https://yourorg.my.salesforce.com/services/oauth2/token",
+  "instance_url": "https://yourorg.my.salesforce.com"
+}
+```
+
+**Response:**
+```json
+{ "status": "ok", "detail": "Registered '00D5f000000ABCDEAU'." }
+```
+
+Create-only — a second call for an already-registered `client_key` returns
+`{"status": "error", "detail": "This org is already registered. Contact us to rotate credentials."}`
+rather than overwriting. Returns `{"status": "error", "detail": "..."}` (still HTTP 200)
+if this deployment doesn't have Postgres provisioned (`registry_backend: "env-only"`
+on `GET /health`) — in that case, send us your credentials directly instead (§3a).
+
+### `GET/PUT/DELETE /admin/clients` — admin registry management
+
+Auth: `X-Admin-API-Key` (separate, higher-privilege secret — see §3b). We hold
+this key; you generally won't need it unless managing your own deployment.
+
+```
+GET /admin/clients
+→ {"status":"ok","clients":[{"client_key":"00D5f000000ABCDEAU","client_id":"...","token_url":"...","instance_url":"...","source":"db"}]}
+```
+`source` is `"db"` (dynamically registered) or `"env"` (from the static
+`SF_CLIENTS_JSON` config) — `client_secret` is never included in any response.
+
+```
+PUT /admin/clients/{client_key}
+{ "client_id": "...", "client_secret": "...", "token_url": "...", "instance_url": "..." }
+```
+Registers or rotates credentials for an org — this route (unlike self-register)
+can overwrite an existing entry, so it's the one to use for credential rotation.
+
+```
+DELETE /admin/clients/{client_key}
+```
+Deregisters an org. Only affects dynamically-registered (`source: "db"`)
+entries — an env-only entry needs `SF_CLIENTS_JSON` edited on our side instead.
+
 ### `GET /popup` — embeddable UI (optional)
 
-A ready-made HTML page (watermark upload form + Mask button) you can drop
-into a Lightning Component / iframe if you don't want to build your own UI.
-Authenticates itself automatically once `MASK_API_KEY` is set — nothing extra
-to wire.
+A ready-made HTML page — "Connect Your Org" self-service form (§3a), watermark
+upload form, and Mask button — you can drop into a Lightning Component / iframe
+if you don't want to build your own UI. Authenticates itself automatically
+once `MASK_API_KEY` is set — nothing extra to wire. The "Connect Your Org"
+form currently requires manually typing your Organization Id; if you embed
+this page via Visualforce/Lightning, that field can be pre-filled from
+`{!$Organization.Id}` — ask us if you want that wired up.
 
 ---
 
@@ -286,14 +394,18 @@ a plain-English message safe to surface in a Flow error toast):
 | `Invalid Salesforce Id for job_applicant_id: ...` | Malformed/wrong-length Id passed | Check the button's merge field |
 | `No resume found for Job Applicant '...'.` | No PDF attached to that record | Confirm the resume was actually uploaded there |
 | `No PII strings to mask.` | Neither `mask_strings` nor the regex fallback found anything | Pass explicit `mask_strings` from your parsed candidate data |
-| `Unknown client_key '...'. Configured: [...]` | Wrong/missing `client_key` for multi-org setup | Check the key we gave you against what your Flow is sending |
+| `Unknown client_key '...'. Configured: [...]` | Wrong/missing `client_key`, or your org hasn't been registered yet | Register via `/clients/self-register` (§3a), or check the Org Id against what your Flow is sending |
 | `watermark_base64 is not valid base64.` | Malformed inline watermark | Check the formula field encoding |
+| `This org is already registered. Contact us to rotate credentials.` | `/clients/self-register` called twice for the same `client_key` | Ask us to rotate via `/admin/clients` instead — self-service can't overwrite |
+| `Postgres isn't provisioned on this deployment (DATABASE_URL unset)...` | `/clients/self-register` or `/admin/clients` called on a deployment with `registry_backend: "env-only"` | Send us your credentials directly instead of self-registering |
+| `Missing or invalid X-Admin-API-Key.` / `Admin API not configured...` | Wrong or missing admin key on `/admin/clients` | This route isn't for Apex/Flow — it's for us; you shouldn't normally be calling it |
 
 ---
 
 ## 7. Security notes
 
-- Salesforce credentials live only in our service's environment (Railway secrets) — never in Flow/button config, never in code.
-- `/mask`, `/mask/batch`, `/watermark/upload` require `X-API-Key` once we set `MASK_API_KEY` — ask us for the key and use a Named Credential in Apex so it never appears in visible metadata.
+- Salesforce credentials live only in our service's environment (Railway secrets) or, for dynamically-registered orgs, encrypted at rest in our database — never in Flow/button config, never in code.
+- `/mask`, `/mask/batch`, `/mask/inline`, `/watermark/upload`, `/clients/self-register` require `X-API-Key` once we set `MASK_API_KEY` — ask us for the key and use a Named Credential in Apex so it never appears in visible metadata.
+- `/admin/clients` requires a separate, higher-privilege `X-Admin-API-Key` that we hold — it can add/rotate/remove any org's credentials, so it's deliberately not the same key handed to Apex/Flow.
 - The service validates every Salesforce Id it receives against Salesforce's Id format before using it in SOQL (defense against SOQL injection from a malformed/malicious button parameter).
 - We do not log or persist resume content — the PDF is fetched, masked in memory, uploaded, and discarded per request.

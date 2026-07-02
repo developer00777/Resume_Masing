@@ -1,4 +1,4 @@
-"""Multi-client OAuth2 Client Credentials registry — network fully mocked.
+"""Multi-client OAuth2 Client Credentials registry — network AND Postgres fully mocked.
 
 Covers:
   * SF_CLIENTS_JSON parsing (missing, malformed, missing required fields)
@@ -9,6 +9,12 @@ Covers:
   * stale token_cache eviction when a client_key is removed from SF_CLIENTS_JSON
   * force_refresh bypasses the cache
   * with_session() retries once on a dead session, not on other errors
+
+DB-backed registry behavior (register_client/remove_client/merge-with-DB) is
+covered separately in tests/test_client_registry_db.py -- this file asserts
+the env-only path is byte-for-byte unchanged now that Postgres is a possible
+second source (DATABASE_URL is explicitly unset here, so db.is_configured()
+is always False and _load_db_registry() always returns {}).
 """
 import json
 import os
@@ -32,9 +38,12 @@ ACME_ENTRY = {
 @pytest.fixture(autouse=True)
 def _clear_state(monkeypatch):
     sf_client._token_cache.clear()
+    sf_client.invalidate_registry_cache()
     monkeypatch.delenv("SF_CLIENTS_JSON", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     yield
     sf_client._token_cache.clear()
+    sf_client.invalidate_registry_cache()
 
 
 def test_list_client_keys_empty_without_env():

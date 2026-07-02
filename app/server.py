@@ -65,7 +65,7 @@ from fastapi import Depends, FastAPI, UploadFile, File, Form, Header, HTTPExcept
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from app import mask, sf_client
+from app import crypto_util, mask, sf_client
 
 app = FastAPI(title="Salesforce Resume Masking Service", version="1.3.0")
 
@@ -76,6 +76,17 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         return  # not configured yet -> unenforced (see module docstring)
     if x_api_key != expected:
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key.")
+
+
+def require_admin_api_key(x_admin_api_key: str | None = Header(default=None)) -> None:
+    """Unlike require_api_key, this fails CLOSED when unset -- /admin/* can
+    register/overwrite any client org's credentials, a more sensitive surface
+    than /mask, so a forgotten ADMIN_API_KEY must not silently mean "open"."""
+    expected = os.environ.get("ADMIN_API_KEY", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Admin API not configured (ADMIN_API_KEY unset).")
+    if x_admin_api_key != expected:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-API-Key.")
 
 
 # --- PII detection fallback ---
@@ -117,9 +128,11 @@ class MaskRequest(BaseModel):
                     "lookup (account_id) when both are present.")
     client_key: str | None = Field(
         default=None,
-        description="Which registered Salesforce client/org (SF_CLIENTS_JSON) to use for this call. "
-                    "Required when the service is configured for multiple clients via OAuth2 Client "
-                    "Credentials; omit for a single-tenant username/password deployment.")
+        description="Which registered Salesforce org to use for this call, by convention the org's "
+                    "own Organization Id (Apex: UserInfo.getOrganizationId()). Required when the "
+                    "service is configured for multiple clients; omit for a single-tenant "
+                    "username/password deployment. See POST /clients/self-register to register a "
+                    "new org's credentials.")
 
 
 class MaskResponse(BaseModel):
@@ -151,8 +164,8 @@ class BatchMaskRequest(BaseModel):
                                        description="Job Applicants to mask in this batch.")
     client_key: str | None = Field(
         default=None,
-        description="Which registered Salesforce client/org (SF_CLIENTS_JSON) to use for the whole "
-                    "batch — one shared session, reused across all items.")
+        description="Which registered Salesforce org (by convention, its Organization Id) to use "
+                    "for the whole batch — one shared session, reused across all items.")
     watermark_text: str = Field(default="", description="Fallback text watermark, shared by all items.")
     watermark_base64: str | None = Field(
         default=None,
@@ -187,6 +200,39 @@ class InlineMaskResponse(BaseModel):
     detail: str | None = None
 
 
+class ClientOrgUpsertRequest(BaseModel):
+    client_id: str = Field(..., description="Connected App Consumer Key.")
+    client_secret: str = Field(..., description="Connected App Consumer Secret.")
+    token_url: str = Field(..., description="e.g. https://acme.my.salesforce.com/services/oauth2/token")
+    instance_url: str = Field(..., description="e.g. https://acme.my.salesforce.com")
+
+
+class SelfRegisterRequest(BaseModel):
+    client_key: str = Field(..., description="The org's own Organization Id.")
+    client_id: str = Field(..., description="Connected App Consumer Key.")
+    client_secret: str = Field(..., description="Connected App Consumer Secret.")
+    token_url: str = Field(..., description="e.g. https://acme.my.salesforce.com/services/oauth2/token")
+    instance_url: str = Field(..., description="e.g. https://acme.my.salesforce.com")
+
+
+class ClientOrgSummary(BaseModel):
+    client_key: str
+    client_id: str
+    token_url: str
+    instance_url: str
+    source: str  # "db" | "env" -- client_secret is never included in any response
+
+
+class ClientOrgListResponse(BaseModel):
+    status: str
+    clients: list[ClientOrgSummary] = Field(default_factory=list)
+
+
+class AdminActionResponse(BaseModel):
+    status: str
+    detail: str | None = None
+
+
 # --- Routes ---
 
 @app.get("/health")
@@ -195,6 +241,7 @@ def health() -> dict:
         "status": "ok",
         "salesforce_configured": sf_client.creds_configured(),
         "client_keys": sf_client.list_client_keys(),
+        "registry_backend": sf_client.registry_backend(),
     }
 
 
@@ -367,6 +414,79 @@ def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
     )
 
 
+@app.get("/admin/clients", response_model=ClientOrgListResponse,
+        dependencies=[Depends(require_admin_api_key)])
+def admin_list_clients() -> ClientOrgListResponse:
+    return ClientOrgListResponse(status="ok", clients=[
+        ClientOrgSummary(**c) for c in sf_client.list_registered_clients()
+    ])
+
+
+@app.put("/admin/clients/{client_key}", response_model=AdminActionResponse,
+         dependencies=[Depends(require_admin_api_key)])
+def admin_upsert_client(client_key: str, req: ClientOrgUpsertRequest) -> AdminActionResponse:
+    """Register or update (rotate credentials for) a client org. Admin-key
+    gated, so this is the route to use for credential rotation -- the
+    self-service route below is deliberately create-only."""
+    try:
+        sf_client.register_client(client_key, req.client_id, req.client_secret,
+                                  req.token_url, req.instance_url, allow_overwrite=True)
+    except sf_client.InvalidIdError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    except sf_client.MissingCredentialsError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    except sf_client.PostgresNotConfiguredError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    except crypto_util.EncryptionKeyError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    return AdminActionResponse(status="ok", detail=f"Registered '{client_key}'.")
+
+
+@app.delete("/admin/clients/{client_key}", response_model=AdminActionResponse,
+           dependencies=[Depends(require_admin_api_key)])
+def admin_delete_client(client_key: str) -> AdminActionResponse:
+    try:
+        deleted = sf_client.remove_client(client_key)
+    except sf_client.PostgresNotConfiguredError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    if not deleted:
+        return AdminActionResponse(
+            status="error",
+            detail=f"'{client_key}' is not DB-managed (not found, or only present in "
+                    "SF_CLIENTS_JSON -- remove it from that env var instead).")
+    return AdminActionResponse(status="ok", detail=f"Removed '{client_key}'.")
+
+
+@app.post("/clients/self-register", response_model=AdminActionResponse,
+         dependencies=[Depends(require_api_key)])
+def self_register_client(req: SelfRegisterRequest) -> AdminActionResponse:
+    """Client-facing registration: a Salesforce org submits its own Connected
+    App credentials directly (e.g. from the /popup 'Connect your org' form),
+    no admin round-trip needed. Gated by the same MASK_API_KEY already used
+    by /mask -- not ADMIN_API_KEY, since this only ever runs inside a
+    Salesforce-embedded page at that same trust boundary. Create-only
+    (allow_overwrite=False): a resubmission can't clobber an already-working
+    org's credentials, it just fails with a clear "already registered"
+    message -- rotation goes through the admin-key-gated PUT route instead.
+    """
+    try:
+        sf_client.register_client(req.client_key, req.client_id, req.client_secret,
+                                  req.token_url, req.instance_url, allow_overwrite=False)
+    except sf_client.ClientAlreadyRegisteredError:
+        return AdminActionResponse(
+            status="error",
+            detail="This org is already registered. Contact us to rotate credentials.")
+    except sf_client.InvalidIdError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    except sf_client.MissingCredentialsError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    except sf_client.PostgresNotConfiguredError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    except crypto_util.EncryptionKeyError as e:
+        return AdminActionResponse(status="error", detail=str(e))
+    return AdminActionResponse(status="ok", detail=f"Registered '{req.client_key}'.")
+
+
 @app.post("/watermark/upload", response_model=WatermarkUploadResponse,
          dependencies=[Depends(require_api_key)])
 async def watermark_upload(
@@ -470,6 +590,28 @@ _POPUP_HTML = """<!DOCTYPE html>
 
 <h1>Mask Profile</h1>
 
+<!-- Connect Your Org -->
+<div class="card">
+  <div class="card-title">Connect Your Org</div>
+  <p style="font-size:13px;color:#6b7280;margin-bottom:12px;">
+    One-time setup: register this org's Connected App so /mask calls know which
+    Salesforce credentials to use. Skip this if your org is already connected.
+  </p>
+  <label for="connect-org-id">Organization Id</label>
+  <input type="text" id="connect-org-id" placeholder="e.g. 00D5f000000ABCDEAU (Setup &gt; Company Information, or {!$Organization.Id} if embedded via Lightning/Visualforce)" />
+  <label for="connect-client-id">Consumer Key</label>
+  <input type="text" id="connect-client-id" placeholder="Connected App Consumer Key" />
+  <label for="connect-client-secret">Consumer Secret</label>
+  <input type="password" id="connect-client-secret" placeholder="Connected App Consumer Secret" />
+  <label for="connect-token-url">Token URL</label>
+  <input type="text" id="connect-token-url" placeholder="https://yourorg.my.salesforce.com/services/oauth2/token" />
+  <label for="connect-instance-url">Instance URL</label>
+  <input type="text" id="connect-instance-url" placeholder="https://yourorg.my.salesforce.com" />
+  <button class="btn btn-primary" id="connect-org-btn">Connect Org</button>
+  <div id="connect-org-success" class="success"></div>
+  <div id="connect-org-error" class="error"></div>
+</div>
+
 <!-- Watermark Upload -->
 <div class="card">
   <div class="card-title">Upload Watermark</div>
@@ -508,6 +650,39 @@ _POPUP_HTML = """<!DOCTYPE html>
 const SF = window.location.origin;
 const API_KEY = "__MASK_API_KEY__";  // server-templated; empty string when MASK_API_KEY unset
 const authHeaders = API_KEY ? {'X-API-Key': API_KEY} : {};
+
+// Connect Your Org (self-service credential registration)
+document.getElementById('connect-org-btn').addEventListener('click', async () => {
+  const body = {
+    client_key: document.getElementById('connect-org-id').value.trim(),
+    client_id: document.getElementById('connect-client-id').value.trim(),
+    client_secret: document.getElementById('connect-client-secret').value.trim(),
+    token_url: document.getElementById('connect-token-url').value.trim(),
+    instance_url: document.getElementById('connect-instance-url').value.trim(),
+  };
+  ['connect-org-success','connect-org-error'].forEach(id => document.getElementById(id).style.display = 'none');
+  const btn = document.getElementById('connect-org-btn');
+  btn.disabled = true; btn.textContent = 'Connecting...';
+  try {
+    const r = await fetch(SF + '/clients/self-register', {
+      method: 'POST', headers: Object.assign({'Content-Type':'application/json'}, authHeaders),
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.status === 'ok') {
+      document.getElementById('connect-org-success').textContent = '✅ Org connected!';
+      document.getElementById('connect-org-success').style.display = 'block';
+    } else {
+      document.getElementById('connect-org-error').textContent = '❌ ' + (d.detail || 'Failed');
+      document.getElementById('connect-org-error').style.display = 'block';
+    }
+  } catch(e) {
+    document.getElementById('connect-org-error').textContent = '❌ ' + e.message;
+    document.getElementById('connect-org-error').style.display = 'block';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Connect Org';
+  }
+});
 
 // File upload
 const uploadZone = document.getElementById('upload-zone');
