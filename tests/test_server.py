@@ -42,11 +42,11 @@ def _install_mocks(monkeypatch):
     """Force creds-configured, stub the Salesforce round-trip, capture the uploaded bytes."""
     captured = {}
 
-    monkeypatch.setattr(sf_client, "creds_configured", lambda: True)
+    monkeypatch.setattr(sf_client, "creds_configured", lambda client_key=None: True)
     # connect() must never hit the network in tests.
-    monkeypatch.setattr(sf_client, "connect", lambda: object())
-    monkeypatch.setattr(server.sf_client, "creds_configured", lambda: True)
-    monkeypatch.setattr(server.sf_client, "connect", lambda: object())
+    monkeypatch.setattr(sf_client, "connect", lambda client_key=None, force_refresh=False: object())
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: True)
+    monkeypatch.setattr(server.sf_client, "connect", lambda client_key=None, force_refresh=False: object())
 
     def fake_fetch(job_applicant_id, sf=None):
         return _make_sample_pdf()
@@ -117,8 +117,34 @@ def test_mask_falls_back_to_detect_pii(monkeypatch):
     assert "98765" not in text, "regex phone not redacted"
 
 
+def test_detect_pii_ignores_stacked_dates_across_lines():
+    """_PHONE_RE must not span newlines -- real resumes stack education years and
+    date ranges on separate lines (e.g. "2023\\n2014\\n2016"), which previously
+    matched as one 8+ digit "phone number" and got redacted, blacking out real
+    content. Regression for the false-positive found testing real resumes."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text(
+        (72, 72),
+        "July 2019 - December 2023\n"
+        "2014\n"
+        "2016\n"
+        "Jeewanbharti\n"
+        "8949775210 | jeewanbharti560@gmail.com",
+        fontsize=12,
+    )
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    detected = server.detect_pii(pdf_bytes)
+    assert "8949775210" in detected
+    assert "jeewanbharti560@gmail.com" in detected
+    assert not any("\n" in d for d in detected), \
+        f"phone/email regex matched across a newline: {detected!r}"
+
+
 def test_mask_errors_when_creds_missing(monkeypatch):
-    monkeypatch.setattr(server.sf_client, "creds_configured", lambda: False)
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: False)
     client = TestClient(server.app)
     resp = client.post("/mask", json={"job_applicant_id": "a0X000000000003"})
     assert resp.status_code == 200
@@ -139,8 +165,8 @@ def test_fetch_resume_pdf_rejects_bad_salesforce_id():
 def test_mask_endpoint_surfaces_invalid_id_as_error(monkeypatch):
     """The /mask route itself turns InvalidIdError into a clean {status: error},
     not a 500."""
-    monkeypatch.setattr(server.sf_client, "creds_configured", lambda: True)
-    monkeypatch.setattr(server.sf_client, "connect", lambda: object())
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: True)
+    monkeypatch.setattr(server.sf_client, "connect", lambda client_key=None: object())
     client = TestClient(server.app)
     resp = client.post("/mask", json={"job_applicant_id": "x' OR Id != '", "mask_strings": ["x"]})
     assert resp.status_code == 200
@@ -222,3 +248,172 @@ def test_mask_explicit_account_id_skips_auto_resolve(monkeypatch):
     })
     assert resp.status_code == 200
     assert captured["watermark_account_id"] == "001EXPLICIT0001AA"
+
+
+def test_mask_with_inline_watermark_base64(monkeypatch):
+    """watermark_base64 in the request should be decoded and used directly, no SOQL fetch."""
+    import base64
+
+    captured = _install_mocks(monkeypatch)
+
+    def fail_if_called(account_id=None, sf=None):
+        raise AssertionError("fetch_watermark_png should not be called when watermark_base64 is set")
+
+    monkeypatch.setattr(server.sf_client, "fetch_watermark_png", fail_if_called)
+
+    client = TestClient(server.app)
+    # A real (if minimal) 1x1 transparent PNG — PyMuPDF's decoder requires valid image data.
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    resp = client.post(
+        "/mask",
+        json={
+            "job_applicant_id": "a0X000000000004",
+            "mask_strings": SAMPLE_PII,
+            "watermark_base64": base64.b64encode(tiny_png).decode("ascii"),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert body["watermark_used"] == "image:inline_base64"
+
+
+def test_mask_errors_on_invalid_watermark_base64(monkeypatch):
+    _install_mocks(monkeypatch)
+    client = TestClient(server.app)
+    resp = client.post(
+        "/mask",
+        json={
+            "job_applicant_id": "a0X000000000005",
+            "mask_strings": SAMPLE_PII,
+            "watermark_base64": "not-valid-base64!!!",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "base64" in body["detail"].lower()
+
+
+def test_mask_errors_on_unknown_client_key(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: True)
+
+    def fake_connect(client_key=None):
+        raise sf_client.UnknownClientError(f"Unknown client_key '{client_key}'. Configured: []")
+
+    monkeypatch.setattr(server.sf_client, "connect", fake_connect)
+
+    client = TestClient(server.app)
+    resp = client.post(
+        "/mask",
+        json={"job_applicant_id": "a0X000000000006", "client_key": "nonexistent"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "nonexistent" in body["detail"]
+
+
+def test_mask_retries_once_on_expired_session(monkeypatch):
+    """A SalesforceExpiredSession on the first attempt should trigger exactly one
+    forced-refresh retry via with_session(), not surface as a failure."""
+    from simple_salesforce.exceptions import SalesforceExpiredSession
+
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: True)
+
+    connect_calls = []
+
+    def fake_connect(client_key=None, force_refresh=False):
+        connect_calls.append(force_refresh)
+        return object()
+
+    monkeypatch.setattr(server.sf_client, "connect", fake_connect)
+
+    fetch_calls = []
+
+    def fake_fetch(job_applicant_id, sf=None):
+        fetch_calls.append(1)
+        if len(fetch_calls) == 1:
+            raise SalesforceExpiredSession(url="x", status=401, resource_name="ContentVersion", content=b"")
+        return _make_sample_pdf()
+
+    monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch)
+    monkeypatch.setattr(server.sf_client, "resolve_account_id", lambda jaid, sf=None: None)
+    monkeypatch.setattr(server.sf_client, "fetch_watermark_png", lambda account_id=None, sf=None: None)
+    monkeypatch.setattr(server.sf_client, "upload_masked_pdf",
+                        lambda jaid, pdf_bytes, filename, sf=None: "068000000000009AAA")
+
+    client = TestClient(server.app)
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000009", "mask_strings": SAMPLE_PII})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert len(fetch_calls) == 2, "expected exactly one retry"
+    assert connect_calls == [False, True], "second connect() must force a fresh token"
+
+
+def test_mask_batch_all_succeed(monkeypatch):
+    captured = _install_mocks(monkeypatch)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask/batch", json={
+        "items": [
+            {"job_applicant_id": "a0X000000000010", "mask_strings": SAMPLE_PII},
+            {"job_applicant_id": "a0X000000000011", "mask_strings": SAMPLE_PII},
+        ],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert body["succeeded"] == 2
+    assert body["failed"] == 0
+    assert [r["job_applicant_id"] for r in body["results"]] == ["a0X000000000010", "a0X000000000011"]
+    assert all(r["result"]["status"] == "ok" for r in body["results"])
+    assert captured["job_applicant_id"] == "a0X000000000011", "last item's upload should be the one captured"
+
+
+def test_mask_batch_partial_failure_does_not_abort_batch(monkeypatch):
+    """One item's ResumeNotFoundError must not prevent the rest of the batch from running."""
+    _install_mocks(monkeypatch)
+
+    def fake_fetch(job_applicant_id, sf=None):
+        if job_applicant_id == "a0X000000000BAD":
+            raise sf_client.ResumeNotFoundError(f"No resume found for Job Applicant '{job_applicant_id}'.")
+        return _make_sample_pdf()
+
+    monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask/batch", json={
+        "items": [
+            {"job_applicant_id": "a0X000000000GOOD1", "mask_strings": SAMPLE_PII},
+            {"job_applicant_id": "a0X000000000BAD", "mask_strings": SAMPLE_PII},
+            {"job_applicant_id": "a0X000000000GOOD2", "mask_strings": SAMPLE_PII},
+        ],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert body["succeeded"] == 2
+    assert body["failed"] == 1
+    statuses = {r["job_applicant_id"]: r["result"]["status"] for r in body["results"]}
+    assert statuses["a0X000000000GOOD1"] == "ok"
+    assert statuses["a0X000000000BAD"] == "error"
+    assert statuses["a0X000000000GOOD2"] == "ok"
+
+
+def test_mask_batch_errors_when_creds_missing(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: False)
+    client = TestClient(server.app)
+    resp = client.post("/mask/batch", json={"items": [{"job_applicant_id": "a0X000000000012"}]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+
+
+def test_mask_batch_rejects_empty_items():
+    client = TestClient(server.app)
+    resp = client.post("/mask/batch", json={"items": []})
+    assert resp.status_code == 422

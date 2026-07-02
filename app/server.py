@@ -1,25 +1,43 @@
 """Resume-masking service — FastAPI.
 
-Custom watermark IMAGE per client, stored in Salesforce as a File
-titled 'ResumeWatermark' on the Account record. Falls back to text.
+Custom watermark IMAGE per client, configured on the Salesforce side. Salesforce
+can hand it to us two ways:
+  1. Inline: the caller (Apex/Flow) reads the client's watermark File and sends
+     its base64 content directly in the /mask request (watermark_base64) — preferred,
+     no extra round-trip.
+  2. Stored: a File titled 'ResumeWatermark' on the Account record, which we fetch
+     ourselves via SOQL (account_id) if watermark_base64 isn't supplied.
+Falls back to a text watermark if neither is present.
 
 Flow (RecruitChamp: Job list -> click Job Id -> joined view of that job's requirements
 + eligible professionals -> Mask button on each row of that joined view):
-  join-view Mask button → POST /mask {job_applicant_id, account_id?, mask_strings}
+  join-view Mask button → POST /mask {job_applicant_id, account_id?, mask_strings, watermark_base64?}
     1. Fetch resume PDF from Salesforce
     2. Resolve the client Account: use account_id if the button passed one, else
        look it up from Job Applicant's own Account lookup (SCSCHAMPS__Account__c) —
        the join view already has both the job and the client in scope, so callers
        don't have to also pass account_id explicitly.
-    3. Fetch that client's watermark image from Salesforce (by the resolved Account)
+    3. Resolve the watermark image: use watermark_base64 if the caller sent it inline
+       (no extra round-trip), else fetch that client's watermark image from Salesforce
+       (by the resolved Account), else fall back to plain text.
     4. True-redact PII strings + overlay centered watermark image
     5. Upload masked PDF back to Salesforce
     6. Return {status, masked_content_version_id}
 
   Per-client watermark upload (once per client, reused for every job/applicant
-  under that client):
+  under that client; alternative to sending watermark_base64 inline each call):
     POST /watermark/upload {account_id, image_file} → stores as 'ResumeWatermark'
     on the client's Account record.
+
+  Bulk masking (same client_key, many Job Applicants in one call):
+    POST /mask/batch {client_key?, items: [{job_applicant_id, ...}]} → runs the
+    same per-item flow as /mask for each item against one shared Salesforce
+    session, so one bad item returns its own error without failing the batch.
+
+Every Salesforce operation in /mask and /mask/batch runs through
+sf_client.with_session(), which retries once with a forced-fresh token if the
+session turns out to be expired mid-request (see sf_client.py's with_session
+docstring for why the cached-token TTL is a conservative guess, not a guarantee).
 
 Auth: this is a public Railway URL (same pattern as RecruitChamp/LakeStream's other
 Salesforce-facing services), so /mask and /watermark/upload are gated by a shared
@@ -30,6 +48,8 @@ mid-rollout; /health stays open for Railway's healthcheck.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import re
 
@@ -52,7 +72,10 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 # --- PII detection fallback ---
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-_PHONE_RE = re.compile(r"\+?\d[\d\s().\-]{8,}\d")
+# Same-line separators only ([ ()\-.], not \s) -- \s also matches newlines, which let
+# this span unrelated stacked lines (e.g. education years, date ranges) and get
+# fuzzy-matched as a "phone number" by mask._phone_rects, blacking out real content.
+_PHONE_RE = re.compile(r"\+?\d[\d ().\-]{8,}\d")
 
 
 def detect_pii(pdf_bytes: bytes) -> list[str]:
@@ -79,6 +102,16 @@ class MaskRequest(BaseModel):
     account_id: str | None = Field(default=None, description="Salesforce Account Id (for per-client watermark).")
     mask_strings: list[str] | None = Field(default=None, description="Exact PII strings to redact.")
     watermark_text: str = Field(default="", description="Fallback text if no watermark image found.")
+    watermark_base64: str | None = Field(
+        default=None,
+        description="Base64-encoded PNG/JPEG watermark image, set up client-side in Salesforce and "
+                    "sent inline. Takes priority over the Salesforce-stored 'ResumeWatermark' File "
+                    "lookup (account_id) when both are present.")
+    client_key: str | None = Field(
+        default=None,
+        description="Which registered Salesforce client/org (SF_CLIENTS_JSON) to use for this call. "
+                    "Required when the service is configured for multiple clients via OAuth2 Client "
+                    "Credentials; omit for a single-tenant username/password deployment.")
 
 
 class MaskResponse(BaseModel):
@@ -95,23 +128,57 @@ class WatermarkUploadResponse(BaseModel):
     detail: str | None = None
 
 
+class BatchMaskItem(BaseModel):
+    job_applicant_id: str = Field(..., description="Salesforce Job Applicant record Id.")
+    account_id: str | None = Field(default=None, description="Salesforce Account Id (for per-client watermark).")
+    mask_strings: list[str] | None = Field(default=None, description="Exact PII strings to redact.")
+    watermark_base64: str | None = Field(
+        default=None,
+        description="Per-item watermark override. Falls back to the batch-level watermark_base64, "
+                    "then to the Salesforce-stored lookup, then to text — same priority as /mask.")
+
+
+class BatchMaskRequest(BaseModel):
+    items: list[BatchMaskItem] = Field(..., min_length=1, max_length=200,
+                                       description="Job Applicants to mask in this batch.")
+    client_key: str | None = Field(
+        default=None,
+        description="Which registered Salesforce client/org (SF_CLIENTS_JSON) to use for the whole "
+                    "batch — one shared session, reused across all items.")
+    watermark_text: str = Field(default="", description="Fallback text watermark, shared by all items.")
+    watermark_base64: str | None = Field(
+        default=None,
+        description="Batch-level watermark image, used for any item that doesn't set its own.")
+
+
+class BatchMaskResult(BaseModel):
+    job_applicant_id: str
+    result: MaskResponse
+
+
+class BatchMaskResponse(BaseModel):
+    status: str
+    results: list[BatchMaskResult] = Field(default_factory=list)
+    succeeded: int = 0
+    failed: int = 0
+    detail: str | None = None
+
+
 # --- Routes ---
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "salesforce_configured": sf_client.creds_configured()}
+    return {
+        "status": "ok",
+        "salesforce_configured": sf_client.creds_configured(),
+        "client_keys": sf_client.list_client_keys(),
+    }
 
 
-@app.post("/mask", response_model=MaskResponse, dependencies=[Depends(require_api_key)])
-def mask_endpoint(req: MaskRequest) -> MaskResponse:
-    if not sf_client.creds_configured():
-        return MaskResponse(status="error", detail="Salesforce credentials not configured.")
-
-    try:
-        sf = sf_client.connect()
-    except sf_client.MissingCredentialsError as e:
-        return MaskResponse(status="error", detail=str(e))
-
+def _mask_one(req: MaskRequest, sf) -> MaskResponse:
+    """Run the full mask pipeline for one Job Applicant against an already-connected
+    Salesforce session. Shared by /mask and /mask/batch so both retry and batch
+    behavior stay in one place."""
     # 1) Fetch resume PDF
     try:
         pdf_bytes = sf_client.fetch_resume_pdf(req.job_applicant_id, sf=sf)
@@ -123,30 +190,36 @@ def mask_endpoint(req: MaskRequest) -> MaskResponse:
     if not mask_strings:
         return MaskResponse(status="error", detail="No PII strings to mask.")
 
-    # 3) Resolve the client Account (per-client watermark) — if the caller (the
-    #    join-view mask button) didn't already pass account_id, look it up from
-    #    the Job Applicant's own Account lookup. Best-effort: falls through to
-    #    the global/text watermark if it can't be resolved.
-    account_id = req.account_id or sf_client.resolve_account_id(req.job_applicant_id, sf=sf)
-
-    # 4) Fetch client watermark image from Salesforce
+    # 3) Resolve the client watermark image, in priority order:
+    #    a) inline base64 (caller sent it directly, no extra round-trip)
+    #    b) Salesforce File lookup, against account_id if passed, else auto-resolved
+    #       from the Job Applicant's own Account lookup (SCSCHAMPS__Account__c) —
+    #       best-effort, falls through to the global/text watermark if it can't resolve.
     watermark_png = None
     watermark_used = "none"
-    try:
-        watermark_png = sf_client.fetch_watermark_png(account_id=account_id, sf=sf)
-        if watermark_png:
-            watermark_used = f"image:account_{account_id}" if account_id else "image:global"
-    except Exception:
-        watermark_png = None
+    if req.watermark_base64:
+        try:
+            watermark_png = base64.b64decode(req.watermark_base64, validate=True)
+            watermark_used = "image:inline_base64"
+        except (binascii.Error, ValueError):
+            return MaskResponse(status="error", detail="watermark_base64 is not valid base64.")
+    else:
+        account_id = req.account_id or sf_client.resolve_account_id(req.job_applicant_id, sf=sf)
+        try:
+            watermark_png = sf_client.fetch_watermark_png(account_id=account_id, sf=sf)
+            if watermark_png:
+                watermark_used = f"image:account_{account_id}" if account_id else "image:global"
+        except Exception:
+            watermark_png = None
 
-    # 5) True-redact + overlay watermark
+    # 4) True-redact PII text + candidate photos, then overlay watermark
     masked_bytes, hits = mask.mask_pdf_bytes(
         pdf_bytes, mask_strings,
         watermark_png=watermark_png,
         watermark_text=req.watermark_text or "CONFIDENTIAL",
     )
 
-    # 6) Upload masked PDF back to Salesforce
+    # 5) Upload masked PDF back to Salesforce
     filename = f"masked_{req.job_applicant_id}.pdf"
     new_id = sf_client.upload_masked_pdf(req.job_applicant_id, masked_bytes, filename, sf=sf)
 
@@ -158,11 +231,81 @@ def mask_endpoint(req: MaskRequest) -> MaskResponse:
     )
 
 
+@app.post("/mask", response_model=MaskResponse, dependencies=[Depends(require_api_key)])
+def mask_endpoint(req: MaskRequest) -> MaskResponse:
+    if not sf_client.creds_configured(client_key=req.client_key):
+        return MaskResponse(status="error", detail="Salesforce credentials not configured.")
+
+    try:
+        return sf_client.with_session(lambda sf: _mask_one(req, sf), client_key=req.client_key)
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
+        return MaskResponse(status="error", detail=str(e))
+
+
+def _batch_item_to_mask_request(item: BatchMaskItem, batch: BatchMaskRequest) -> MaskRequest:
+    return MaskRequest(
+        job_applicant_id=item.job_applicant_id,
+        account_id=item.account_id,
+        mask_strings=item.mask_strings,
+        watermark_text=batch.watermark_text,
+        watermark_base64=item.watermark_base64 or batch.watermark_base64,
+        client_key=batch.client_key,
+    )
+
+
+@app.post("/mask/batch", response_model=BatchMaskResponse, dependencies=[Depends(require_api_key)])
+def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
+    """Mask many Job Applicants in one call, one shared Salesforce session/org.
+
+    Each item is independent: one item's Salesforce/PDF error is captured in its
+    own result and does NOT abort the rest of the batch. _mask_one() is safe to
+    re-run (it only ever creates a new masked ContentVersion, never mutates the
+    original), so if the shared session expires mid-batch, with_session()'s
+    retry re-runs the whole batch once against a fresh session -- items already
+    completed before the expiry just produce a second masked copy, not a
+    duplicate-charge or inconsistent-state problem.
+    """
+    if not sf_client.creds_configured(client_key=req.client_key):
+        return BatchMaskResponse(status="error", detail="Salesforce credentials not configured.")
+
+    def run_batch(sf) -> BatchMaskResponse:
+        results: list[BatchMaskResult] = []
+        for item in req.items:
+            item_req = _batch_item_to_mask_request(item, req)
+            try:
+                result = _mask_one(item_req, sf)
+            except sf_client.SESSION_EXPIRED_ERRORS:
+                # Let with_session()'s retry handle this at the batch level --
+                # re-raising here (instead of turning it into a per-item error)
+                # is what makes the whole batch retry against a fresh session.
+                raise
+            except Exception as e:
+                # Any other per-item failure (e.g. a Salesforce validation rule
+                # rejecting the upload) must not take down the rest of the batch.
+                result = MaskResponse(status="error", detail=str(e)[:300])
+            results.append(BatchMaskResult(job_applicant_id=item.job_applicant_id, result=result))
+        succeeded = sum(1 for r in results if r.result.status == "ok")
+        return BatchMaskResponse(
+            status="ok",
+            results=results,
+            succeeded=succeeded,
+            failed=len(results) - succeeded,
+        )
+
+    try:
+        return sf_client.with_session(run_batch, client_key=req.client_key)
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
+        return BatchMaskResponse(status="error", detail=str(e))
+
+
 @app.post("/watermark/upload", response_model=WatermarkUploadResponse,
          dependencies=[Depends(require_api_key)])
 async def watermark_upload(
     account_id: str = Form(..., description="Salesforce Account Id."),
     file: UploadFile = File(..., description="Watermark image (PNG/JPEG)."),
+    client_key: str | None = Form(
+        default=None,
+        description="Which registered Salesforce client/org (SF_CLIENTS_JSON) owns this account."),
 ) -> WatermarkUploadResponse:
     """Upload a custom watermark image for a client account.
 
@@ -172,7 +315,7 @@ async def watermark_upload(
 
     Supported formats: PNG, JPEG. Recommended max dimensions: 800x800px.
     """
-    if not sf_client.creds_configured():
+    if not sf_client.creds_configured(client_key=client_key):
         return WatermarkUploadResponse(status="error", detail="Salesforce not configured.")
 
     contents = await file.read()
@@ -185,7 +328,7 @@ async def watermark_upload(
 
     filename = file.filename or "watermark.png"
     try:
-        sf = sf_client.connect()
+        sf = sf_client.connect(client_key=client_key)
         new_id = sf_client.upload_watermark_image(account_id, contents, filename, sf=sf)
         return WatermarkUploadResponse(
             status="ok",

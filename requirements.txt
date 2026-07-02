@@ -1,6 +1,7 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 simple-salesforce>=1.12
+requests>=2.31
 pymupdf>=1.24
 python-multipart>=0.0.9
 pytest>=8.0

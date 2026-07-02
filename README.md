@@ -43,10 +43,11 @@ under that client.
 | File | Purpose |
 |------|---------|
 | `app/mask.py` | Masking core — PyMuPDF true-redact + centered watermark. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). |
-| `app/sf_client.py` | Salesforce wrapper: `connect()`, `fetch_resume_pdf(id)`, `upload_masked_pdf(id, bytes, filename)`. All creds from ENV. |
-| `app/server.py` | FastAPI app: `POST /mask`, `GET /health`, `detect_pii()` fallback. |
+| `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)`, `upload_masked_pdf(id, bytes, filename)`. All creds from ENV. |
+| `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `GET /health`, `detect_pii()` fallback. |
 | `app/assets/watermark.png` | (Optional) company logo. If present, stamped centered; else a faint text watermark. |
-| `tests/test_server.py` | `/mask` + `/health` with Salesforce mocked, PyMuPDF real. |
+| `tests/test_server.py` | `/mask`, `/mask/batch` + `/health` with Salesforce mocked, PyMuPDF real. |
+| `tests/test_sf_client_multitenant.py` | Multi-client token registry, cache eviction, `with_session()` retry — network mocked. |
 | `Dockerfile`, `railway.json`, `Procfile` | Railway deploy. |
 | `.env.example` | Every env var, with comments. |
 
@@ -141,18 +142,66 @@ live org. Adjust if a different client org uses a different namespace.)
 Optionally include `"mask_strings": [...]` (the exact name/phone/email values from the on-prem resume
 parser — preferred, most accurate) and/or `"masking_profile": "<id>"`.
 
+**Watermark, set up client-side in Salesforce:** the client configures their logo as a File in Salesforce
+(e.g. on the Account, titled `ResumeWatermark`, or wherever your Apex/Flow reads it from). Pass it inline
+as base64 in the same call — no extra round-trip to us:
+
+```json
+{ "job_applicant_id": "{!JobApplicant.Id}", "watermark_base64": "{!Base64EncodedWatermarkFormula}" }
+```
+
+If `watermark_base64` is omitted, the service falls back to fetching a `ResumeWatermark` File from
+Salesforce itself via `account_id` (SOQL on `ContentVersion`), then to a plain text watermark.
+
+**Multi-client (multiple Salesforce orgs) via OAuth2 Client Credentials:** if the service is configured
+with `SF_CLIENTS_JSON` (see `.env.example`, Auth mode C), also pass `"client_key": "acme"` to select which
+registered org/Connected App to use for that call.
+
 **Security:** Salesforce creds live in the **service env** (Railway secrets), **never** in the button
-URL — the button passes only the Job Applicant Id. Set `MASK_API_KEY` (Railway env, see
-`.env.example`) once this leaves the pilot client — without it, `/mask` and `/watermark/upload` are
-open to anyone with the Railway URL. Named Credential in Apex lets you attach the header without the
-secret touching Flow/button config. The `/popup` page (browser-embedded) picks up the key
-automatically once it's set — nothing else to wire there. The service returns:
+URL — the button passes only the Job Applicant Id (+ optional watermark/client_key). Set `MASK_API_KEY`
+(Railway env, see `.env.example`) once this leaves the pilot client — without it, `/mask` and
+`/watermark/upload` are open to anyone with the Railway URL. Named Credential in Apex lets you attach the
+header without the secret touching Flow/button config. The `/popup` page (browser-embedded) picks up the
+key automatically once it's set — nothing else to wire there. The service returns:
 
 ```json
 { "status": "ok", "masked_content_version_id": "068...", "redacted_regions": 3 }
 ```
 
 The masked PDF appears as a new file on the record. No redirect, no popup.
+
+**Bulk masking:** to mask many Job Applicants in one call (e.g. a recruiter selecting a page of
+candidates for the same client), use `POST /mask/batch` instead of looping `/mask` per row:
+
+```json
+{
+  "client_key": "acme",
+  "items": [
+    { "job_applicant_id": "a0X000000000001" },
+    { "job_applicant_id": "a0X000000000002" }
+  ]
+}
+```
+
+`client_key`, `watermark_text`, and `watermark_base64` are shared batch-level defaults; each item can
+override `account_id` / `mask_strings` / `watermark_base64` individually. One item's failure (bad Id,
+no resume, no PII found) does not abort the rest of the batch — the response reports each item's own
+result:
+
+```json
+{
+  "status": "ok",
+  "succeeded": 1,
+  "failed": 1,
+  "results": [
+    { "job_applicant_id": "a0X000000000001", "result": { "status": "ok", "masked_content_version_id": "068..." } },
+    { "job_applicant_id": "a0X000000000002", "result": { "status": "error", "detail": "No resume found for Job Applicant 'a0X000000000002'." } }
+  ]
+}
+```
+
+Capped at 200 items per call. All items in a batch share one Salesforce session/org (`client_key`) —
+for candidates across different client orgs, send separate batch calls.
 
 ---
 

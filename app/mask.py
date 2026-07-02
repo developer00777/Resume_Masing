@@ -1,4 +1,5 @@
-"""Resume masking core — TRUE-redact PII + centered watermark IMAGE overlay.
+"""Resume masking core — TRUE-redact PII text, plus centered watermark
+IMAGE overlay.
 
 Watermark is a client-specific PNG image (logo/brand) stored in Salesforce,
 fetched at mask-time, stamped center-aligned on every page of the resume PDF.
@@ -66,7 +67,7 @@ def _phone_rects(page: fitz.Page, target: str) -> list[fitz.Rect]:
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
                    watermark_png: bytes | None = None,
                    watermark_text: str = "") -> tuple[bytes, int]:
-    """True-redact PII strings + overlay centered watermark image.
+    """True-redact PII strings, then overlay watermark.
 
     Args:
         pdf_bytes: Raw resume PDF bytes.
@@ -91,6 +92,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
             for rect in rects:
                 page.add_redact_annot(rect, fill=(0, 0, 0))
                 hits += 1
+
         page.apply_redactions()
 
         # Apply watermark
@@ -128,16 +130,26 @@ def _watermark_image(page: fitz.Page, png_bytes: bytes) -> None:
 
 
 def _watermark_text(page: fitz.Page, text: str) -> None:
-    """Fallback: centered watermark text if no image provided."""
+    """Fallback: diagonal, semi-transparent watermark text if no image provided.
+
+    Sized to a modest fraction of the page width (measured via real font
+    metrics, not a length-based guess) so it reads as a watermark stamp
+    rather than a banner that drowns out the resume content underneath.
+    """
     rect = page.rect
-    font_size = rect.width / max(len(text), 1) * 1.5
-    font_size = min(max(font_size, 18), 72)
+    font = fitz.Font("helv")
+    max_width = rect.width * 0.6
+
+    font_size = 36.0
+    while font_size > 8 and font.text_length(text, fontsize=font_size) > max_width:
+        font_size -= 2
 
     page.insert_textbox(
         rect,
         text,
         fontsize=font_size,
         color=(0.4, 0.4, 0.4),
+        fill_opacity=0.25,
         overlay=True,
         align=fitz.TEXT_ALIGN_CENTER,
     )
