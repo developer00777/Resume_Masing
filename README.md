@@ -44,9 +44,9 @@ under that client.
 |------|---------|
 | `app/mask.py` | Masking core — PyMuPDF true-redact + centered watermark. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). |
 | `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)`, `upload_masked_pdf(id, bytes, filename)`. All creds from ENV. |
-| `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `GET /health`, `detect_pii()` fallback. |
+| `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `POST /mask/inline`, `GET /health`, `detect_pii()` fallback. |
 | `app/assets/watermark.png` | (Optional) company logo. If present, stamped centered; else a faint text watermark. |
-| `tests/test_server.py` | `/mask`, `/mask/batch` + `/health` with Salesforce mocked, PyMuPDF real. |
+| `tests/test_server.py` | `/mask`, `/mask/batch`, `/mask/inline` + `/health` with Salesforce mocked, PyMuPDF real. |
 | `tests/test_sf_client_multitenant.py` | Multi-client token registry, cache eviction, `with_session()` retry — network mocked. |
 | `Dockerfile`, `railway.json`, `Procfile` | Railway deploy. |
 | `.env.example` | Every env var, with comments. |

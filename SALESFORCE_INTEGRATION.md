@@ -1,36 +1,53 @@
 # Salesforce Integration Guide — Resume Masking Service
 
 This doc is for the Salesforce team wiring up the *CV Masking* button. It covers:
-what the service does today, what we need confirmed before wiring the new
-Job → Contact → Applicant flow, and exactly how to call the API once that's settled.
+what the service does today, how to wire the new Job → Contact → Applicant
+flow, and the full API reference.
 
 ---
 
-## 1. Open items — please confirm before we finalize the Apex/Flow
+## 1. How to wire the new Contact → Applicant flow
 
-The requirement described (*Job record → ATS tab → CV Masking button → pull
-resume from the related Contact's Notes & Attachments → mask → save to the
-Applicant's Notes & Attachments*) is a **different object/field model** than
-what this service currently reads/writes (see [§4](#4-current-behavior-live-today)).
-We don't want to hardcode field/object API names we're guessing at, so we need:
+The requirement (*Job record → ATS tab → CV Masking button → pull resume from
+the related Contact's Notes & Attachments → mask → save to the Applicant's
+Notes & Attachments*) touches a Job/Contact/Applicant object model and a
+Notes & Attachments API (Files vs. legacy Attachment) that only your org
+knows for certain. Rather than us guessing SOQL/field names, **Apex should
+own all of the Salesforce read/write for this flow**, and call our service
+purely as a masking transform:
 
-| # | What we need | Why |
-|---|---------------------------------------------------------------------|-----|
-| 1 | API name of the **Job** object (e.g. `SCSCHAMPS__Job__c`?) | To know what record the button lives on and what Id the button passes us. |
-| 2 | API name of the **Applicant** object, and the relationship field linking it to Job and to Contact | To know where to write the masked file and how to resolve the candidate. |
-| 3 | Confirm: does "Notes & Attachments" mean modern **Files** (`ContentDocumentLink`/`ContentVersion`), or legacy **Attachment** objects (`Attachment.Body`/`ParentId`)? | These are different Salesforce APIs. Most orgs created after ~2017 use Files even when the page layout still says "Notes & Attachments," but some legacy orgs still use `Attachment`. This determines which SOQL/API we implement. |
-| 4 | How is the Contact related to the Job/Applicant? Direct lookup on Applicant, or via a junction? | To resolve "the candidate's resume" — i.e. which Contact record to read from. |
-| 5 | Where should the masked file be named/titled? Same title as source, or a fixed convention (e.g. `Masked_<name>`)? | Affects `Title`/`PathOnClient` on the new File/Attachment we create. |
-| 6 | Multiple resumes on one Contact — pick most recent, or is there a flag/field marking "the" resume? | Contact could have several attachments (old CVs, cover letters, ID docs). |
-| 7 | Which org(s)/client(s) does this apply to — same `SF_CLIENTS_JSON` multi-tenant setup as today, or a single org? | Determines whether the button needs to pass `client_key`. |
+```
+CV Masking button (on Job record)
+  → Apex:
+      1. Resolve the Contact from the Job (however your data model links them)
+      2. Read the resume from the Contact's Notes & Attachments (Attachment.Body
+         or ContentVersion.VersionData — Apex has native access to either, you
+         don't need to tell us which one your org uses)
+      3. Base64-encode it, POST to POST /mask/inline { resume_base64, mask_strings? }
+      4. Take masked_pdf_base64 from the response
+      5. Write it to the Applicant's Notes & Attachments (same API you read with)
+```
 
-Once we have these, we'll add a `fetch_resume_from_contact()` /
-`upload_masked_to_applicant()` pair to the service (mirroring the existing
-`fetch_resume_pdf()` / `upload_masked_pdf()` in `app/sf_client.py`) and this
-doc gets updated with the final request shape. **Until then, the API below
-reflects what's actually live** — if you want to start integrating now, wire
-the button to the current `/mask` contract and we'll swap the field names
-under the hood without changing your Apex once the above is confirmed.
+`/mask/inline` (see [§4](#4b-post-maskinline--mask-bytes-directly-no-salesforce-io))
+takes a base64 PDF in and returns a base64 masked PDF out — it never calls
+Salesforce itself, so there's no object/field API name for us to get wrong,
+and no Connected App / auth-to-your-org needed for this flow at all (still
+gated by `X-API-Key` if you've set one, same as every other endpoint).
+
+**What we still need from you**, only if you want us doing the PII detection
+too (recommended — see `mask_strings` below):
+- Nothing else. If you already have the candidate's name/phone/email as
+  structured fields on the Contact, pass them as `mask_strings` in the
+  request for the most accurate redaction — otherwise we fall back to a
+  regex scan of the PDF text (email + phone patterns), which is good but not
+  as precise as exact values from your data.
+
+If instead you'd prefer **we** do the Salesforce I/O (i.e. Apex just passes
+an Id and we fetch/write), that's also possible — but then we do need the
+object/field answers from the table this section used to have. Tell us and
+we'll follow up with those specific questions; the inline approach above
+avoids the whole conversation, so we'd lead with that unless there's a reason
+Apex can't own the Notes & Attachments read/write itself.
 
 ---
 
@@ -182,6 +199,43 @@ Max 200 items per call. One item's failure doesn't abort the batch:
   ]
 }
 ```
+
+### `POST /mask/inline` — mask bytes directly, no Salesforce I/O {#4b-post-maskinline--mask-bytes-directly-no-salesforce-io}
+
+**This is the recommended endpoint for the CV Masking button** (§1 above) —
+Apex fetches the resume and writes the result, we only transform bytes.
+
+**Request:**
+```json
+{
+  "resume_base64": "<base64 PDF, read from the Contact's Notes & Attachments>",
+  "mask_strings": ["John Doe", "+91 98765 43210", "john.doe@example.com"],
+  "watermark_text": "CONFIDENTIAL",
+  "watermark_base64": "<base64 PNG/JPEG, optional>"
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `resume_base64` | yes | The source PDF, base64-encoded. |
+| `mask_strings` | no | Exact PII strings to redact — pass the candidate's name/phone/email from your Contact fields for the most accurate result. Falls back to a regex email/phone scan if omitted. |
+| `watermark_text` | no | Fallback text watermark. Default `"CONFIDENTIAL"`. |
+| `watermark_base64` | no | Client logo image, base64. |
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "masked_pdf_base64": "<base64 masked PDF — write this to the Applicant's Notes & Attachments>",
+  "redacted_regions": 3,
+  "watermark_used": "image:inline_base64",
+  "detail": null
+}
+```
+
+No `job_applicant_id`, `account_id`, or `client_key` — this endpoint never
+calls Salesforce, so none of that is relevant. Same `X-API-Key` auth as
+every other endpoint applies if `MASK_API_KEY` is set.
 
 ### `POST /watermark/upload` — set a client's logo (one-time per client)
 

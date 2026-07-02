@@ -417,3 +417,99 @@ def test_mask_batch_rejects_empty_items():
     client = TestClient(server.app)
     resp = client.post("/mask/batch", json={"items": []})
     assert resp.status_code == 422
+
+
+def test_mask_inline_never_touches_salesforce(monkeypatch):
+    """/mask/inline must not call connect/fetch/upload -- it's pure bytes-in/bytes-out."""
+    import base64
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("mask/inline must not touch Salesforce")
+
+    monkeypatch.setattr(server.sf_client, "connect", fail_if_called)
+    monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fail_if_called)
+    monkeypatch.setattr(server.sf_client, "upload_masked_pdf", fail_if_called)
+
+    client = TestClient(server.app)
+    resp = client.post("/mask/inline", json={
+        "resume_base64": base64.b64encode(_make_sample_pdf()).decode("ascii"),
+        "mask_strings": SAMPLE_PII,
+    })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert body["redacted_regions"] > 0
+
+    masked_bytes = base64.b64decode(body["masked_pdf_base64"])
+    doc = fitz.open(stream=masked_bytes, filetype="pdf")
+    text = "".join(page.get_text() for page in doc)
+    doc.close()
+    assert "John Doe" not in text
+    assert "98765" not in text
+    assert "Acme Corp" in text, "non-PII content must survive masking"
+
+
+def test_mask_inline_falls_back_to_detect_pii():
+    import base64
+
+    client = TestClient(server.app)
+    resp = client.post("/mask/inline", json={
+        "resume_base64": base64.b64encode(_make_sample_pdf()).decode("ascii"),
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert body["redacted_regions"] > 0
+
+
+def test_mask_inline_errors_on_invalid_resume_base64():
+    client = TestClient(server.app)
+    resp = client.post("/mask/inline", json={"resume_base64": "not-valid-base64!!!"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "base64" in body["detail"].lower()
+
+
+def test_mask_inline_errors_on_malformed_pdf_bytes():
+    import base64
+
+    client = TestClient(server.app)
+    resp = client.post("/mask/inline", json={
+        "resume_base64": base64.b64encode(b"this is not a pdf").decode("ascii"),
+        "mask_strings": ["x"],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "masking failed" in body["detail"].lower()
+
+
+def test_mask_inline_with_watermark_base64():
+    import base64
+
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    client = TestClient(server.app)
+    resp = client.post("/mask/inline", json={
+        "resume_base64": base64.b64encode(_make_sample_pdf()).decode("ascii"),
+        "mask_strings": SAMPLE_PII,
+        "watermark_base64": base64.b64encode(tiny_png).decode("ascii"),
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok", body
+    assert body["watermark_used"] == "image:inline_base64"
+
+
+def test_mask_inline_requires_api_key_when_configured(monkeypatch):
+    import base64
+
+    monkeypatch.setenv("MASK_API_KEY", "secret-123")
+    client = TestClient(server.app)
+    resp = client.post("/mask/inline", json={
+        "resume_base64": base64.b64encode(_make_sample_pdf()).decode("ascii"),
+        "mask_strings": SAMPLE_PII,
+    })
+    assert resp.status_code == 401

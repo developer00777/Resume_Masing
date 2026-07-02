@@ -34,10 +34,18 @@ Flow (RecruitChamp: Job list -> click Job Id -> joined view of that job's requir
     same per-item flow as /mask for each item against one shared Salesforce
     session, so one bad item returns its own error without failing the batch.
 
+  Inline masking (no Salesforce I/O — for callers that fetch/write themselves,
+  e.g. Apex reading a Contact's Notes & Attachments and writing to a different
+  object's Notes & Attachments; we don't need to know that object model at all):
+    POST /mask/inline {resume_base64, mask_strings?, watermark_base64?} →
+    {masked_pdf_base64, ...}. Pure bytes-in/bytes-out, no client_key, no
+    Salesforce connection made.
+
 Every Salesforce operation in /mask and /mask/batch runs through
 sf_client.with_session(), which retries once with a forced-fresh token if the
 session turns out to be expired mid-request (see sf_client.py's with_session
 docstring for why the cached-token TTL is a conservative guess, not a guarantee).
+/mask/inline never touches Salesforce, so this doesn't apply to it.
 
 Auth: this is a public Railway URL (same pattern as RecruitChamp/LakeStream's other
 Salesforce-facing services), so /mask and /watermark/upload are gated by a shared
@@ -161,6 +169,21 @@ class BatchMaskResponse(BaseModel):
     results: list[BatchMaskResult] = Field(default_factory=list)
     succeeded: int = 0
     failed: int = 0
+    detail: str | None = None
+
+
+class InlineMaskRequest(BaseModel):
+    resume_base64: str = Field(..., description="Base64-encoded source resume PDF.")
+    mask_strings: list[str] | None = Field(default=None, description="Exact PII strings to redact.")
+    watermark_text: str = Field(default="", description="Fallback text if no watermark image found.")
+    watermark_base64: str | None = Field(default=None, description="Base64-encoded PNG/JPEG watermark image.")
+
+
+class InlineMaskResponse(BaseModel):
+    status: str
+    masked_pdf_base64: str | None = None
+    redacted_regions: int | None = None
+    watermark_used: str = "none"
     detail: str | None = None
 
 
@@ -296,6 +319,52 @@ def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
         return sf_client.with_session(run_batch, client_key=req.client_key)
     except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
         return BatchMaskResponse(status="error", detail=str(e))
+
+
+@app.post("/mask/inline", response_model=InlineMaskResponse, dependencies=[Depends(require_api_key)])
+def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
+    """Mask a resume PDF handed to us directly — no Salesforce fetch or upload.
+
+    For callers (e.g. Apex) that already have the source PDF bytes and want to
+    write the masked result back themselves, rather than pointing us at a
+    Salesforce record to fetch from/write to. This is what lets a caller own
+    an arbitrary source/destination record shape (e.g. read from one object's
+    Notes & Attachments, write to a different object's) without us needing to
+    know its object/field API names.
+    """
+    try:
+        pdf_bytes = base64.b64decode(req.resume_base64, validate=True)
+    except (binascii.Error, ValueError):
+        return InlineMaskResponse(status="error", detail="resume_base64 is not valid base64.")
+
+    mask_strings = req.mask_strings if req.mask_strings else detect_pii(pdf_bytes)
+    if not mask_strings:
+        return InlineMaskResponse(status="error", detail="No PII strings to mask.")
+
+    watermark_png = None
+    watermark_used = "none"
+    if req.watermark_base64:
+        try:
+            watermark_png = base64.b64decode(req.watermark_base64, validate=True)
+            watermark_used = "image:inline_base64"
+        except (binascii.Error, ValueError):
+            return InlineMaskResponse(status="error", detail="watermark_base64 is not valid base64.")
+
+    try:
+        masked_bytes, hits = mask.mask_pdf_bytes(
+            pdf_bytes, mask_strings,
+            watermark_png=watermark_png,
+            watermark_text=req.watermark_text or "CONFIDENTIAL",
+        )
+    except Exception as e:
+        return InlineMaskResponse(status="error", detail=f"Masking failed: {e}"[:300])
+
+    return InlineMaskResponse(
+        status="ok",
+        masked_pdf_base64=base64.b64encode(masked_bytes).decode("ascii"),
+        redacted_regions=hits,
+        watermark_used=watermark_used,
+    )
 
 
 @app.post("/watermark/upload", response_model=WatermarkUploadResponse,
