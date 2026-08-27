@@ -316,6 +316,32 @@ def test_mask_errors_on_unknown_client_key(monkeypatch):
     assert "nonexistent" in body["detail"]
 
 
+def test_mask_unknown_client_key_message_not_swallowed_by_creds_configured(monkeypatch):
+    """Regression: creds_configured(client_key=...) must not cause /mask to
+    report the generic 'Salesforce credentials not configured.' for an
+    UNREGISTERED client_key -- the caller needs the specific 'Unknown
+    client_key' message to know to register it, not a message implying the
+    whole deployment is unconfigured. Exercises the REAL creds_configured()
+    and connect() (only the SF_CLIENTS_JSON registry is faked via env),
+    unlike test_mask_errors_on_unknown_client_key above which mocks
+    creds_configured itself and therefore can't catch this class of bug --
+    found via live regression testing against a real deployment."""
+    monkeypatch.setenv("SF_CLIENTS_JSON", '{"known-key": {"client_id":"x","client_secret":"y",'
+                                          '"token_url":"https://x/token","instance_url":"https://x"}}')
+    sf_client.invalidate_registry_cache()
+    client = TestClient(server.app)
+    try:
+        resp = client.post("/mask", json={"job_applicant_id": "a0X000000000001", "client_key": "totally-unknown"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "error"
+        assert "unknown" in body["detail"].lower() and "totally-unknown" in body["detail"], body
+        assert "not configured" not in body["detail"].lower(), \
+            f"generic message leaked through instead of the specific one: {body['detail']!r}"
+    finally:
+        sf_client.invalidate_registry_cache()
+
+
 def test_mask_retries_once_on_expired_session(monkeypatch):
     """A SalesforceExpiredSession on the first attempt should trigger exactly one
     forced-refresh retry via with_session(), not surface as a failure."""

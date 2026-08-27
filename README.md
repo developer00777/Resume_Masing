@@ -46,6 +46,7 @@ under that client.
 | `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)`, `upload_masked_pdf(id, bytes, filename)`. All creds from ENV. |
 | `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `POST /mask/inline`, `GET /health`, `detect_pii()` fallback. |
 | `app/assets/watermark.png` | (Optional) company logo. If present, stamped centered; else a faint text watermark. |
+| `API.md` | Full endpoint + environment-variable reference, including the **current live Railway config** (today: only `DATABASE_URL` is set) and exactly what each endpoint does/doesn't do as a result. |
 | `tests/test_server.py` | `/mask`, `/mask/batch`, `/mask/inline` + `/health` with Salesforce mocked, PyMuPDF real. |
 | `tests/test_sf_client_multitenant.py` | Multi-client token registry, cache eviction, `with_session()` retry — network mocked. |
 | `Dockerfile`, `railway.json`, `Procfile` | Railway deploy. |

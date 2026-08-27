@@ -303,9 +303,13 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
 
 @app.post("/mask", response_model=MaskResponse, dependencies=[Depends(require_api_key)])
 def mask_endpoint(req: MaskRequest) -> MaskResponse:
-    if not sf_client.creds_configured(client_key=req.client_key):
-        return MaskResponse(status="error", detail="Salesforce credentials not configured.")
-
+    # No creds_configured() pre-check here -- it used to gate this call, but
+    # creds_configured() swallows UnknownClientError into a plain bool, which
+    # made an unregistered client_key report the generic "not configured"
+    # message instead of the specific "Unknown client_key '...'" one below.
+    # connect() (via with_session()) raises the same two exception types
+    # directly, with no extra network call for the client_key branch, so the
+    # pre-check was redundant as well as lossy -- removed, not replaced.
     try:
         return sf_client.with_session(lambda sf: _mask_one(req, sf), client_key=req.client_key)
     except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
@@ -335,9 +339,6 @@ def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
     completed before the expiry just produce a second masked copy, not a
     duplicate-charge or inconsistent-state problem.
     """
-    if not sf_client.creds_configured(client_key=req.client_key):
-        return BatchMaskResponse(status="error", detail="Salesforce credentials not configured.")
-
     def run_batch(sf) -> BatchMaskResponse:
         results: list[BatchMaskResult] = []
         for item in req.items:
@@ -504,8 +505,14 @@ async def watermark_upload(
 
     Supported formats: PNG, JPEG. Recommended max dimensions: 800x800px.
     """
-    if not sf_client.creds_configured(client_key=client_key):
-        return WatermarkUploadResponse(status="error", detail="Salesforce not configured.")
+    # Connect first (fail fast before touching the uploaded file). No
+    # creds_configured() pre-check -- same reasoning as /mask: it swallowed
+    # UnknownClientError into a generic "not configured" message instead of
+    # the specific one connect() itself raises, caught below.
+    try:
+        sf = sf_client.connect(client_key=client_key)
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
+        return WatermarkUploadResponse(status="error", detail=str(e))
 
     contents = await file.read()
     if not contents:
@@ -517,7 +524,6 @@ async def watermark_upload(
 
     filename = file.filename or "watermark.png"
     try:
-        sf = sf_client.connect(client_key=client_key)
         new_id = sf_client.upload_watermark_image(account_id, contents, filename, sf=sf)
         return WatermarkUploadResponse(
             status="ok",
