@@ -130,7 +130,7 @@ Railway injects `$PORT`; the Dockerfile / `railway.json` start command binds to 
 Repoint the existing **"Generate Masking"** button (Apex / Flow / external action) at:
 
 ```
-POST  https://<your-railway-app>.up.railway.app/mask
+POST  https://resume-masker-production.up.railway.app/mask
 Content-Type: application/json
 X-API-Key: <MASK_API_KEY, if you've set one — see below>
 

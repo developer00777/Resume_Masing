@@ -4,6 +4,16 @@ This doc is for the Salesforce team wiring up the *CV Masking* button. It covers
 what the service does today, how to wire the new Job → Contact → Applicant
 flow, and the full API reference.
 
+> **Status: LIVE.** The service is deployed and connected to Salesforce —
+> `GET /health` (below) currently reports `salesforce_configured: true`.
+> `X-API-Key` auth is enforced on every write endpoint; request the key
+> through a private channel (Slack/email), never via a ticket or commit —
+> it is deliberately not written down in this doc. Every endpoint below has
+> been exercised against this live deployment with real HTTP calls, not just
+> read from the code — see `API.md` in this repo for the fuller endpoint +
+> environment-variable reference (written for us/ops; this doc is the one to
+> hand your Apex/Flow team).
+
 ---
 
 ## 1. How to wire the new Contact → Applicant flow
@@ -56,7 +66,7 @@ reason Apex can't own the Notes & Attachments read/write itself.
 ## 2. Base URL & Auth
 
 ```
-Base URL: https://<your-railway-app>.up.railway.app
+Base URL: https://resume-masker-production.up.railway.app
 ```
 
 Every write endpoint (`/mask`, `/mask/batch`, `/mask/inline`, `/watermark/upload`, `/clients/self-register`) requires a shared-secret header once `MASK_API_KEY` is set on our side (`/admin/clients` uses a separate key, see §3b):
@@ -78,9 +88,16 @@ req.setHeader('Content-Type', 'application/json');
 `GET /health` is unauthenticated (used for Railway's own healthcheck and for you to sanity-check the deploy):
 
 ```bash
-curl https://<your-railway-app>.up.railway.app/health
-# {"status":"ok","salesforce_configured":true,"client_keys":["00D5f000000ABCDEAU"],"registry_backend":"db+env"}
+curl https://resume-masker-production.up.railway.app/health
+# actual live response right now:
+# {"status":"ok","salesforce_configured":true,"client_keys":[],"registry_backend":"db+env"}
 ```
+
+`client_keys: []` means no multi-org (Option C) orgs are registered yet — the
+service is currently authenticated to Salesforce via a single-org
+username/password connection (Option A), not per-`client_key`. If your org
+needs multi-org routing, register via `/clients/self-register` (§3a) and it
+will show up in this list.
 
 `registry_backend` tells you whether dynamic org registration (§3b below) is available on this deployment: `"db+env"` means yes, `"env-only"` means orgs can only be added via a static config change on our side.
 
