@@ -323,6 +323,38 @@ def test_candidate_settings_surfaces_missing_credentials_error(monkeypatch):
     assert "missing" in body["detail"].lower()
 
 
+def test_candidate_settings_status_requires_api_key(monkeypatch):
+    monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
+    client = TestClient(server.app)
+    resp = client.get("/candidate/settings")
+    assert resp.status_code == 401
+
+
+def test_candidate_settings_status_reports_unconfigured(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "default_credentials_status",
+                        lambda: {"configured": False, "login_host": None, "has_client_credentials": False})
+    client = TestClient(server.app)
+    resp = client.get("/candidate/settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["configured"] is False
+
+
+def test_candidate_settings_status_reports_configured_without_secrets(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "default_credentials_status",
+                        lambda: {"configured": True, "login_host": "test", "has_client_credentials": True})
+    client = TestClient(server.app)
+    resp = client.get("/candidate/settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["configured"] is True
+    assert body["login_host"] == "test"
+    assert body["has_client_credentials"] is True
+    assert "password" not in resp.text.lower()
+    assert "secret" not in [k.lower() for k in body.keys()]
+
+
 def test_candidate_settings_delete_requires_api_key(monkeypatch):
     monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
     client = TestClient(server.app)

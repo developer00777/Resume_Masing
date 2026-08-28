@@ -359,6 +359,27 @@ def test_connect_falls_back_to_env_vars_when_no_override_stored(monkeypatch):
     assert kwargs["security_token"] == "envtoken"
 
 
+def test_default_credentials_status_unconfigured(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    _install_fake_db(monkeypatch)
+    status = sf_client.default_credentials_status()
+    assert status == {"configured": False, "login_host": None, "has_client_credentials": False}
+
+
+def test_default_credentials_status_configured_never_includes_password_or_secret(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("super-secret-password", "ck", "cs", "test")
+
+    status = sf_client.default_credentials_status()
+    assert status["configured"] is True
+    assert status["login_host"] == "test"
+    assert status["has_client_credentials"] is True
+    assert "password" not in status
+    assert "client_secret" not in status
+    assert "super-secret-password" not in str(status)
+
+
 def test_remove_default_credentials_returns_false_when_none_stored(monkeypatch):
     monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
     _install_fake_db(monkeypatch)

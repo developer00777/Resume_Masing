@@ -480,6 +480,22 @@ def remove_client(client_key: str) -> bool:
     return deleted
 
 
+def default_credentials_status() -> dict:
+    """Non-destructive status check for the default-connection override --
+    NEVER includes the password or Consumer Secret. Backs GET
+    /candidate/settings, added because there was previously no way to
+    confirm whether a Settings-tab save actually persisted short of the
+    destructive DELETE (which reports "existed" only by removing it)."""
+    override = _load_default_override(force=True)
+    if override is None:
+        return {"configured": False, "login_host": None, "has_client_credentials": False}
+    return {
+        "configured": True,
+        "login_host": override["login_host"],
+        "has_client_credentials": bool(override["client_id"] and override["client_secret"]),
+    }
+
+
 def remove_default_credentials() -> bool:
     """Clear the default-connection override (POST /candidate/settings)
     so connect() falls back to the static SF_* env vars again. Returns

@@ -253,6 +253,13 @@ class CandidateSettingsResponse(BaseModel):
     detail: str | None = None
 
 
+class CandidateSettingsStatusResponse(BaseModel):
+    status: str
+    configured: bool = False
+    login_host: str | None = None
+    has_client_credentials: bool = False
+
+
 # --- Routes ---
 
 @app.get("/health")
@@ -585,6 +592,20 @@ def candidate_mask_profile_index(request: Request, ids: str = "", uname: str = "
     }
     return templates.TemplateResponse(
         request, "candidate_mask_profile_index.html", {"ctx": ctx})
+
+
+@app.get("/candidate/settings", response_model=CandidateSettingsStatusResponse,
+        dependencies=[Depends(require_api_key)])
+def candidate_settings_status() -> CandidateSettingsStatusResponse:
+    """Non-destructive check for whether a Settings-tab save actually
+    persisted -- never returns the password or Consumer Secret, only
+    whether an override exists and (if so) its login_host. force=True on
+    the underlying read so this always reflects the current DB state, not
+    a stale up-to-30s-old in-process cache."""
+    s = sf_client.default_credentials_status()
+    return CandidateSettingsStatusResponse(
+        status="ok", configured=s["configured"], login_host=s["login_host"],
+        has_client_credentials=s["has_client_credentials"])
 
 
 @app.post("/candidate/settings", response_model=CandidateSettingsResponse,
