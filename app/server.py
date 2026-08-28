@@ -62,7 +62,7 @@ import os
 import re
 
 from fastapi import Depends, FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from app import crypto_util, mask, sf_client
@@ -532,6 +532,22 @@ async def watermark_upload(
         )
     except Exception as e:
         return WatermarkUploadResponse(status="error", detail=str(e)[:200])
+
+
+@app.get("/candidate/MaskProfileIndex")
+def legacy_mask_profile_index_redirect() -> RedirectResponse:
+    """Compatibility redirect for the old freelancer app's URL.
+
+    Railway logs show live, repeated requests to this exact path (a 404
+    before this route existed) -- some Salesforce button/Lightning
+    Component/Visualforce config still hardcodes it from before this
+    service replaced the freelancer app at the same domain. Redirects to
+    /popup, this service's actual embeddable UI, so those stale links work
+    immediately. The Salesforce-side config should still be updated to
+    point here directly (see SALESFORCE_INTEGRATION.md) when convenient --
+    this is a stopgap, not a substitute for fixing the source.
+    """
+    return RedirectResponse(url="/popup")
 
 
 @app.get("/popup", response_class=HTMLResponse)

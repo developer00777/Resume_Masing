@@ -14,10 +14,14 @@ flow, and the full API reference.
 > environment-variable reference (written for us/ops; this doc is the one to
 > hand your Apex/Flow team).
 
-> **⚠️ Action needed on your side:** Railway logs show repeated live requests
-> to `GET /candidate/MaskProfileIndex` on this URL — a 404, since this
-> service never defines that route. It has the shape of a leftover path
-> from the old freelancer app that used to live at this same domain.
+> **ℹ️ Stopgap in place, real fix still on your side:** Railway logs showed
+> repeated live requests to `GET /candidate/MaskProfileIndex` on this URL —
+> a 404, since this service never defined that route. It has the shape of a
+> leftover path from the old freelancer app that used to live at this same
+> domain. **This service now redirects that path to `/popup`** so whatever's
+> still pointed at it works immediately — but the underlying Salesforce
+> config should still be updated to the correct URL directly when
+> convenient; the redirect is a patch, not a fix for the stale reference.
 >
 > **Step 1 — find it fast, via Developer Console → Debug → Open Execute
 > Anonymous Window (or Workbench), Tooling API query:**
@@ -47,7 +51,8 @@ flow, and the full API reference.
 >   (§2 and §4 below) if the button should trigger masking directly rather
 >   than display a page.
 >
-> Until this is fixed, whoever clicks that button/page gets a dead link.
+> Steps 1–3 above still apply if you want to fix the source instead of
+> relying on the redirect long-term.
 
 ---
 

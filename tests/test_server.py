@@ -217,6 +217,16 @@ def test_popup_is_real_html_and_carries_the_key(monkeypatch):
     assert 'const API_KEY = "s3cr3t"' in resp.text
 
 
+def test_legacy_mask_profile_index_redirects_to_popup():
+    """Compatibility redirect for the old freelancer app's URL, which some
+    Salesforce button/component config still hardcodes -- Railway logs showed
+    dozens of live 404 hits to this exact path."""
+    client = TestClient(server.app, follow_redirects=False)
+    resp = client.get("/candidate/MaskProfileIndex")
+    assert resp.status_code in (302, 307), resp.status_code
+    assert resp.headers["location"] == "/popup"
+
+
 def test_mask_auto_resolves_account_id_for_per_client_watermark(monkeypatch):
     """The join-view button only passes job_applicant_id (no account_id) -- the
     service should resolve the client Account itself (SCSCHAMPS__Account__c on

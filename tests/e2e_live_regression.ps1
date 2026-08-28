@@ -119,6 +119,19 @@ Test-Case "GET /nonexistent-route returns 404" {
     return ($r.Status -eq 404), "status=$($r.Status)"
 }
 
+Test-Case "GET /candidate/MaskProfileIndex redirects to /popup (stale freelancer-app URL compat)" {
+    # Railway logs showed dozens of live hits to this exact path -- a leftover
+    # reference in some Salesforce button/component config to the old
+    # freelancer app that used to live at this same domain. Compatibility
+    # redirect added so those stale links keep working while the Salesforce
+    # side gets updated (see SALESFORCE_INTEGRATION.md). Uses -MaximumRedirection 0
+    # directly (not Invoke-Api, which follows redirects by default) so the
+    # 3xx itself is inspected instead of the page it points to.
+    $resp = Invoke-WebRequest -Uri "$BaseUrl/candidate/MaskProfileIndex" -MaximumRedirection 0 -UseBasicParsing -TimeoutSec 30
+    $ok = ($resp.StatusCode -eq 307 -or $resp.StatusCode -eq 302) -and $resp.Headers["Location"] -eq "/popup"
+    return $ok, "status=$($resp.StatusCode) location=$($resp.Headers['Location'])"
+}
+
 # ── 2. Auth enforcement ──────────────────────────────────────────────────
 Test-Case "POST /mask without X-API-Key is rejected IF MASK_API_KEY is enforced (else runs unauthenticated)" {
     $r = Invoke-Api POST "/mask" (@{job_applicant_id="a0X000000000001"} | ConvertTo-Json)
