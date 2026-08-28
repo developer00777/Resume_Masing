@@ -27,7 +27,7 @@ from typing import Callable, TypeVar
 
 import requests
 from simple_salesforce import Salesforce
-from simple_salesforce.exceptions import SalesforceExpiredSession
+from simple_salesforce.exceptions import SalesforceExpiredSession, SalesforceAuthenticationFailed
 
 from app import crypto_util, db
 
@@ -59,6 +59,17 @@ class InvalidIdError(RuntimeError):
 
 class UnknownClientError(RuntimeError):
     pass
+
+
+class SalesforceAuthenticationError(RuntimeError):
+    """Salesforce itself rejected the credentials (bad password/token/
+    consumer key-secret) -- distinct from MissingCredentialsError (nothing
+    configured at all). Wraps simple_salesforce's SalesforceAuthenticationFailed
+    so every caller uses this module's own exception vocabulary instead of
+    reaching into simple_salesforce's. Previously uncaught anywhere, which
+    turned a bad password (env var OR a bad Settings-tab-saved override)
+    into an unhandled 500 on /mask, /mask/batch, and /watermark/upload
+    instead of a clean, actionable error message."""
 
 
 class PostgresNotConfiguredError(RuntimeError):
@@ -308,35 +319,42 @@ def connect(client_key: str | None = None, force_refresh: bool = False) -> Sales
         return _connect_with_client_credentials(client_key, force_refresh=force_refresh)
 
     override = _load_default_override(force=force_refresh)
-    if override is not None:
-        username = os.environ.get("SF_USERNAME", "").strip()
-        if not username:
-            raise MissingCredentialsError(
-                "Salesforce credentials not configured. Missing: SF_USERNAME "
-                "(the Settings-tab-stored password/creds need SF_USERNAME set "
-                "in the environment alongside them).")
-        domain = (override["login_host"] or "").strip() or "login"
-        if override["client_id"] and override["client_secret"]:
+    try:
+        if override is not None:
+            username = os.environ.get("SF_USERNAME", "").strip()
+            if not username:
+                raise MissingCredentialsError(
+                    "Salesforce credentials not configured. Missing: SF_USERNAME "
+                    "(the Settings-tab-stored password/creds need SF_USERNAME set "
+                    "in the environment alongside them).")
+            domain = (override["login_host"] or "").strip() or "login"
+            if override["client_id"] and override["client_secret"]:
+                return Salesforce(username=username, password=override["password"],
+                                  consumer_key=override["client_id"], consumer_secret=override["client_secret"],
+                                  domain=domain)
+            # No Connected App creds stored -- plain username/password login. The
+            # Settings-tab form tells the caller to concatenate the security token
+            # into the password themselves, so security_token="" here (simple-
+            # salesforce just concatenates password + security_token internally;
+            # "" is a no-op when the token is already part of the password).
             return Salesforce(username=username, password=override["password"],
-                              consumer_key=override["client_id"], consumer_secret=override["client_secret"],
-                              domain=domain)
-        # No Connected App creds stored -- plain username/password login. The
-        # Settings-tab form tells the caller to concatenate the security token
-        # into the password themselves, so security_token="" here (simple-
-        # salesforce just concatenates password + security_token internally;
-        # "" is a no-op when the token is already part of the password).
-        return Salesforce(username=username, password=override["password"],
-                          security_token="", domain=domain)
+                              security_token="", domain=domain)
 
-    domain = os.environ.get("SF_DOMAIN", "login").strip() or "login"
-    if os.environ.get("SF_CONSUMER_KEY"):
-        c = _require("SF_USERNAME", "SF_PASSWORD", "SF_CONSUMER_KEY", "SF_CONSUMER_SECRET")
+        domain = os.environ.get("SF_DOMAIN", "login").strip() or "login"
+        if os.environ.get("SF_CONSUMER_KEY"):
+            c = _require("SF_USERNAME", "SF_PASSWORD", "SF_CONSUMER_KEY", "SF_CONSUMER_SECRET")
+            return Salesforce(username=c["SF_USERNAME"], password=c["SF_PASSWORD"],
+                              consumer_key=c["SF_CONSUMER_KEY"], consumer_secret=c["SF_CONSUMER_SECRET"],
+                              domain=domain)
+        c = _require("SF_USERNAME", "SF_PASSWORD", "SF_SECURITY_TOKEN")
         return Salesforce(username=c["SF_USERNAME"], password=c["SF_PASSWORD"],
-                          consumer_key=c["SF_CONSUMER_KEY"], consumer_secret=c["SF_CONSUMER_SECRET"],
-                          domain=domain)
-    c = _require("SF_USERNAME", "SF_PASSWORD", "SF_SECURITY_TOKEN")
-    return Salesforce(username=c["SF_USERNAME"], password=c["SF_PASSWORD"],
-                      security_token=c["SF_SECURITY_TOKEN"], domain=domain)
+                          security_token=c["SF_SECURITY_TOKEN"], domain=domain)
+    except SalesforceAuthenticationFailed as e:
+        source = "the Settings-tab-stored default connection" if override is not None else "the configured (env var) credentials"
+        raise SalesforceAuthenticationError(
+            f"Salesforce rejected {source}: {e}. If this was just changed via "
+            "the Settings tab, clear it with DELETE /candidate/settings to "
+            "fall back to the working env-var credentials.") from e
 
 
 class SessionExpiredError(RuntimeError):

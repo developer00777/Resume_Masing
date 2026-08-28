@@ -520,6 +520,56 @@ def test_mask_unknown_client_key_message_not_swallowed_by_creds_configured(monke
         sf_client.invalidate_registry_cache()
 
 
+def test_mask_surfaces_salesforce_auth_failure_cleanly_not_500(monkeypatch):
+    """Regression: connect() raising SalesforceAuthenticationError (bad
+    password/token, from env vars OR a bad Settings-tab-saved override) must
+    return a clean {status: error} response, not an uncaught 500. This was
+    the actual root cause of a real "/mask/batch 500" report -- neither
+    /mask nor /mask/batch caught this exception type at all before the fix."""
+    def fake_connect(client_key=None, force_refresh=False):
+        raise sf_client.SalesforceAuthenticationError(
+            "Salesforce rejected the configured credentials: INVALID_LOGIN")
+
+    monkeypatch.setattr(server.sf_client, "connect", fake_connect)
+    client = TestClient(server.app)
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000001"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "rejected" in body["detail"].lower()
+
+
+def test_mask_batch_surfaces_salesforce_auth_failure_cleanly_not_500(monkeypatch):
+    def fake_connect(client_key=None, force_refresh=False):
+        raise sf_client.SalesforceAuthenticationError(
+            "Salesforce rejected the configured credentials: INVALID_LOGIN")
+
+    monkeypatch.setattr(server.sf_client, "connect", fake_connect)
+    client = TestClient(server.app)
+    resp = client.post("/mask/batch", json={"items": [{"job_applicant_id": "a0X000000000001"}]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "rejected" in body["detail"].lower()
+
+
+def test_watermark_upload_surfaces_salesforce_auth_failure_cleanly(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "creds_configured", lambda client_key=None: True)
+
+    def fake_connect(client_key=None, force_refresh=False):
+        raise sf_client.SalesforceAuthenticationError(
+            "Salesforce rejected the configured credentials: INVALID_LOGIN")
+
+    monkeypatch.setattr(server.sf_client, "connect", fake_connect)
+    client = TestClient(server.app)
+    resp = client.post("/watermark/upload", data={"account_id": "001XXXXXXXXXXXXAAA"},
+                       files={"file": ("logo.png", b"\x89PNG\r\n\x1a\n" + b"x" * 10, "image/png")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "rejected" in body["detail"].lower()
+
+
 def test_mask_retries_once_on_expired_session(monkeypatch):
     """A SalesforceExpiredSession on the first attempt should trigger exactly one
     forced-refresh retry via with_session(), not surface as a failure."""

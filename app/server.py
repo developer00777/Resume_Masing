@@ -339,7 +339,8 @@ def mask_endpoint(req: MaskRequest) -> MaskResponse:
     # pre-check was redundant as well as lossy -- removed, not replaced.
     try:
         return sf_client.with_session(lambda sf: _mask_one(req, sf), client_key=req.client_key)
-    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
+            sf_client.SalesforceAuthenticationError) as e:
         return MaskResponse(status="error", detail=str(e))
 
 
@@ -392,7 +393,8 @@ def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
 
     try:
         return sf_client.with_session(run_batch, client_key=req.client_key)
-    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
+            sf_client.SalesforceAuthenticationError) as e:
         return BatchMaskResponse(status="error", detail=str(e))
 
 
@@ -538,7 +540,8 @@ async def watermark_upload(
     # the specific one connect() itself raises, caught below.
     try:
         sf = sf_client.connect(client_key=client_key)
-    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError) as e:
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
+            sf_client.SalesforceAuthenticationError) as e:
         return WatermarkUploadResponse(status="error", detail=str(e))
 
     contents = await file.read()

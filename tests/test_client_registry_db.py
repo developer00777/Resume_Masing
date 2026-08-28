@@ -332,6 +332,47 @@ def test_connect_uses_default_override_connected_app_when_client_id_present(monk
     assert kwargs["domain"] == "login"
 
 
+def test_connect_wraps_bad_env_var_credentials_as_salesforce_auth_error(monkeypatch):
+    """Regression: a real SalesforceAuthenticationFailed (Salesforce
+    rejecting a bad password/token) from the plain env-var login path used
+    to propagate completely uncaught -- this is what turned a bad
+    SF_PASSWORD/SF_SECURITY_TOKEN into an unhandled 500 on /mask instead of
+    a clean error."""
+    monkeypatch.setenv("SF_USERNAME", "user@org.com")
+    monkeypatch.setenv("SF_PASSWORD", "wrong-password")
+    monkeypatch.setenv("SF_SECURITY_TOKEN", "wrong-token")
+    _install_fake_db(monkeypatch)  # configured but no override row -- exercises the env-var branch
+
+    from simple_salesforce.exceptions import SalesforceAuthenticationFailed
+
+    def raising_salesforce(**kwargs):
+        raise SalesforceAuthenticationFailed("INVALID_LOGIN", "Invalid username, password, security token")
+
+    monkeypatch.setattr(sf_client, "Salesforce", raising_salesforce)
+
+    with pytest.raises(sf_client.SalesforceAuthenticationError) as exc_info:
+        sf_client.connect()
+    assert "rejected" in str(exc_info.value).lower()
+
+
+def test_connect_wraps_bad_override_credentials_as_salesforce_auth_error(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.setenv("SF_USERNAME", "user@org.partialcpy")
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("bad-password", None, None, "test")
+
+    from simple_salesforce.exceptions import SalesforceAuthenticationFailed
+
+    def raising_salesforce(**kwargs):
+        raise SalesforceAuthenticationFailed("INVALID_LOGIN", "Invalid username, password, security token")
+
+    monkeypatch.setattr(sf_client, "Salesforce", raising_salesforce)
+
+    with pytest.raises(sf_client.SalesforceAuthenticationError) as exc_info:
+        sf_client.connect()
+    assert "settings-tab" in str(exc_info.value).lower()
+
+
 def test_connect_raises_when_override_present_but_sf_username_unset(monkeypatch):
     monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
     monkeypatch.delenv("SF_USERNAME", raising=False)
