@@ -77,7 +77,22 @@
     maskSpinner.classList.toggle("d-none", !busy);
   }
 
-  maskBtn.addEventListener("click", function () {
+  // LibreOffice conversion alone measures ~2-4s per .docx resume (real
+  // measurement, not an estimate); add Salesforce round-trips and upload
+  // time and a full 200-item batch in ONE blocking request can run well
+  // past any reasonable HTTP timeout, hanging with nothing to show for it.
+  // Chunking keeps each request's wall-clock time bounded, gives visible
+  // incremental progress, and means a failure partway through doesn't
+  // lose the results already completed.
+  var MASK_CHUNK_SIZE = 5;
+
+  function chunk(arr, size) {
+    var out = [];
+    for (var i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  }
+
+  maskBtn.addEventListener("click", async function () {
     var ids = parseIds(jaIds.value);
     maskSummary.classList.remove("d-none", "summary-error");
 
@@ -88,31 +103,47 @@
     }
 
     setMaskBusy(true);
-    maskSummary.textContent = "Masking " + ids.length + " profile(s)...";
+    var chunks = chunk(ids, MASK_CHUNK_SIZE);
+    var allResults = [];
+    var succeeded = 0;
+    var failed = 0;
 
-    fetch("/mask/batch", {
-      method: "POST",
-      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders),
-      body: JSON.stringify({ items: ids.map(function (id) { return { job_applicant_id: id }; }) }),
-    })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
+    for (var c = 0; c < chunks.length; c++) {
+      var done = c * MASK_CHUNK_SIZE;
+      maskSummary.classList.remove("summary-error");
+      maskSummary.textContent = "Masking " + Math.min(done + MASK_CHUNK_SIZE, ids.length)
+        + " of " + ids.length + " profile(s)...";
+
+      try {
+        var resp = await fetch("/mask/batch", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, authHeaders),
+          body: JSON.stringify({ items: chunks[c].map(function (id) { return { job_applicant_id: id }; }) }),
+        });
+        var data = await resp.json();
         if (data.status === "ok") {
-          maskSummary.classList.remove("summary-error");
-          maskSummary.textContent = data.succeeded + " succeeded, " + data.failed + " failed.";
-          renderStatusRows(data.results);
+          succeeded += data.succeeded;
+          failed += data.failed;
+          allResults = allResults.concat(data.results);
         } else {
-          maskSummary.classList.add("summary-error");
-          maskSummary.textContent = data.detail || "Masking failed.";
+          failed += chunks[c].length;
+          allResults = allResults.concat(chunks[c].map(function (id) {
+            return { job_applicant_id: id, result: { status: "error", detail: data.detail || "Batch failed." } };
+          }));
         }
-      })
-      .catch(function (e) {
-        maskSummary.classList.add("summary-error");
-        maskSummary.textContent = "Request failed: " + e.message;
-      })
-      .finally(function () {
-        setMaskBusy(false);
-      });
+      } catch (e) {
+        failed += chunks[c].length;
+        allResults = allResults.concat(chunks[c].map(function (id) {
+          return { job_applicant_id: id, result: { status: "error", detail: "Request failed: " + e.message } };
+        }));
+      }
+
+      renderStatusRows(allResults);
+    }
+
+    maskSummary.classList.toggle("summary-error", failed > 0);
+    maskSummary.textContent = succeeded + " succeeded, " + failed + " failed.";
+    setMaskBusy(false);
   });
 
   } catch (e) {

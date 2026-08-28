@@ -292,7 +292,20 @@ per call; split into multiple batch calls for different orgs.
 }
 ```
 
-Max 200 items per call. One item's failure doesn't abort the batch:
+Max 200 items per call. One item's failure doesn't abort the batch.
+
+**Expect real processing time, not an instant response.** `.docx` resumes
+(the common case on this org) need a LibreOffice conversion step before
+masking — measured at ~2-4 seconds per file, plus Salesforce round-trips
+and upload. A large batch is genuinely slow, not stuck: the
+`/candidate/MaskProfileIndex` page (`app/static/js/app.js`) sends batches
+in chunks of 5 rather than one giant request for exactly this reason —
+keeps each request's wall-clock time bounded (a 200-item request in one
+call could run past any reasonable HTTP timeout and hang with nothing to
+show) and shows visible incremental progress instead of one static
+"Masking N profile(s)..." message for the whole run. If you're calling
+`/mask/batch` directly (not through that page), consider chunking large
+selections client-side the same way.
 
 ```json
 {
