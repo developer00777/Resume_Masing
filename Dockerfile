@@ -16,5 +16,13 @@ COPY app ./app
 ENV PORT=8000
 EXPOSE 8000
 
+# --proxy-headers + --forwarded-allow-ips='*': Railway terminates TLS at its
+# edge and forwards to this container over plain HTTP, so without this the
+# app sees every request as http:// even though the real page loaded over
+# https://. That made Jinja2's url_for('static', ...) emit http:// URLs for
+# CSS/JS on an https:// page -- browsers correctly block that as mixed
+# content, so /candidate/MaskProfileIndex loaded with zero styling and zero
+# JavaScript (the "button isn't working" report). '*' is safe here: Railway's
+# proxy is the only thing that can reach this container's port at all.
 # Shell form so $PORT expands at runtime.
-CMD uvicorn app.server:app --host 0.0.0.0 --port ${PORT}
+CMD uvicorn app.server:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips='*'
