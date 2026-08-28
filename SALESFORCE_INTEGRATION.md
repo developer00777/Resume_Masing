@@ -426,13 +426,17 @@ Salesforce-authenticated users viewing this Lightning page reach it), but
 its own `fetch()` calls to `/mask/batch` and `/candidate/settings` carry
 `X-API-Key` automatically, templated in server-side.
 
-Query params (all optional — omit them for manual/standalone testing):
+Query params (all optional — omit them for manual/standalone testing). These
+are the actual names the `massMasking` LWC sends (fetched from the live org
+via the Tooling API to confirm — `ids`/`orgUrl` are also accepted as
+fallback aliases from an earlier guess, but `sfjobapplicantid`/`sfURL` are
+what real traffic actually uses):
 
 | Param | Source | Used for |
 |---|---|---|
-| `ids` | `String.join(jobAppIdList, ';')` | Pre-fills the bulk-mask list; falls back to manual paste if absent |
+| `sfjobapplicantid` | `String.join(jobAppIdList, ';')` (built in `massMasking.js`'s `handleMassMasking()`) | Pre-fills the bulk-mask list; falls back to manual paste if absent |
 | `uname` | `UserInfo.getUserName()` | Displayed (read-only) on the User Settings tab |
-| `orgUrl` | `URL.getOrgDomainUrl() + '/services/Soap/c/59.0/' + UserInfo.getOrganizationId()` | Its host is auto-extracted client-side to pre-fill the Settings tab's "Custom My Domain host" field |
+| `sfURL` | `URL.getOrgDomainUrl() + '/services/Soap/c/59.0/' + UserInfo.getOrganizationId()` | Its host is auto-extracted client-side to pre-fill the Settings tab's "Custom My Domain host" field |
 
 ### `POST /candidate/settings` — rotate the default connection's credentials
 

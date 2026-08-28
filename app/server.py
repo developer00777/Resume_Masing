@@ -577,22 +577,25 @@ async def watermark_upload(
 
 
 @app.get("/candidate/MaskProfileIndex", response_class=HTMLResponse)
-def candidate_mask_profile_index(request: Request, ids: str = "", uname: str = "",
-                                 orgUrl: str = "") -> HTMLResponse:
+def candidate_mask_profile_index(request: Request, sfjobapplicantid: str = "", uname: str = "",
+                                 sfURL: str = "", ids: str = "", orgUrl: str = "") -> HTMLResponse:
     """The Salesforce-embedded masking UI -- Jinja2 templates under
     app/templates/, static CSS/JS under app/static/, served from this same
     FastAPI service so Salesforce's button/Lightning Component can hit this
     exact path directly (no separate frontend deployment/URL to wire up).
 
-    Launched by MassMaskingController.generatemassmasking() (Apex, no HTTP
-    callout of its own -- it just returns data for the Lightning Component's
-    JS to build this URL from):
-      ?ids=<Job Applicant Ids, SEMICOLON-separated (String.join(ids, ';'))>
+    Launched by the massMasking LWC's handleMassMasking() (fetched directly
+    from the live org via the Tooling API to confirm the real contract --
+    MassMaskingController.generatemassmasking() itself makes no HTTP call,
+    it just returns data for this LWC's JS to build the URL from):
+      ?sfURL=<the org's SOAP endpoint URL, org id embedded at the end:
+              .../services/Soap/c/59.0/{OrganizationId}>
       &uname=<UserInfo.getUserName() -- the Salesforce user viewing the page>
-      &orgUrl=<the org's SOAP endpoint URL, org id embedded at the end:
-               .../services/Soap/c/59.0/{OrganizationId}>
-    Opened without these params, the page falls back to manual Id entry and
-    a blank Settings tab (see app/static/js/app.js).
+      &sfjobapplicantid=<Job Applicant Ids, SEMICOLON-separated (String.join(ids, ';'))>
+    `ids`/`orgUrl` are kept as fallback aliases -- an earlier guess at these
+    param names, before the real LWC source was available; harmless to keep
+    accepting both shapes. Opened without any of these, the page falls back
+    to manual Id entry and a blank Settings tab (see app/static/js/app.js).
 
     Templates render with the API key server-side (same trust-boundary
     reasoning as /popup: only Salesforce-authenticated users viewing this
@@ -601,8 +604,8 @@ def candidate_mask_profile_index(request: Request, ids: str = "", uname: str = "
     """
     ctx = {
         "uname": uname.strip() or os.environ.get("SF_USERNAME", "").strip(),
-        "prefill_ids": ids,
-        "org_url": orgUrl,
+        "prefill_ids": sfjobapplicantid or ids,
+        "org_url": sfURL or orgUrl,
         "api_key": os.environ.get("MASK_API_KEY", "").strip(),
     }
     return templates.TemplateResponse(

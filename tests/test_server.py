@@ -234,21 +234,32 @@ def test_candidate_mask_profile_index_renders(monkeypatch):
     assert "/static/js/app.js" in resp.text
 
 
-def test_candidate_mask_profile_index_prefills_ids_from_query_param():
+def test_candidate_mask_profile_index_prefills_ids_from_real_query_param():
+    """sfjobapplicantid is the REAL param name the massMasking LWC sends
+    (fetched from the live org via the Tooling API to confirm) -- an
+    earlier guess used 'ids' before that source was available; this is the
+    one that actually matters."""
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex?sfjobapplicantid=a0X000000000001;a0X000000000002")
+    assert resp.status_code == 200
+    assert "a0X000000000001;a0X000000000002" in resp.text
+
+
+def test_candidate_mask_profile_index_prefills_ids_from_legacy_alias():
+    """'ids' kept as a harmless fallback alias from before the real LWC
+    source was available -- must keep working in case anything still uses it."""
     client = TestClient(server.app)
     resp = client.get("/candidate/MaskProfileIndex?ids=a0X000000000001,a0X000000000002")
     assert resp.status_code == 200
     assert "a0X000000000001,a0X000000000002" in resp.text
 
 
-def test_candidate_mask_profile_index_accepts_apex_semicolon_joined_ids():
-    """MassMaskingController.generatemassmasking() (Apex) joins ids with ';'
-    (String.join(ids, ';')), not commas -- the exact query shape Salesforce's
-    Lightning Component actually builds this URL with."""
+def test_candidate_mask_profile_index_real_param_wins_over_legacy_alias():
     client = TestClient(server.app)
-    resp = client.get("/candidate/MaskProfileIndex?ids=a0X000000000001;a0X000000000002")
+    resp = client.get("/candidate/MaskProfileIndex?sfjobapplicantid=a0X000000000REAL&ids=a0X000000000LEGACY")
     assert resp.status_code == 200
-    assert "a0X000000000001;a0X000000000002" in resp.text
+    assert "a0X000000000REAL" in resp.text
+    assert "a0X000000000LEGACY" not in resp.text
 
 
 def test_candidate_mask_profile_index_uses_uname_query_param_over_env(monkeypatch):
@@ -263,7 +274,17 @@ def test_candidate_mask_profile_index_uses_uname_query_param_over_env(monkeypatc
     assert "integration.user@org.com" not in resp.text
 
 
-def test_candidate_mask_profile_index_passes_org_url_into_ctx():
+def test_candidate_mask_profile_index_passes_real_sf_url_param_into_ctx():
+    """sfURL is the REAL param name the massMasking LWC sends -- an earlier
+    guess used 'orgUrl'."""
+    client = TestClient(server.app)
+    sf_url = "https://acme--partialcpy.sandbox.my.salesforce.com/services/Soap/c/59.0/00D000000000001"
+    resp = client.get("/candidate/MaskProfileIndex", params={"sfURL": sf_url})
+    assert resp.status_code == 200
+    assert "acme--partialcpy.sandbox.my.salesforce.com" in resp.text
+
+
+def test_candidate_mask_profile_index_passes_org_url_legacy_alias():
     client = TestClient(server.app)
     org_url = "https://acme--partialcpy.sandbox.my.salesforce.com/services/Soap/c/59.0/00D000000000001"
     resp = client.get("/candidate/MaskProfileIndex", params={"orgUrl": org_url})

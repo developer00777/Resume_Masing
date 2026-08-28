@@ -15,3 +15,6 @@ masked_output_samples/
 agent/
 .agents/
 skills-lock.json
+
+# Claude Code harness state, not part of this service
+.claude/
