@@ -42,8 +42,9 @@ under that client.
 
 | File | Purpose |
 |------|---------|
-| `app/mask.py` | Masking core — PyMuPDF true-redact + centered watermark. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). |
-| `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)`, `upload_masked_pdf(id, bytes, filename)`. All creds from ENV. |
+| `app/mask.py` | Masking core — PyMuPDF true-redact + centered watermark. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
+| `app/docx_convert.py` | `.docx`/`.doc` → PDF via headless LibreOffice (`soffice`, installed in the Dockerfile) — real candidate resumes on this org are legacy Word attachments, not PDFs, so this runs before `app/mask.py` whenever the fetched resume isn't already a PDF. |
+| `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)` (checks modern Files + legacy Attachments, on the Job Applicant and its related Contact — returns `(bytes, extension)`), `upload_masked_pdf(id, bytes, filename)`. Creds from ENV or the Postgres-backed override (`register_default_credentials`). |
 | `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `POST /mask/inline`, `GET /health`, `detect_pii()` fallback. |
 | `app/assets/watermark.png` | (Optional) company logo. If present, stamped centered; else a faint text watermark. |
 | `app/templates/`, `app/static/` | Jinja2 templates + CSS/JS for `GET /candidate/MaskProfileIndex` — the real Salesforce-embedded masking UI (driven by `MassMaskingController` Apex). |

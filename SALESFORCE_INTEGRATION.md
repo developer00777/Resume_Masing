@@ -143,9 +143,13 @@ To connect this service to your org, we need **one** of the following. Option C 
 - One Connected App **per org/client**, configured for the **Client Credentials** OAuth grant
 - Each Connected App needs a dedicated **"Run As" execution user** (Setup → App Manager → your Connected App → Edit Policies → Run As) — fully headless, no username/password stored on our side at all
 - That execution user's profile needs **API Only** + these object permissions:
-  - Read: `ContentDocumentLink`, `ContentVersion`
+  - Read: `ContentDocumentLink`, `ContentVersion`, `Attachment` (real candidate
+    resumes on this org are legacy `.docx` Attachments on the related Contact —
+    confirmed against live data, not a hypothetical)
   - Create: `ContentVersion`
-  - Read: whatever object holds the source resume (today: `SCSCHAMPS__Job_Applicant__c`; not needed at all if you use `/mask/inline`, §1/§4b)
+  - Read: `SCSCHAMPS__Job_Applicant__c` and `Contact` (for the
+    `SCSCHAMPS__Contact_Talent__c` lookup used to find the resume); not needed
+    at all if you use `/mask/inline`, §1/§4b
 
 For Option C, your Apex/Flow passes a `client_key` in the request body so the
 service knows which org's credentials to use. **By convention, `client_key` is
@@ -213,11 +217,19 @@ job's requirements + eligible professionals.** The Mask button lives on each
 row of that joined view.
 
 ```
-join-view "Mask" button
+join-view "Mask" button (real flow: MassMaskingController -> /candidate/MaskProfileIndex -> /mask/batch)
   → POST /mask { job_applicant_id, account_id?, mask_strings?, watermark_base64?, client_key? }
-      1. Fetch resume PDF — currently from ContentVersion linked via
-         ContentDocumentLink to SCSCHAMPS__Job_Applicant__c (the join row itself,
-         not a separate Contact record)
+      1. Fetch resume file — checked in this order, first usable one wins
+         (confirmed against live data, not a guess):
+           a. Modern File (ContentVersion via ContentDocumentLink) on the
+              Job Applicant directly
+           b. Modern File on the related Contact (SCSCHAMPS__Contact_Talent__c)
+           c. Legacy Attachment on the Job Applicant directly
+           d. Legacy Attachment on the related Contact -- this is where real
+              candidate resumes on this org actually live, as .docx files
+         pdf > docx > doc if more than one file exists at a given location.
+         .docx/.doc are converted to PDF (LibreOffice headless, in the same
+         container) before masking -- PyMuPDF only opens PDFs.
       2. Resolve the client Account (for per-client watermark) — from account_id
          if passed, else auto-resolved from SCSCHAMPS__Job_Applicant__c.SCSCHAMPS__Account__c
       3. Resolve watermark image — inline base64 > Salesforce File lookup > plain text
@@ -477,7 +489,8 @@ a plain-English message safe to surface in a Flow error toast):
 |---|---|---|
 | `Salesforce credentials not configured.` | Service-side env vars missing | Contact us — this is our config, not yours |
 | `Invalid Salesforce Id for job_applicant_id: ...` | Malformed/wrong-length Id passed | Check the button's merge field |
-| `No resume found for Job Applicant '...'.` | No PDF attached to that record | Confirm the resume was actually uploaded there |
+| `No resume found for Job Applicant '...'.` | No pdf/docx/doc file in any of the checked locations (Job Applicant or related Contact, modern File or legacy Attachment) | Confirm a resume was actually uploaded, and that `SCSCHAMPS__Contact_Talent__c` is populated if it's on the Contact |
+| `Could not convert docx resume to PDF: ...` | The `.docx` file is corrupt, password-protected, or LibreOffice failed for another reason | Try re-saving/re-uploading the file; if it recurs, send it to us to reproduce |
 | `No PII strings to mask.` | Neither `mask_strings` nor the regex fallback found anything | Pass explicit `mask_strings` from your parsed candidate data |
 | `Unknown client_key '...'. Configured: [...]` | Wrong/missing `client_key`, or your org hasn't been registered yet | Register via `/clients/self-register` (§3a), or check the Org Id against what your Flow is sending |
 | `watermark_base64 is not valid base64.` | Malformed inline watermark | Check the formula field encoding |

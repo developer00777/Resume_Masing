@@ -288,7 +288,8 @@ All error responses share this shape (HTTP 200, `status: "error"`):
 |---|---|---|
 | `Salesforce credentials not configured.` | No auth mode configured at all | N/A on this deployment — Mode A is live |
 | `Invalid Salesforce Id for ...` | Malformed/wrong-length Id | Check the caller's merge field |
-| `No resume found for Job Applicant '...'.` | No PDF attached to that record | Confirm the resume was uploaded, and check §2's sandbox-vs-prod note |
+| `No resume found for Job Applicant '...'.` | No pdf/docx/doc in any checked location (Job Applicant or related Contact, modern File or legacy Attachment — see `SALESFORCE_INTEGRATION.md` §4 for the exact lookup order) | Confirm the resume was uploaded, and check §2's sandbox-vs-prod note |
+| `Could not convert docx resume to PDF: ...` | LibreOffice (`soffice`) failed on that specific `.docx` — corrupt/password-protected file, or a real conversion bug | Re-upload the file; report if it recurs |
 | `No PII strings to mask.` | Neither `mask_strings` nor the regex fallback found anything | Pass explicit `mask_strings` |
 | `Unknown client_key '...'. Configured: [...]` | `client_key` passed but not registered | Register via `/clients/self-register`, or omit `client_key` to use the live Mode A connection. Fixed 2026-08-27 to surface this specific message instead of the generic one above (§0). |
 | `watermark_base64 is not valid base64.` | Malformed inline watermark | Check the encoding |

@@ -1,11 +1,21 @@
 FROM python:3.12-slim
 
-# PyMuPDF ships manylinux wheels, so no system build deps are required for the slim base.
+# PyMuPDF ships manylinux wheels, so no system build deps are required for it.
+# libreoffice-writer: real candidate resumes on this org are legacy .docx
+# Attachments (confirmed against live data, not a hypothetical) -- soffice
+# --headless converts docx -> pdf, then the existing PyMuPDF pipeline runs
+# unchanged. --no-install-recommends keeps this to just the Writer
+# component + its font/UNO deps, not the full LibreOffice suite.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/tmp
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-writer \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

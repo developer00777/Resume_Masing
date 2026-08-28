@@ -49,7 +49,7 @@ def _install_mocks(monkeypatch):
     monkeypatch.setattr(server.sf_client, "connect", lambda client_key=None, force_refresh=False: object())
 
     def fake_fetch(job_applicant_id, sf=None):
-        return _make_sample_pdf()
+        return _make_sample_pdf(), "pdf"
 
     def fake_upload(job_applicant_id, pdf_bytes, filename, sf=None):
         captured["pdf_bytes"] = pdf_bytes
@@ -591,7 +591,7 @@ def test_mask_retries_once_on_expired_session(monkeypatch):
         fetch_calls.append(1)
         if len(fetch_calls) == 1:
             raise SalesforceExpiredSession(url="x", status=401, resource_name="ContentVersion", content=b"")
-        return _make_sample_pdf()
+        return _make_sample_pdf(), "pdf"
 
     monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch)
     monkeypatch.setattr(server.sf_client, "resolve_account_id", lambda jaid, sf=None: None)
@@ -635,7 +635,7 @@ def test_mask_batch_partial_failure_does_not_abort_batch(monkeypatch):
     def fake_fetch(job_applicant_id, sf=None):
         if job_applicant_id == "a0X000000000BAD":
             raise sf_client.ResumeNotFoundError(f"No resume found for Job Applicant '{job_applicant_id}'.")
-        return _make_sample_pdf()
+        return _make_sample_pdf(), "pdf"
 
     monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch)
     client = TestClient(server.app)

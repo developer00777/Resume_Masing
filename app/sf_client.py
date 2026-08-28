@@ -590,25 +590,120 @@ def resolve_account_id(job_applicant_id: str, sf: Salesforce | None = None) -> s
 
 # ── Resume PDF ──────────────────────────────────────────────────────────────
 
-def fetch_resume_pdf(job_applicant_id: str, sf: Salesforce | None = None) -> bytes:
-    """Fetch the latest resume PDF linked to a Job Applicant record."""
+_JOB_APPLICANT_CONTACT_FIELD = "SCSCHAMPS__Contact_Talent__c"
+
+_RESUME_EXT_PRIORITY = ("pdf", "docx", "doc")
+
+
+def resolve_contact_id(job_applicant_id: str, sf: Salesforce | None = None) -> str | None:
+    """Look up the related candidate Contact (SCSCHAMPS__Contact_Talent__c)
+    from a Job Applicant record -- confirmed against live data as where the
+    actual resume file usually lives (legacy Attachment), not the Job
+    Applicant record itself. Returns None (never raises) if blank/unreadable."""
     job_applicant_id = _safe_id(job_applicant_id, "job_applicant_id")
     sf = sf or connect()
+    try:
+        res = sf.query(
+            f"SELECT {_JOB_APPLICANT_CONTACT_FIELD} FROM {_JOB_APPLICANT_OBJECT} "
+            f"WHERE Id = '{job_applicant_id}' LIMIT 1")
+        recs = res.get("records", [])
+        if not recs:
+            return None
+        return recs[0].get(_JOB_APPLICANT_CONTACT_FIELD) or None
+    except Exception:
+        return None
+
+
+def _pick_by_extension(records: list[dict], ext_of) -> tuple[dict, str] | None:
+    """From a list of file-like records, pick the best one by
+    _RESUME_EXT_PRIORITY (pdf first, then docx, then doc); anything else
+    (jpg, png, etc.) is ignored -- not a resume format this service
+    understands. Returns (record, extension) or None if nothing usable."""
+    ranked = []
+    for r in records:
+        ext = ext_of(r)
+        if ext in _RESUME_EXT_PRIORITY:
+            ranked.append((_RESUME_EXT_PRIORITY.index(ext), r, ext))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda t: t[0])
+    _, record, ext = ranked[0]
+    return record, ext
+
+
+def _fetch_content_version(sf: Salesforce, parent_id: str) -> tuple[bytes, str] | None:
+    """Modern Files: latest ContentVersion linked to parent_id, if any usable one exists."""
     links = sf.query(
         "SELECT ContentDocumentId FROM ContentDocumentLink "
-        f"WHERE LinkedEntityId = '{job_applicant_id}' ORDER BY SystemModstamp DESC")
+        f"WHERE LinkedEntityId = '{parent_id}' ORDER BY SystemModstamp DESC")
     doc_ids = [r["ContentDocumentId"] for r in links.get("records", [])]
-    if doc_ids:
-        in_list = ",".join(f"'{d}'" for d in doc_ids)
-        versions = sf.query(
-            "SELECT Id, VersionData, FileExtension, Title, ContentDocumentId, CreatedDate "
-            f"FROM ContentVersion WHERE ContentDocumentId IN ({in_list}) AND IsLatest = true "
-            "ORDER BY CreatedDate DESC")
-        records = versions.get("records", [])
-        pdfs = [r for r in records if (r.get("FileExtension") or "").lower() == "pdf"]
-        chosen = pdfs or records
-        if chosen:
-            return _download_version_data(sf, chosen[0]["VersionData"])
+    if not doc_ids:
+        return None
+    in_list = ",".join(f"'{d}'" for d in doc_ids)
+    versions = sf.query(
+        "SELECT Id, VersionData, FileExtension, Title, ContentDocumentId, CreatedDate "
+        f"FROM ContentVersion WHERE ContentDocumentId IN ({in_list}) AND IsLatest = true "
+        "ORDER BY CreatedDate DESC")
+    records = versions.get("records", [])
+    picked = _pick_by_extension(records, lambda r: (r.get("FileExtension") or "").lower())
+    if picked is None:
+        return None
+    record, ext = picked
+    return _download_version_data(sf, record["VersionData"]), ext
+
+
+def _fetch_attachment(sf: Salesforce, parent_id: str) -> tuple[bytes, str] | None:
+    """Legacy Files: latest Attachment parented to parent_id, if any usable
+    one exists. Confirmed against live data as where real resumes actually
+    are on this org -- .Body downloads exactly like ContentVersion.VersionData
+    (both are Salesforce REST sub-resource URL paths)."""
+    res = sf.query(
+        "SELECT Id, Name, Body, CreatedDate FROM Attachment "
+        f"WHERE ParentId = '{parent_id}' ORDER BY CreatedDate DESC")
+    records = res.get("records", [])
+
+    def ext_of(r: dict) -> str:
+        name = r.get("Name") or ""
+        return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+    picked = _pick_by_extension(records, ext_of)
+    if picked is None:
+        return None
+    record, ext = picked
+    return _download_version_data(sf, record["Body"]), ext
+
+
+def fetch_resume_pdf(job_applicant_id: str, sf: Salesforce | None = None) -> tuple[bytes, str]:
+    """Fetch the latest resume file linked to a Job Applicant record.
+
+    Checked in priority order (first usable file wins), since real data on
+    this org spans multiple storage shapes:
+      1. Modern Files (ContentVersion) on the Job Applicant directly
+      2. Modern Files on the related Contact (SCSCHAMPS__Contact_Talent__c)
+      3. Legacy Attachment on the Job Applicant directly
+      4. Legacy Attachment on the related Contact -- confirmed against live
+         data as where real candidate resumes (as .docx) actually live
+    Within each location, pdf > docx > doc if multiple files are present;
+    anything else (images, etc.) is ignored.
+
+    Returns (file_bytes, extension) -- extension is "pdf", "docx", or "doc".
+    Callers must convert non-pdf extensions before handing bytes to
+    app/mask.py (PyMuPDF only opens PDFs) -- see app/docx_convert.py.
+    """
+    job_applicant_id = _safe_id(job_applicant_id, "job_applicant_id")
+    sf = sf or connect()
+
+    found = _fetch_content_version(sf, job_applicant_id)
+    if found is None:
+        contact_id = resolve_contact_id(job_applicant_id, sf=sf)
+        if contact_id:
+            found = _fetch_content_version(sf, contact_id)
+        if found is None:
+            found = _fetch_attachment(sf, job_applicant_id)
+        if found is None and contact_id:
+            found = _fetch_attachment(sf, contact_id)
+    if found is not None:
+        return found
     raise ResumeNotFoundError(f"No resume found for Job Applicant '{job_applicant_id}'.")
 
 

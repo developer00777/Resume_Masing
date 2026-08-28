@@ -67,7 +67,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from app import crypto_util, mask, sf_client
+from app import crypto_util, docx_convert, mask, sf_client
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -276,11 +276,23 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     """Run the full mask pipeline for one Job Applicant against an already-connected
     Salesforce session. Shared by /mask and /mask/batch so both retry and batch
     behavior stay in one place."""
-    # 1) Fetch resume PDF
+    # 1) Fetch resume file -- pdf, docx, or doc (real candidate resumes on
+    #    this org are legacy .docx Attachments; see sf_client.fetch_resume_pdf's
+    #    docstring for the full lookup order).
     try:
-        pdf_bytes = sf_client.fetch_resume_pdf(req.job_applicant_id, sf=sf)
+        resume_bytes, ext = sf_client.fetch_resume_pdf(req.job_applicant_id, sf=sf)
     except (sf_client.ResumeNotFoundError, sf_client.InvalidIdError) as e:
         return MaskResponse(status="error", detail=str(e))
+
+    if ext == "pdf":
+        pdf_bytes = resume_bytes
+    else:
+        # docx/doc -> pdf via LibreOffice headless (app/docx_convert.py),
+        # then the rest of this pipeline is unchanged -- PyMuPDF only opens PDFs.
+        try:
+            pdf_bytes = docx_convert.docx_bytes_to_pdf_bytes(resume_bytes)
+        except docx_convert.DocxConversionError as e:
+            return MaskResponse(status="error", detail=f"Could not convert {ext} resume to PDF: {e}"[:300])
 
     # 2) Determine PII to mask
     mask_strings = req.mask_strings if req.mask_strings else detect_pii(pdf_bytes)
