@@ -64,6 +64,14 @@
     <!-- ── Tab 2: User Settings ─────────────────────────── -->
     <div class="tab-pane fade" id="settings-pane" role="tabpanel">
         <h5 class="section-title">Enter User Details Below:</h5>
+        <div id="settingsStatus" class="alert {{ 'alert-success' if ctx.settings_configured else 'alert-secondary' }} mb-3">
+            {% if ctx.settings_configured %}
+                <strong>Currently saved:</strong> connected to <code>{{ ctx.settings_login_host }}</code>{% if ctx.settings_has_client_credentials %} with a Connected App (Consumer Key/Secret){% else %} via username/password{% endif %}.
+                Leave Password/Client Key/Client Secret blank below to keep this — only fill them in to replace it.
+            {% else %}
+                <strong>No saved override.</strong> Using the service's default (env-var) Salesforce connection. Fill in the form below to set one.
+            {% endif %}
+        </div>
         <form id="settingsForm" class="settings-form" autocomplete="off">
             <div class="mb-3">
                 <label class="form-label">Sales Force User Name</label>
@@ -88,18 +96,19 @@
             <div class="mb-3">
                 <label class="form-label">Sales Force Password</label>
                 <input type="password" id="password" class="form-control" autocomplete="new-password"
-                       placeholder="Enter Salesforce password + security token">
-                <div class="form-text">Password concatenated with the security token, if required.</div>
+                       placeholder="{{ 'Leave blank to keep the saved password' if ctx.settings_configured else 'Enter Salesforce password + security token' }}">
+                <div class="form-text">Password concatenated with the security token, if required. Never redisplayed once saved -- leave blank to keep it unchanged.</div>
             </div>
             <div class="mb-3">
                 <label class="form-label">Sales Force Client Key</label>
                 <input type="password" id="client_key" class="form-control" autocomplete="new-password"
-                       placeholder="Connected App Consumer Key">
+                       placeholder="{{ 'Leave blank to keep the saved Consumer Key' if ctx.settings_has_client_credentials else 'Connected App Consumer Key' }}">
             </div>
             <div class="mb-3">
                 <label class="form-label">Sales Force Client Secret</label>
                 <input type="password" id="client_secret" class="form-control" autocomplete="new-password"
-                       placeholder="Connected App Consumer Secret">
+                       placeholder="{{ 'Leave blank to keep the saved Consumer Secret' if ctx.settings_has_client_credentials else 'Connected App Consumer Secret' }}">
+                <div class="form-text">Client Key and Client Secret: fill in both to set/replace, or leave both blank to keep what's saved.</div>
             </div>
             <button type="submit" class="btn btn-primary">Save Settings</button>
             <span id="settingsSpinner" class="spinner-border spinner-border-sm text-primary d-none ms-2"></span>

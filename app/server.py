@@ -240,11 +240,15 @@ class AdminActionResponse(BaseModel):
 
 
 class CandidateSettingsRequest(BaseModel):
-    password: str = Field(..., description="Salesforce password, with the security token "
-                                            "concatenated onto the end if the org requires one.")
-    client_key: str | None = Field(default=None, description="Connected App Consumer Key, optional.")
+    password: str | None = Field(default=None, description="Salesforce password, with the security "
+                                            "token concatenated onto the end if the org requires one. "
+                                            "Blank/omitted keeps whatever's already saved -- required "
+                                            "only if nothing is saved yet.")
+    client_key: str | None = Field(default=None, description="Connected App Consumer Key. Blank/omitted "
+                                                              "(together with client_secret) keeps "
+                                                              "whatever's already saved.")
     client_secret: str | None = Field(default=None, description="Connected App Consumer Secret, "
-                                                                 "optional -- required together with client_key.")
+                                                                 "required together with client_key when either is provided.")
     login_host: str = Field(..., description='"login" (prod), "test" (sandbox), or a My Domain host.')
 
 
@@ -626,11 +630,20 @@ def candidate_mask_profile_index(request: Request, sfjobapplicantid: str = "", u
     Lightning page reach this HTML at all) so app.js's fetch() calls to
     /mask/batch and /candidate/settings authenticate automatically.
     """
+    # Settings persistence is server-side, not client-side: the password/
+    # Consumer Secret are never sent back to the browser (write-only,
+    # unchanged) -- but what's ALREADY saved (non-secret: is something
+    # configured, and which host) is real, useful state the page should
+    # show on load instead of a blank form implying nothing is set.
+    settings_status = sf_client.default_credentials_status()
     ctx = {
         "uname": uname.strip() or os.environ.get("SF_USERNAME", "").strip(),
         "prefill_ids": sfjobapplicantid or ids,
         "org_url": sfURL or orgUrl,
         "api_key": os.environ.get("MASK_API_KEY", "").strip(),
+        "settings_configured": settings_status["configured"],
+        "settings_login_host": settings_status["login_host"],
+        "settings_has_client_credentials": settings_status["has_client_credentials"],
     }
     return templates.TemplateResponse(
         request, "candidate_mask_profile_index.html", {"ctx": ctx})

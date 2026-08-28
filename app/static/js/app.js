@@ -163,17 +163,33 @@
     loginHostCustom.classList.toggle("d-none", loginHostSelect.value !== "__custom__");
   });
 
-  // Convenience: orgUrl (from MassMaskingController.generatemassmasking(),
-  // e.g. "https://acme--partialcpy.sandbox.my.salesforce.com/services/Soap/c/59.0/00D...")
-  // always carries the org's own My Domain host -- extract it and pre-select
-  // "Custom My Domain host" with that value filled in, so whoever fills in
-  // Settings doesn't have to go look it up and retype it.
-  if (ctx.org_url) {
+  function applyLoginHost(hostValue) {
+    if (hostValue === "login") {
+      loginHostSelect.value = "login.salesforce.com";
+    } else if (hostValue === "test") {
+      loginHostSelect.value = "test.salesforce.com";
+    } else {
+      loginHostSelect.value = "__custom__";
+      loginHostCustom.value = hostValue;
+      loginHostCustom.classList.remove("d-none");
+    }
+  }
+
+  if (ctx.settings_configured && ctx.settings_login_host) {
+    // Ground truth: what's actually saved server-side right now. Takes
+    // priority over the orgUrl guess below -- this is real state, not a
+    // heuristic extracted from a URL.
+    applyLoginHost(ctx.settings_login_host);
+  } else if (ctx.org_url) {
+    // Convenience fallback when nothing's saved yet: orgUrl (from
+    // MassMaskingController.generatemassmasking(), e.g.
+    // "https://acme--partialcpy.sandbox.my.salesforce.com/services/Soap/c/59.0/00D...")
+    // always carries the org's own My Domain host -- extract it and
+    // pre-select "Custom My Domain host" with that value filled in, so
+    // whoever fills in Settings doesn't have to go look it up and retype it.
     var match = /^https?:\/\/([^/]+)/.exec(ctx.org_url);
     if (match) {
-      loginHostSelect.value = "__custom__";
-      loginHostCustom.value = match[1];
-      loginHostCustom.classList.remove("d-none");
+      applyLoginHost(match[1]);
     }
   }
 
@@ -216,7 +232,11 @@
     // Environment dropdown did nothing, with no clear signal why.
     var body = {
       login_host: resolveLoginHost(),
-      password: document.getElementById("password").value,
+      // Blank means "keep whatever's already saved" (server-side default),
+      // so submit null rather than "" for an untouched field -- consistent
+      // with client_key/client_secret below, and lets someone update just
+      // the environment without re-entering a password they already saved.
+      password: document.getElementById("password").value || null,
       client_key: document.getElementById("client_key").value || null,
       client_secret: document.getElementById("client_secret").value || null,
     };

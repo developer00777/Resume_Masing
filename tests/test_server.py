@@ -372,6 +372,47 @@ def test_candidate_mask_profile_index_passes_org_url_legacy_alias():
     assert "acme--partialcpy.sandbox.my.salesforce.com" in resp.text
 
 
+def test_candidate_mask_profile_index_shows_current_settings_status(monkeypatch):
+    """Settings persistence is server-side (encrypted in Postgres), not a
+    client-side cookie -- the page must show what's ACTUALLY currently
+    saved on load, not a blank form that implies nothing is configured."""
+    monkeypatch.setattr(server.sf_client, "default_credentials_status", lambda: {
+        "configured": True, "login_host": "acme.my.salesforce.com", "has_client_credentials": True,
+    })
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex")
+    assert resp.status_code == 200
+    assert "acme.my.salesforce.com" in resp.text
+    assert "Currently saved" in resp.text
+
+
+def test_candidate_mask_profile_index_shows_unconfigured_status(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "default_credentials_status", lambda: {
+        "configured": False, "login_host": None, "has_client_credentials": False,
+    })
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex")
+    assert resp.status_code == 200
+    assert "No saved override" in resp.text
+
+
+def test_candidate_mask_profile_index_never_leaks_password_or_secret(monkeypatch):
+    """The status banner must only ever show non-secret state (configured?,
+    which host, whether a Connected App is set) -- never the actual
+    password or Consumer Secret, which stay write-only client-side."""
+    monkeypatch.setattr(server.sf_client, "default_credentials_status", lambda: {
+        "configured": True, "login_host": "test", "has_client_credentials": True,
+    })
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex")
+    assert resp.status_code == 200
+    # default_credentials_status() itself never returns password/secret (see
+    # sf_client tests), but assert the rendered page doesn't echo a value
+    # attribute on either sensitive input -- both must stay empty.
+    assert 'id="password" class="form-control" autocomplete="new-password"' in resp.text
+    assert 'id="client_secret" class="form-control" autocomplete="new-password"' in resp.text
+
+
 def test_candidate_static_assets_are_served():
     client = TestClient(server.app)
     css = client.get("/static/css/style.css")

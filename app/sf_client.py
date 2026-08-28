@@ -481,7 +481,7 @@ def register_client(client_key: str, client_id: str, client_secret: str,
     invalidate_registry_cache()
 
 
-def register_default_credentials(password: str, client_id: str | None, client_secret: str | None,
+def register_default_credentials(password: str | None, client_id: str | None, client_secret: str | None,
                                  login_host: str) -> None:
     """Persist the default (no client_key) connection's password/security-token
     (caller concatenates the token into password themselves) and optional
@@ -490,12 +490,22 @@ def register_default_credentials(password: str, client_id: str | None, client_se
     Used by POST /candidate/settings so the /candidate/MaskProfileIndex
     "User Settings" tab can rotate these without a Railway redeploy.
     SF_USERNAME is NOT stored here -- it stays an env var; this only
-    overrides password/token/consumer-key/secret/domain. Always overwrites
-    (single sentinel row) -- there's nothing to "already be registered"
-    the way there is for register_client()'s per-org rows.
+    overrides password/token/consumer-key/secret/domain.
+
+    password/client_id/client_secret are each independently optional ON A
+    RESAVE: a blank value means "keep whatever's already stored for this
+    field" (resolved from the existing row, never re-sent to the browser --
+    the password/secret are write-only client-side by design), so the
+    Settings tab lets someone fix just the environment, or add a Connected
+    App, without having to re-enter a password they already saved
+    correctly. If nothing is stored yet, password is still required (there
+    is nothing to "keep"). client_id/client_secret remain an all-or-nothing
+    pair when explicitly provided, but blank+blank always means "keep
+    existing" rather than "clear it" -- clearing the whole override is what
+    DELETE /candidate/settings is for.
     """
-    if not password or not login_host:
-        raise MissingCredentialsError("Missing required field(s): password, login_host")
+    if not login_host:
+        raise MissingCredentialsError("Missing required field: login_host")
     if bool(client_id) != bool(client_secret):
         raise MissingCredentialsError(
             "client_key and client_secret must be provided together, or both left blank.")
@@ -506,9 +516,24 @@ def register_default_credentials(password: str, client_id: str | None, client_se
             "SF_SECURITY_TOKEN (and SF_CONSUMER_KEY / SF_CONSUMER_SECRET if "
             "applicable) via Railway env instead.")
 
-    encrypted_password = crypto_util.encrypt_secret(password)
-    encrypted_client_id = crypto_util.encrypt_secret(client_id) if client_id else None
-    encrypted_client_secret = crypto_util.encrypt_secret(client_secret) if client_secret else None
+    existing = db.get_default_credentials()
+
+    if password:
+        encrypted_password = crypto_util.encrypt_secret(password)
+    elif existing is not None:
+        encrypted_password = existing["encrypted_password"]
+    else:
+        raise MissingCredentialsError("Missing required field: password (nothing saved yet to keep)")
+
+    if client_id and client_secret:
+        encrypted_client_id = crypto_util.encrypt_secret(client_id)
+        encrypted_client_secret = crypto_util.encrypt_secret(client_secret)
+    elif existing is not None:
+        encrypted_client_id = existing["encrypted_client_id"]
+        encrypted_client_secret = existing["encrypted_client_secret"]
+    else:
+        encrypted_client_id = None
+        encrypted_client_secret = None
     db.upsert_default_credentials(encrypted_password, encrypted_client_id, encrypted_client_secret, login_host)
     invalidate_default_override_cache()
 

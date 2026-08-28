@@ -262,10 +262,49 @@ class _FakeSalesforce:
 def test_register_default_credentials_requires_password_and_login_host(monkeypatch):
     monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
     _install_fake_db(monkeypatch)
+    # No existing row -> nothing to "keep", password is still required
     with pytest.raises(sf_client.MissingCredentialsError):
         sf_client.register_default_credentials("", None, None, "test")
     with pytest.raises(sf_client.MissingCredentialsError):
         sf_client.register_default_credentials("pw", None, None, "")
+
+
+def test_register_default_credentials_blank_password_keeps_existing_on_resave(monkeypatch):
+    """The Settings tab's password field is write-only (never redisplayed) --
+    resubmitting with it blank (e.g. to just fix the environment) must keep
+    the previously-saved password, not fail or wipe it."""
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    fake = _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("original-password", None, None, "test")
+
+    sf_client.register_default_credentials("", None, None, "login")  # only changing login_host
+
+    assert crypto_util.decrypt_secret(fake.default_row["encrypted_password"]) == "original-password"
+    assert fake.default_row["login_host"] == "login"
+
+
+def test_register_default_credentials_blank_client_creds_keep_existing_on_resave(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    fake = _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw", "original-key", "original-secret", "test")
+
+    sf_client.register_default_credentials("new-password", None, None, "test")  # only rotating password
+
+    assert crypto_util.decrypt_secret(fake.default_row["encrypted_password"]) == "new-password"
+    assert crypto_util.decrypt_secret(fake.default_row["encrypted_client_id"]) == "original-key"
+    assert crypto_util.decrypt_secret(fake.default_row["encrypted_client_secret"]) == "original-secret"
+
+
+def test_register_default_credentials_explicit_values_always_override(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    fake = _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw1", "key1", "secret1", "test")
+
+    sf_client.register_default_credentials("pw2", "key2", "secret2", "login")
+
+    assert crypto_util.decrypt_secret(fake.default_row["encrypted_password"]) == "pw2"
+    assert crypto_util.decrypt_secret(fake.default_row["encrypted_client_id"]) == "key2"
+    assert fake.default_row["login_host"] == "login"
 
 
 def test_register_default_credentials_requires_client_key_and_secret_together(monkeypatch):

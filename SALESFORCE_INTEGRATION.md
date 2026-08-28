@@ -472,6 +472,20 @@ Connected App Consumer Key/Secret if you want the OAuth2 username-password
 flow instead of a plain password login — both or neither, not one alone.
 Requires `X-API-Key`, same as `/mask`.
 
+**Persistence is server-side, not client-side.** The password/Consumer
+Secret are write-only — never sent back to the browser once saved, and
+deliberately *not* cached in a cookie/localStorage (storing real Salesforce
+credentials in browser storage is a real exposure: any XSS bug or anyone
+with access to that machine could read them back out). What *is* real,
+useful persistence: `password`/`client_key`/`client_secret` are each
+independently optional on a resave — leave any of them blank and the
+previously-saved value is kept, not wiped, so the page can be used to fix
+just the environment (or add a Connected App) without re-entering a
+password that's already correct. `GET /candidate/settings` (below) and the
+page's own status banner reflect what's actually saved on every load, for
+every viewer — the correct way to avoid re-entering the same values over
+and over, without exposing the secrets themselves anywhere client-side.
+
 **`DELETE /candidate/settings`** clears the stored override, reverting to
 the env-var credentials — use this if a bad save (wrong password, garbage
 Consumer Key/Secret) breaks the connection. Same `X-API-Key` gate.
