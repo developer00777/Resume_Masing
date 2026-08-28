@@ -373,6 +373,45 @@ def test_connect_wraps_bad_override_credentials_as_salesforce_auth_error(monkeyp
     assert "settings-tab" in str(exc_info.value).lower()
 
 
+def test_connect_wraps_unexpected_exception_types_too(monkeypatch):
+    """Regression for a REAL production incident: a Settings-tab-saved
+    Consumer Key/Secret pair caused Salesforce(...) to raise something
+    other than SalesforceAuthenticationFailed (exact type never confirmed --
+    Railway logs don't capture Python tracebacks), which propagated as an
+    unhandled 500 on /mask because connect() only caught that one specific
+    type. connect() must now wrap ANY exception from constructing the
+    Salesforce session, not just the one type this module happened to
+    anticipate."""
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.setenv("SF_USERNAME", "user@org.partialcpy")
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw", "consumer-key", "consumer-secret", "test")
+
+    def raising_salesforce(**kwargs):
+        raise KeyError("some totally unrelated library bug")  # NOT SalesforceAuthenticationFailed
+
+    monkeypatch.setattr(sf_client, "Salesforce", raising_salesforce)
+
+    with pytest.raises(sf_client.SalesforceAuthenticationError) as exc_info:
+        sf_client.connect()
+    assert "keyerror" in str(exc_info.value).lower()
+
+
+def test_connect_with_client_credentials_wraps_unexpected_exceptions(monkeypatch):
+    monkeypatch.setenv("SF_CLIENTS_JSON", json.dumps({"acme": ACME_ENV_ENTRY}))
+    monkeypatch.setattr(
+        sf_client, "get_client_credentials_token",
+        lambda client_key, force_refresh=False: ("tok-abc", "https://acme.my.salesforce.com"))
+
+    def raising_salesforce(**kwargs):
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(sf_client, "Salesforce", raising_salesforce)
+
+    with pytest.raises(sf_client.SalesforceAuthenticationError):
+        sf_client.connect(client_key="acme")
+
+
 def test_connect_raises_when_override_present_but_sf_username_unset(monkeypatch):
     monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
     monkeypatch.delenv("SF_USERNAME", raising=False)

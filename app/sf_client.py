@@ -266,7 +266,15 @@ def get_client_credentials_token(client_key: str, force_refresh: bool = False) -
 def _connect_with_client_credentials(client_key: str, force_refresh: bool = False) -> Salesforce:
     access_token, instance_url = get_client_credentials_token(client_key, force_refresh=force_refresh)
     host = instance_url.replace("https://", "").replace("http://", "").rstrip("/")
-    return Salesforce(instance_url=instance_url, session_id=access_token, domain=host)
+    try:
+        return Salesforce(instance_url=instance_url, session_id=access_token, domain=host)
+    except Exception as e:
+        # Same defense-in-depth as connect()'s catch-all below: constructing
+        # a Salesforce session from an already-issued token is usually safe,
+        # but must never leak a raw exception out to an unhandled 500 either.
+        raise SalesforceAuthenticationError(
+            f"Failed to establish a Salesforce session for client_key '{client_key}': "
+            f"{type(e).__name__}: {e}") from e
 
 
 def _load_default_override(force: bool = False) -> dict | None:
@@ -349,12 +357,30 @@ def connect(client_key: str | None = None, force_refresh: bool = False) -> Sales
         c = _require("SF_USERNAME", "SF_PASSWORD", "SF_SECURITY_TOKEN")
         return Salesforce(username=c["SF_USERNAME"], password=c["SF_PASSWORD"],
                           security_token=c["SF_SECURITY_TOKEN"], domain=domain)
+    except MissingCredentialsError:
+        raise  # deliberate control-flow signal, not a connection failure -- let it propagate as-is
     except SalesforceAuthenticationFailed as e:
         source = "the Settings-tab-stored default connection" if override is not None else "the configured (env var) credentials"
         raise SalesforceAuthenticationError(
             f"Salesforce rejected {source}: {e}. If this was just changed via "
             "the Settings tab, clear it with DELETE /candidate/settings to "
             "fall back to the working env-var credentials.") from e
+    except Exception as e:
+        # Catch-all: this is exactly what two real production 500s came
+        # from -- a bad Settings-tab-saved credential combo (once a wrong
+        # password, once a Consumer Key/Secret pair simple_salesforce
+        # rejected with a DIFFERENT exception type than
+        # SalesforceAuthenticationFailed) hit a failure mode this function
+        # hadn't anticipated, and it propagated all the way to an unhandled
+        # 500 on /mask and /mask/batch. Connecting to Salesforce must never
+        # raise anything but this module's own exception types -- any other
+        # failure (a library bug, a network error, a malformed Connected
+        # App config, anything) gets wrapped here instead of leaking out raw.
+        source = "the Settings-tab-stored default connection" if override is not None else "the configured (env var) credentials"
+        raise SalesforceAuthenticationError(
+            f"Failed to connect to Salesforce using {source}: {type(e).__name__}: {e}. "
+            "If this was just changed via the Settings tab, clear it with "
+            "DELETE /candidate/settings to fall back to the working env-var credentials.") from e
 
 
 class SessionExpiredError(RuntimeError):
