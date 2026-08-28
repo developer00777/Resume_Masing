@@ -4,6 +4,14 @@
   var ctx = window.APP_CTX || {};
   var authHeaders = ctx.api_key ? { "X-API-Key": ctx.api_key } : {};
 
+  // The Mask Profile tab's setup below runs before the User Settings tab's
+  // (script order), and an uncaught error partway through would abort the
+  // whole IIFE -- silently leaving the settings form's submit listener
+  // never attached (typing a password then clicking Save would then just
+  // do nothing, no request ever sent, and no error visible). Wrap each
+  // tab's setup independently so a bug in one can never take out the other.
+  try {
+
   // ── Mask Profile tab ──────────────────────────────────────────────────
 
   var jaIds = document.getElementById("jaIds");
@@ -107,7 +115,12 @@
       });
   });
 
+  } catch (e) {
+    console.error("Mask Profile tab setup failed:", e);
+  }
+
   // ── User Settings tab ─────────────────────────────────────────────────
+  try {
 
   var settingsForm = document.getElementById("settingsForm");
   var loginHostSelect = document.getElementById("login_host_select");
@@ -135,7 +148,11 @@
 
   // Translate the UI's environment picker into sf_client.py's existing
   // SF_DOMAIN convention ("login" / "test" / a full My Domain host) rather
-  // than inventing new domain-parsing logic server-side.
+  // than inventing new domain-parsing logic server-side. Returns "" if
+  // nothing is selected -- deliberately NOT validated client-side (see
+  // below): the server already gives a clear, correct error for a missing
+  // login_host, so there's no separate client-side gate to get wrong or
+  // silently block on.
   function resolveLoginHost() {
     var v = loginHostSelect.value;
     if (v === "login.salesforce.com") return "login";
@@ -144,20 +161,30 @@
     return "";
   }
 
+  function showSettingsMessage(text, isError) {
+    // Bootstrap alert, not just small colored text -- a save/fail result
+    // must be impossible to miss, not something that can go unnoticed
+    // right after clicking Save.
+    settingsMsg.className = "mt-3 alert " + (isError ? "alert-danger" : "alert-success");
+    settingsMsg.textContent = text;
+    settingsMsg.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
   settingsForm.addEventListener("submit", function (e) {
     e.preventDefault();
-    settingsMsg.classList.remove("text-success", "text-danger");
+    settingsMsg.className = "mt-2 small";
     settingsMsg.textContent = "";
 
-    var loginHost = resolveLoginHost();
-    if (!loginHost) {
-      settingsMsg.classList.add("text-danger");
-      settingsMsg.textContent = "Select (or enter) a Salesforce environment.";
-      return;
-    }
-
+    // Always submit -- resolveLoginHost() may return "" (nothing picked
+    // yet), and the server's own validation ("Missing required field(s):
+    // password, login_host") is the single source of truth for what's
+    // wrong, shown via showSettingsMessage() below. A client-side-only
+    // block here previously failed SILENTLY (a small, easy-to-miss text
+    // line, no request ever sent) -- that was the actual "settings aren't
+    // saving" bug: typing a password without first touching the
+    // Environment dropdown did nothing, with no clear signal why.
     var body = {
-      login_host: loginHost,
+      login_host: resolveLoginHost(),
       password: document.getElementById("password").value,
       client_key: document.getElementById("client_key").value || null,
       client_secret: document.getElementById("client_secret").value || null,
@@ -174,20 +201,21 @@
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (data.status === "ok") {
-          settingsMsg.classList.add("text-success");
-          settingsMsg.textContent = "Settings saved.";
+          showSettingsMessage("Settings saved.", false);
         } else {
-          settingsMsg.classList.add("text-danger");
-          settingsMsg.textContent = data.detail || "Failed to save settings.";
+          showSettingsMessage(data.detail || "Failed to save settings.", true);
         }
       })
       .catch(function (e) {
-        settingsMsg.classList.add("text-danger");
-        settingsMsg.textContent = "Request failed: " + e.message;
+        showSettingsMessage("Request failed: " + e.message, true);
       })
       .finally(function () {
         settingsSpinner.classList.add("d-none");
         settingsForm.querySelector('button[type="submit"]').disabled = false;
       });
   });
+
+  } catch (e) {
+    console.error("User Settings tab setup failed:", e);
+  }
 })();
