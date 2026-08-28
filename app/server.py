@@ -61,13 +61,19 @@ import binascii
 import os
 import re
 
-from fastapi import Depends, FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Request, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from app import crypto_util, mask, sf_client
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 app = FastAPI(title="Salesforce Resume Masking Service", version="1.3.0")
+app.mount("/static", StaticFiles(directory=os.path.join(_APP_DIR, "static")), name="static")
+templates = Jinja2Templates(directory=os.path.join(_APP_DIR, "templates"))
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -229,6 +235,20 @@ class ClientOrgListResponse(BaseModel):
 
 
 class AdminActionResponse(BaseModel):
+    status: str
+    detail: str | None = None
+
+
+class CandidateSettingsRequest(BaseModel):
+    password: str = Field(..., description="Salesforce password, with the security token "
+                                            "concatenated onto the end if the org requires one.")
+    client_key: str | None = Field(default=None, description="Connected App Consumer Key, optional.")
+    client_secret: str | None = Field(default=None, description="Connected App Consumer Secret, "
+                                                                 "optional -- required together with client_key.")
+    login_host: str = Field(..., description='"login" (prod), "test" (sandbox), or a My Domain host.')
+
+
+class CandidateSettingsResponse(BaseModel):
     status: str
     detail: str | None = None
 
@@ -534,20 +554,83 @@ async def watermark_upload(
         return WatermarkUploadResponse(status="error", detail=str(e)[:200])
 
 
-@app.get("/candidate/MaskProfileIndex")
-def legacy_mask_profile_index_redirect() -> RedirectResponse:
-    """Compatibility redirect for the old freelancer app's URL.
+@app.get("/candidate/MaskProfileIndex", response_class=HTMLResponse)
+def candidate_mask_profile_index(request: Request, ids: str = "", uname: str = "",
+                                 orgUrl: str = "") -> HTMLResponse:
+    """The Salesforce-embedded masking UI -- Jinja2 templates under
+    app/templates/, static CSS/JS under app/static/, served from this same
+    FastAPI service so Salesforce's button/Lightning Component can hit this
+    exact path directly (no separate frontend deployment/URL to wire up).
 
-    Railway logs show live, repeated requests to this exact path (a 404
-    before this route existed) -- some Salesforce button/Lightning
-    Component/Visualforce config still hardcodes it from before this
-    service replaced the freelancer app at the same domain. Redirects to
-    /popup, this service's actual embeddable UI, so those stale links work
-    immediately. The Salesforce-side config should still be updated to
-    point here directly (see SALESFORCE_INTEGRATION.md) when convenient --
-    this is a stopgap, not a substitute for fixing the source.
+    Launched by MassMaskingController.generatemassmasking() (Apex, no HTTP
+    callout of its own -- it just returns data for the Lightning Component's
+    JS to build this URL from):
+      ?ids=<Job Applicant Ids, SEMICOLON-separated (String.join(ids, ';'))>
+      &uname=<UserInfo.getUserName() -- the Salesforce user viewing the page>
+      &orgUrl=<the org's SOAP endpoint URL, org id embedded at the end:
+               .../services/Soap/c/59.0/{OrganizationId}>
+    Opened without these params, the page falls back to manual Id entry and
+    a blank Settings tab (see app/static/js/app.js).
+
+    Templates render with the API key server-side (same trust-boundary
+    reasoning as /popup: only Salesforce-authenticated users viewing this
+    Lightning page reach this HTML at all) so app.js's fetch() calls to
+    /mask/batch and /candidate/settings authenticate automatically.
     """
-    return RedirectResponse(url="/popup")
+    ctx = {
+        "uname": uname.strip() or os.environ.get("SF_USERNAME", "").strip(),
+        "prefill_ids": ids,
+        "org_url": orgUrl,
+        "api_key": os.environ.get("MASK_API_KEY", "").strip(),
+    }
+    return templates.TemplateResponse(
+        request, "candidate_mask_profile_index.html", {"ctx": ctx})
+
+
+@app.post("/candidate/settings", response_model=CandidateSettingsResponse,
+         dependencies=[Depends(require_api_key)])
+def candidate_settings(req: CandidateSettingsRequest) -> CandidateSettingsResponse:
+    """Save the default (no client_key) Salesforce connection's
+    password/security-token and optional Connected App Consumer Key/Secret,
+    submitted from /candidate/MaskProfileIndex's "User Settings" tab.
+
+    SF_USERNAME itself is NOT settable here -- it stays a Railway env var
+    (shown read-only on the form); this only overrides
+    password/token/consumer-key/secret/domain, encrypted at rest in
+    Postgres (same crypto_util pattern as the multi-org registry) so it
+    survives without a redeploy. Always overwrites the single stored row --
+    there's no per-org "already registered" concept here.
+    """
+    try:
+        sf_client.register_default_credentials(
+            req.password, req.client_key, req.client_secret, req.login_host)
+    except sf_client.MissingCredentialsError as e:
+        return CandidateSettingsResponse(status="error", detail=str(e))
+    except sf_client.PostgresNotConfiguredError as e:
+        return CandidateSettingsResponse(status="error", detail=str(e))
+    except crypto_util.EncryptionKeyError as e:
+        return CandidateSettingsResponse(status="error", detail=str(e))
+    return CandidateSettingsResponse(status="ok", detail="Settings saved.")
+
+
+@app.delete("/candidate/settings", response_model=CandidateSettingsResponse,
+           dependencies=[Depends(require_api_key)])
+def candidate_settings_delete() -> CandidateSettingsResponse:
+    """Clear the default-connection override, reverting to the static SF_*
+    env vars. The DB override always wins over env vars while it exists, so
+    this is the only way back short of hand-deleting the Postgres row --
+    needed the moment a bad Settings-tab save (wrong password, garbage
+    Consumer Key/Secret) breaks the live connection until it's cleared. Same
+    X-API-Key trust boundary as the POST above: whoever can break the
+    connection via Settings can also revert it.
+    """
+    try:
+        deleted = sf_client.remove_default_credentials()
+    except sf_client.PostgresNotConfiguredError as e:
+        return CandidateSettingsResponse(status="error", detail=str(e))
+    if not deleted:
+        return CandidateSettingsResponse(status="error", detail="No stored settings to clear.")
+    return CandidateSettingsResponse(status="ok", detail="Settings cleared -- using env-configured credentials again.")
 
 
 @app.get("/popup", response_class=HTMLResponse)

@@ -119,17 +119,50 @@ Test-Case "GET /nonexistent-route returns 404" {
     return ($r.Status -eq 404), "status=$($r.Status)"
 }
 
-Test-Case "GET /candidate/MaskProfileIndex redirects to /popup (stale freelancer-app URL compat)" {
-    # Railway logs showed dozens of live hits to this exact path -- a leftover
-    # reference in some Salesforce button/component config to the old
-    # freelancer app that used to live at this same domain. Compatibility
-    # redirect added so those stale links keep working while the Salesforce
-    # side gets updated (see SALESFORCE_INTEGRATION.md). Uses -MaximumRedirection 0
-    # directly (not Invoke-Api, which follows redirects by default) so the
-    # 3xx itself is inspected instead of the page it points to.
-    $resp = Invoke-WebRequest -Uri "$BaseUrl/candidate/MaskProfileIndex" -MaximumRedirection 0 -UseBasicParsing -TimeoutSec 30
-    $ok = ($resp.StatusCode -eq 307 -or $resp.StatusCode -eq 302) -and $resp.Headers["Location"] -eq "/popup"
-    return $ok, "status=$($resp.StatusCode) location=$($resp.Headers['Location'])"
+Test-Case "GET /candidate/MaskProfileIndex renders the real Salesforce-embedded UI" {
+    # This is the exact path Salesforce's button/Lightning Component hits.
+    # Was a 404, then briefly a redirect stopgap to /popup, now the real
+    # Jinja2-templated page (Mask Profile + User Settings tabs) served from
+    # this same FastAPI service.
+    $r = Invoke-Api GET "/candidate/MaskProfileIndex"
+    $ok = $r.Status -eq 200 -and $r.Raw -like "*Mask Profile*" -and $r.Raw -like "*/static/js/app.js*"
+    return $ok, "status=$($r.Status)"
+}
+
+Test-Case "GET /candidate/MaskProfileIndex prefills ids from the ?ids= query param" {
+    $r = Invoke-Api GET "/candidate/MaskProfileIndex?ids=a0X000000000777"
+    $ok = $r.Status -eq 200 -and $r.Raw -like "*a0X000000000777*"
+    return $ok, "status=$($r.Status)"
+}
+
+Test-Case "GET /static/css/style.css and /static/js/app.js are served" {
+    $css = Invoke-Api GET "/static/css/style.css"
+    $js = Invoke-Api GET "/static/js/app.js"
+    $ok = $css.Status -eq 200 -and $js.Status -eq 200
+    return $ok, "css=$($css.Status) js=$($js.Status)"
+}
+
+Test-Case "POST /candidate/settings without X-API-Key is rejected IF MASK_API_KEY is enforced" {
+    # DELIBERATELY the only /candidate/settings check run against a live
+    # deployment -- unlike /clients/self-register (per-org rows, safe to
+    # create-then-delete a test entry), this endpoint overwrites the SINGLE
+    # default-connection credentials row. A "success" test with a valid
+    # X-API-Key and fake data would silently break the live Salesforce
+    # connection. Never add one here; verify save/connect behavior against
+    # local Docker + a disposable Postgres instead (see tests/test_client_registry_db.py).
+    $r = Invoke-Api POST "/candidate/settings" (@{password="x"; login_host="test"} | ConvertTo-Json)
+    if ($r.Status -eq 401) { return $true, "enforced -- 401 (expected/secure)" }
+    if ($r.Status -eq 200) { return $true, "NOT enforced -- endpoint is open" }
+    return $false, "unexpected status=$($r.Status) body=$($r.Raw)"
+}
+
+Test-Case "DELETE /candidate/settings without X-API-Key is rejected IF MASK_API_KEY is enforced" {
+    # Same reasoning as the POST check above -- only verifies auth
+    # enforcement, never actually clears a real stored override.
+    $r = Invoke-Api DELETE "/candidate/settings"
+    if ($r.Status -eq 401) { return $true, "enforced -- 401 (expected/secure)" }
+    if ($r.Status -eq 200) { return $true, "NOT enforced -- endpoint is open" }
+    return $false, "unexpected status=$($r.Status) body=$($r.Raw)"
 }
 
 # ── 2. Auth enforcement ──────────────────────────────────────────────────

@@ -217,14 +217,150 @@ def test_popup_is_real_html_and_carries_the_key(monkeypatch):
     assert 'const API_KEY = "s3cr3t"' in resp.text
 
 
-def test_legacy_mask_profile_index_redirects_to_popup():
-    """Compatibility redirect for the old freelancer app's URL, which some
-    Salesforce button/component config still hardcodes -- Railway logs showed
-    dozens of live 404 hits to this exact path."""
-    client = TestClient(server.app, follow_redirects=False)
+def test_candidate_mask_profile_index_renders(monkeypatch):
+    """The actual Salesforce-embedded UI (Jinja2 templates + static assets),
+    served at the exact path Salesforce hits -- was a 404, then a redirect
+    stopgap to /popup, now the real page."""
+    monkeypatch.setenv("SF_USERNAME", "someone@org.partialcpy")
+    monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
+    client = TestClient(server.app)
     resp = client.get("/candidate/MaskProfileIndex")
-    assert resp.status_code in (302, 307), resp.status_code
-    assert resp.headers["location"] == "/popup"
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "Mask Profile" in resp.text
+    assert "someone@org.partialcpy" in resp.text  # readonly uname field
+    assert '"api_key": "s3cr3t"' in resp.text  # templated ctx for app.js's fetch() auth
+    assert "/static/css/style.css" in resp.text
+    assert "/static/js/app.js" in resp.text
+
+
+def test_candidate_mask_profile_index_prefills_ids_from_query_param():
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex?ids=a0X000000000001,a0X000000000002")
+    assert resp.status_code == 200
+    assert "a0X000000000001,a0X000000000002" in resp.text
+
+
+def test_candidate_mask_profile_index_accepts_apex_semicolon_joined_ids():
+    """MassMaskingController.generatemassmasking() (Apex) joins ids with ';'
+    (String.join(ids, ';')), not commas -- the exact query shape Salesforce's
+    Lightning Component actually builds this URL with."""
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex?ids=a0X000000000001;a0X000000000002")
+    assert resp.status_code == 200
+    assert "a0X000000000001;a0X000000000002" in resp.text
+
+
+def test_candidate_mask_profile_index_uses_uname_query_param_over_env(monkeypatch):
+    """uname comes from Apex's UserInfo.getUserName() (the Salesforce user
+    viewing the page) -- takes priority over SF_USERNAME (the API
+    integration user, a separate concept) when both are present."""
+    monkeypatch.setenv("SF_USERNAME", "integration.user@org.com")
+    client = TestClient(server.app)
+    resp = client.get("/candidate/MaskProfileIndex?uname=recruiter@org.com")
+    assert resp.status_code == 200
+    assert "recruiter@org.com" in resp.text
+    assert "integration.user@org.com" not in resp.text
+
+
+def test_candidate_mask_profile_index_passes_org_url_into_ctx():
+    client = TestClient(server.app)
+    org_url = "https://acme--partialcpy.sandbox.my.salesforce.com/services/Soap/c/59.0/00D000000000001"
+    resp = client.get("/candidate/MaskProfileIndex", params={"orgUrl": org_url})
+    assert resp.status_code == 200
+    assert "acme--partialcpy.sandbox.my.salesforce.com" in resp.text
+
+
+def test_candidate_static_assets_are_served():
+    client = TestClient(server.app)
+    css = client.get("/static/css/style.css")
+    assert css.status_code == 200
+    js = client.get("/static/js/app.js")
+    assert js.status_code == 200
+
+
+def test_candidate_settings_requires_api_key(monkeypatch):
+    monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
+    client = TestClient(server.app)
+    resp = client.post("/candidate/settings", json={
+        "password": "pw", "client_key": None, "client_secret": None, "login_host": "test",
+    })
+    assert resp.status_code == 401
+
+
+def test_candidate_settings_delegates_to_register_default_credentials(monkeypatch):
+    captured = {}
+
+    def fake_register(password, client_id, client_secret, login_host):
+        captured["password"] = password
+        captured["client_id"] = client_id
+        captured["client_secret"] = client_secret
+        captured["login_host"] = login_host
+
+    monkeypatch.setattr(server.sf_client, "register_default_credentials", fake_register)
+    client = TestClient(server.app)
+    resp = client.post("/candidate/settings", json={
+        "password": "pw+token", "client_key": "ck", "client_secret": "cs", "login_host": "test",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert captured == {"password": "pw+token", "client_id": "ck", "client_secret": "cs", "login_host": "test"}
+
+
+def test_candidate_settings_surfaces_missing_credentials_error(monkeypatch):
+    def fake_register(*a, **k):
+        raise server.sf_client.MissingCredentialsError("Missing required field(s): password, login_host")
+
+    monkeypatch.setattr(server.sf_client, "register_default_credentials", fake_register)
+    client = TestClient(server.app)
+    resp = client.post("/candidate/settings", json={
+        "password": "", "client_key": None, "client_secret": None, "login_host": "",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "missing" in body["detail"].lower()
+
+
+def test_candidate_settings_delete_requires_api_key(monkeypatch):
+    monkeypatch.setenv("MASK_API_KEY", "s3cr3t")
+    client = TestClient(server.app)
+    resp = client.delete("/candidate/settings")
+    assert resp.status_code == 401
+
+
+def test_candidate_settings_delete_delegates_and_reports_nothing_to_clear(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "remove_default_credentials", lambda: False)
+    client = TestClient(server.app)
+    resp = client.delete("/candidate/settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "no stored settings" in body["detail"].lower()
+
+
+def test_candidate_settings_delete_confirms_clear(monkeypatch):
+    monkeypatch.setattr(server.sf_client, "remove_default_credentials", lambda: True)
+    client = TestClient(server.app)
+    resp = client.delete("/candidate/settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+
+
+def test_candidate_settings_surfaces_postgres_not_configured(monkeypatch):
+    def fake_register(*a, **k):
+        raise server.sf_client.PostgresNotConfiguredError("Postgres isn't provisioned.")
+
+    monkeypatch.setattr(server.sf_client, "register_default_credentials", fake_register)
+    client = TestClient(server.app)
+    resp = client.post("/candidate/settings", json={
+        "password": "pw", "client_key": None, "client_secret": None, "login_host": "test",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
 
 
 def test_mask_auto_resolves_account_id_for_per_client_watermark(monkeypatch):

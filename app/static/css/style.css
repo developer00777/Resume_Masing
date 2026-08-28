@@ -1,0 +1,139 @@
+:root {
+    --brand: #2563eb;
+    --brand-dark: #1d4ed8;
+    --ink: #1a1a2e;
+    --muted: #6b7280;
+    --border: #e2e6ef;
+    --bg: #f5f7fa;
+}
+
+body {
+    background: var(--bg);
+    color: var(--ink);
+}
+
+.app-header {
+    padding: 20px 24px 8px;
+}
+
+.app-header h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0;
+}
+
+.app-main {
+    padding: 0 24px 32px;
+    max-width: 960px;
+}
+
+.section-title {
+    font-size: 14px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+/* Ready card -- shown when Salesforce launched this page with pre-selected records */
+.ready-card {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.ready-icon {
+    font-size: 32px;
+    line-height: 1;
+}
+
+.ready-count {
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.ready-sub {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 2px;
+}
+
+.mask-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.summary-bar {
+    margin-top: 14px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+}
+
+.summary-bar.summary-error {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.status-table {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.status-table thead th {
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    border-bottom: 2px solid var(--border);
+}
+
+.status-table .empty-row {
+    text-align: center;
+    color: #9ca3af;
+    padding: 24px;
+}
+
+.status-badge {
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+    display: inline-block;
+}
+
+.status-badge.ok {
+    background: #d1fae5;
+    color: #065f46;
+}
+
+.status-badge.error {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.settings-form {
+    max-width: 480px;
+}
+
+#settingsMsg.text-success {
+    color: #065f46;
+}
+
+#settingsMsg.text-danger {
+    color: #991b1b;
+}

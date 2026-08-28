@@ -264,6 +264,20 @@ Ready-made "Connect Your Org" + watermark upload + Mask button page for a
 Lightning Component / iframe embed. Auto-templates `MASK_API_KEY` into its
 own `fetch()` calls.
 
+### `GET /candidate/MaskProfileIndex` + `POST`/`DELETE /candidate/settings`
+
+The real Salesforce-embedded masking UI (Jinja2 templates in
+`app/templates/`, static CSS/JS in `app/static/`, mounted on this same
+FastAPI app). Driven by `MassMaskingController` (Apex, no HTTP callout of
+its own — it just returns `{ids, orgUrl, uname}` for the Lightning
+Component's JS to build the URL from). `POST /candidate/settings` lets the
+page's "User Settings" tab rotate the default connection's
+password/security-token/Connected-App creds via Postgres (encrypted,
+requires `DATABASE_URL` + `CLIENT_SECRET_ENCRYPTION_KEY`) without a
+redeploy; `DELETE /candidate/settings` clears that override, reverting to
+the env-var credentials. Full query-param and request-body contract in
+`SALESFORCE_INTEGRATION.md` §4.
+
 ---
 
 ## 4. Error reference

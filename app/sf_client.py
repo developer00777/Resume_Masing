@@ -113,6 +113,15 @@ _registry_cache: dict[str, dict] | None = None
 _registry_cache_at: float = 0.0
 _REGISTRY_CACHE_TTL = 30  # seconds
 
+# In-memory cache for the default (no client_key) connection's Postgres
+# override -- same TTL/invalidate-on-write pattern as _registry_cache above.
+# _default_override_loaded distinguishes "not loaded yet" from "loaded, and
+# there's genuinely no override row" (both would otherwise look like None).
+_default_override_cache: dict | None = None
+_default_override_loaded: bool = False
+_default_override_cache_at: float = 0.0
+_DEFAULT_OVERRIDE_CACHE_TTL = 30  # seconds
+
 
 def _load_env_registry() -> dict[str, dict]:
     raw = os.environ.get("SF_CLIENTS_JSON")
@@ -249,9 +258,75 @@ def _connect_with_client_credentials(client_key: str, force_refresh: bool = Fals
     return Salesforce(instance_url=instance_url, session_id=access_token, domain=host)
 
 
+def _load_default_override(force: bool = False) -> dict | None:
+    """Postgres-backed override for the default (no client_key) connection --
+    lets /candidate/MaskProfileIndex's Settings tab rotate the
+    password/security-token/Connected-App creds without a Railway redeploy.
+
+    Returns None if unset, or if Postgres is unreachable/unconfigured (never
+    raises -- a DB hiccup degrades to 'fall back to the static env vars',
+    not an outage of every no-client_key /mask call). SF_USERNAME is
+    deliberately NOT part of this override; it stays an env var."""
+    global _default_override_cache, _default_override_loaded, _default_override_cache_at
+    now = time.time()
+    if not force and _default_override_loaded and (now - _default_override_cache_at) < _DEFAULT_OVERRIDE_CACHE_TTL:
+        return _default_override_cache
+
+    override = None
+    if db.is_configured():
+        try:
+            row = db.get_default_credentials()
+            if row is not None:
+                override = {
+                    "password": crypto_util.decrypt_secret(row["encrypted_password"]),
+                    "client_id": (crypto_util.decrypt_secret(row["encrypted_client_id"])
+                                  if row["encrypted_client_id"] else None),
+                    "client_secret": (crypto_util.decrypt_secret(row["encrypted_client_secret"])
+                                       if row["encrypted_client_secret"] else None),
+                    "login_host": row["login_host"],
+                }
+        except Exception:
+            override = None
+
+    _default_override_cache = override
+    _default_override_loaded = True
+    _default_override_cache_at = now
+    return override
+
+
+def invalidate_default_override_cache() -> None:
+    """Called after POST /candidate/settings writes so the next connect() in
+    this process reflects it immediately, without waiting out the TTL."""
+    global _default_override_cache, _default_override_loaded, _default_override_cache_at
+    _default_override_cache = None
+    _default_override_loaded = False
+    _default_override_cache_at = 0.0
+
+
 def connect(client_key: str | None = None, force_refresh: bool = False) -> Salesforce:
     if client_key:
         return _connect_with_client_credentials(client_key, force_refresh=force_refresh)
+
+    override = _load_default_override(force=force_refresh)
+    if override is not None:
+        username = os.environ.get("SF_USERNAME", "").strip()
+        if not username:
+            raise MissingCredentialsError(
+                "Salesforce credentials not configured. Missing: SF_USERNAME "
+                "(the Settings-tab-stored password/creds need SF_USERNAME set "
+                "in the environment alongside them).")
+        domain = (override["login_host"] or "").strip() or "login"
+        if override["client_id"] and override["client_secret"]:
+            return Salesforce(username=username, password=override["password"],
+                              consumer_key=override["client_id"], consumer_secret=override["client_secret"],
+                              domain=domain)
+        # No Connected App creds stored -- plain username/password login. The
+        # Settings-tab form tells the caller to concatenate the security token
+        # into the password themselves, so security_token="" here (simple-
+        # salesforce just concatenates password + security_token internally;
+        # "" is a no-op when the token is already part of the password).
+        return Salesforce(username=username, password=override["password"],
+                          security_token="", domain=domain)
 
     domain = os.environ.get("SF_DOMAIN", "login").strip() or "login"
     if os.environ.get("SF_CONSUMER_KEY"):
@@ -313,6 +388,8 @@ def connect_kwargs_present(client_key: str | None = None) -> None:
         return
     if _load_client_registry():
         return  # at least one multi-client entry configured, no client_key required to report "configured"
+    if _load_default_override() is not None and os.environ.get("SF_USERNAME", "").strip():
+        return  # Settings-tab override present, alongside the required SF_USERNAME
     if os.environ.get("SF_CONSUMER_KEY"):
         _require("SF_USERNAME", "SF_PASSWORD", "SF_CONSUMER_KEY", "SF_CONSUMER_SECRET")
     else:
@@ -360,6 +437,38 @@ def register_client(client_key: str, client_id: str, client_secret: str,
     invalidate_registry_cache()
 
 
+def register_default_credentials(password: str, client_id: str | None, client_secret: str | None,
+                                 login_host: str) -> None:
+    """Persist the default (no client_key) connection's password/security-token
+    (caller concatenates the token into password themselves) and optional
+    Connected App Consumer Key/Secret to Postgres, encrypted.
+
+    Used by POST /candidate/settings so the /candidate/MaskProfileIndex
+    "User Settings" tab can rotate these without a Railway redeploy.
+    SF_USERNAME is NOT stored here -- it stays an env var; this only
+    overrides password/token/consumer-key/secret/domain. Always overwrites
+    (single sentinel row) -- there's nothing to "already be registered"
+    the way there is for register_client()'s per-org rows.
+    """
+    if not password or not login_host:
+        raise MissingCredentialsError("Missing required field(s): password, login_host")
+    if bool(client_id) != bool(client_secret):
+        raise MissingCredentialsError(
+            "client_key and client_secret must be provided together, or both left blank.")
+    if not db.is_configured():
+        raise PostgresNotConfiguredError(
+            "Postgres isn't provisioned on this deployment (DATABASE_URL unset) "
+            "-- dynamic credential rotation is unavailable. Set SF_PASSWORD / "
+            "SF_SECURITY_TOKEN (and SF_CONSUMER_KEY / SF_CONSUMER_SECRET if "
+            "applicable) via Railway env instead.")
+
+    encrypted_password = crypto_util.encrypt_secret(password)
+    encrypted_client_id = crypto_util.encrypt_secret(client_id) if client_id else None
+    encrypted_client_secret = crypto_util.encrypt_secret(client_secret) if client_secret else None
+    db.upsert_default_credentials(encrypted_password, encrypted_client_id, encrypted_client_secret, login_host)
+    invalidate_default_override_cache()
+
+
 def remove_client(client_key: str) -> bool:
     """Delete a Postgres-backed client org entry. Returns whether one existed.
     Does not touch SF_CLIENTS_JSON entries -- those aren't DB-managed."""
@@ -368,6 +477,22 @@ def remove_client(client_key: str) -> bool:
             "Postgres isn't provisioned on this deployment (DATABASE_URL unset).")
     deleted = db.delete_entry(client_key)
     invalidate_registry_cache()
+    return deleted
+
+
+def remove_default_credentials() -> bool:
+    """Clear the default-connection override (POST /candidate/settings)
+    so connect() falls back to the static SF_* env vars again. Returns
+    whether an override existed. The DB override always wins over env vars
+    while present, so this is the only way back to env-var-only mode short
+    of hand-deleting the row -- needed the moment a bad Settings-tab save
+    (wrong password, garbage Consumer Key/Secret) breaks the live
+    connection until it's cleared."""
+    if not db.is_configured():
+        raise PostgresNotConfiguredError(
+            "Postgres isn't provisioned on this deployment (DATABASE_URL unset).")
+    deleted = db.delete_default_credentials()
+    invalidate_default_override_cache()
     return deleted
 
 

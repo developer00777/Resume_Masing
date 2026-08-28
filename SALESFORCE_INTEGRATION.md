@@ -14,45 +14,28 @@ flow, and the full API reference.
 > environment-variable reference (written for us/ops; this doc is the one to
 > hand your Apex/Flow team).
 
-> **ℹ️ Stopgap in place, real fix still on your side:** Railway logs showed
-> repeated live requests to `GET /candidate/MaskProfileIndex` on this URL —
-> a 404, since this service never defined that route. It has the shape of a
-> leftover path from the old freelancer app that used to live at this same
-> domain. **This service now redirects that path to `/popup`** so whatever's
-> still pointed at it works immediately — but the underlying Salesforce
-> config should still be updated to the correct URL directly when
-> convenient; the redirect is a patch, not a fix for the stale reference.
->
-> **Step 1 — find it fast, via Developer Console → Debug → Open Execute
-> Anonymous Window (or Workbench), Tooling API query:**
-> ```sql
-> SELECT Id, Name FROM ApexPage WHERE Markup LIKE '%railway.app%'
-> SELECT Id, Name FROM ApexClass WHERE Body LIKE '%railway.app%'
-> SELECT Id, Name FROM AuraDefinition WHERE Source LIKE '%railway.app%'
-> SELECT Id, Name FROM LightningComponentResource WHERE Source LIKE '%railway.app%'
+> **`/candidate/MaskProfileIndex` is now a real page**, served by this
+> service. It's driven by `MassMaskingController` (Apex, `@AuraEnabled`) —
+> that controller makes **no HTTP callout of its own**; `getJobApplicants()`
+> lists candidates for the Lightning Component's picker, and
+> `generatemassmasking(jobAppIdList)` returns `{ids, orgUrl, uname}` for the
+> component's own JS to build this URL:
 > ```
-> Any hit names the exact Visualforce page / Apex class / Lightning component
-> hardcoding the URL — open it and search for `candidate/MaskProfileIndex`.
+> https://resume-masker-production.up.railway.app/candidate/MaskProfileIndex
+>   ?ids=<Job Applicant Ids, SEMICOLON-separated — String.join(ids, ';')>
+>   &uname=<UserInfo.getUserName() — the Salesforce user viewing the page>
+>   &orgUrl=<the org's SOAP endpoint URL, Org Id embedded at the end:
+>            .../services/Soap/c/59.0/{OrganizationId}>
+> ```
+> The page (Jinja2 templates + static JS under `app/templates/`,
+> `app/static/` in this repo) shows a **Mask Profile** tab (bulk-masks the
+> passed-in Ids via `POST /mask/batch`) and a **User Settings** tab that can
+> rotate the service's Salesforce password/security-token/Connected-App
+> creds without a Railway redeploy — see §4 below (`/candidate/settings`)
+> for that endpoint.
 >
-> **Step 2 — if that finds nothing, check by hand:**
-> - **Setup → Object Manager → [the object the button lives on] → Buttons,
->   Links, and Actions** → open the "Generate Masking"/"CV Masking" button →
->   check its URL/Formula field
-> - **Setup → Tabs → Web Tabs** → check each tab's URL
-> - **Setup → Custom Metadata Types** / **Custom Settings** → anything
->   storing an "Integration Endpoint"/"API URL" value
-> - The Lightning page's **App Builder** (gear icon → Edit Page) → click the
->   component → check its URL property in the right-hand panel
->
-> **Step 3 — repoint it to:**
-> - `https://resume-masker-production.up.railway.app/popup` if it just opens
->   a page/iframe, or
-> - an Apex callout to `POST https://resume-masker-production.up.railway.app/mask`
->   (§2 and §4 below) if the button should trigger masking directly rather
->   than display a page.
->
-> Steps 1–3 above still apply if you want to fix the source instead of
-> relying on the redirect long-term.
+> Opened with no query params, the page falls back to manual Job Applicant
+> Id entry — useful for testing without going through Salesforce at all.
 
 ---
 
@@ -422,6 +405,51 @@ form currently requires manually typing your Organization Id; if you embed
 this page via Visualforce/Lightning, that field can be pre-filled from
 `{!$Organization.Id}` — ask us if you want that wired up.
 
+### `GET /candidate/MaskProfileIndex` — the live masking UI
+
+This is the page `MassMaskingController`'s Lightning Component actually
+opens (see the callout at the top of this doc for the exact query-param
+contract). Unauthenticated to load (same trust boundary as `/popup` — only
+Salesforce-authenticated users viewing this Lightning page reach it), but
+its own `fetch()` calls to `/mask/batch` and `/candidate/settings` carry
+`X-API-Key` automatically, templated in server-side.
+
+Query params (all optional — omit them for manual/standalone testing):
+
+| Param | Source | Used for |
+|---|---|---|
+| `ids` | `String.join(jobAppIdList, ';')` | Pre-fills the bulk-mask list; falls back to manual paste if absent |
+| `uname` | `UserInfo.getUserName()` | Displayed (read-only) on the User Settings tab |
+| `orgUrl` | `URL.getOrgDomainUrl() + '/services/Soap/c/59.0/' + UserInfo.getOrganizationId()` | Its host is auto-extracted client-side to pre-fill the Settings tab's "Custom My Domain host" field |
+
+### `POST /candidate/settings` — rotate the default connection's credentials
+
+From the page's User Settings tab. Saves the password (security token
+concatenated onto it by the caller, same convention as `SF_SECURITY_TOKEN`),
+and optionally a Connected App Consumer Key/Secret, encrypted into Postgres
+(requires `DATABASE_URL` **and** `CLIENT_SECRET_ENCRYPTION_KEY` — see §3b's
+requirements). This **overrides** `SF_PASSWORD`/`SF_SECURITY_TOKEN`/
+`SF_CONSUMER_KEY`/`SF_CONSUMER_SECRET` env vars for the default (no
+`client_key`) connection the moment it's saved — `SF_USERNAME` itself stays
+an env var, shown read-only on the form.
+
+```json
+{ "password": "yourpassword+securitytoken", "client_key": null, "client_secret": null, "login_host": "test" }
+```
+
+`login_host` is `"login"` (prod), `"test"` (sandbox), or a My Domain host
+(auto-filled from `orgUrl`, above). `client_key`/`client_secret` are the
+Connected App Consumer Key/Secret if you want the OAuth2 username-password
+flow instead of a plain password login — both or neither, not one alone.
+Requires `X-API-Key`, same as `/mask`.
+
+**`DELETE /candidate/settings`** clears the stored override, reverting to
+the env-var credentials — use this if a bad save (wrong password, garbage
+Consumer Key/Secret) breaks the connection. Same `X-API-Key` gate.
+
+⚠️ There's only ever one stored row — every `POST /candidate/settings`
+overwrites whatever was there before, for whoever opens the page next.
+
 ---
 
 ## 5. Watermark — how the per-client logo gets to us
@@ -456,6 +484,9 @@ a plain-English message safe to surface in a Flow error toast):
 | `This org is already registered. Contact us to rotate credentials.` | `/clients/self-register` called twice for the same `client_key` | Ask us to rotate via `/admin/clients` instead — self-service can't overwrite |
 | `Postgres isn't provisioned on this deployment (DATABASE_URL unset)...` | `/clients/self-register` or `/admin/clients` called on a deployment with `registry_backend: "env-only"` | Send us your credentials directly instead of self-registering |
 | `Missing or invalid X-Admin-API-Key.` / `Admin API not configured...` | Wrong or missing admin key on `/admin/clients` | This route isn't for Apex/Flow — it's for us; you shouldn't normally be calling it |
+| `Missing required field(s): password, login_host` | `/candidate/settings` save with an empty password or environment | Fill in both fields on the User Settings tab |
+| `client_key and client_secret must be provided together, or both left blank.` | Only one of Consumer Key/Secret filled in on the Settings tab | Fill in both, or leave both blank for a plain password login |
+| `No stored settings to clear.` | `DELETE /candidate/settings` called with no override currently saved | Nothing to do — the connection is already using env-var credentials |
 
 ---
 

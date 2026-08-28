@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+
+{% block content %}
+<ul class="nav nav-tabs" id="mainTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="mask-tab" data-bs-toggle="tab"
+                data-bs-target="#mask-pane" type="button" role="tab">Mask Profile</button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="settings-tab" data-bs-toggle="tab"
+                data-bs-target="#settings-pane" type="button" role="tab">User Settings</button>
+    </li>
+</ul>
+
+<div class="tab-content pt-4">
+    <!-- ── Tab 1: Bulk Mask ─────────────────────────────── -->
+    <div class="tab-pane fade show active" id="mask-pane" role="tabpanel">
+
+        <!-- Summary card: shown when launched from Salesforce with selected records -->
+        <div id="readyCard" class="ready-card d-none">
+            <div class="ready-icon">&#128737;</div>
+            <div class="ready-text">
+                <div class="ready-count"><span id="readyCount">0</span> candidate profile(s) selected</div>
+                <div class="ready-sub">Email, phone numbers and personal links will be removed
+                    from each resume, and the masked copy attached back to the record.</div>
+            </div>
+        </div>
+
+        <!-- Manual entry: shown only when opened without any selected records -->
+        <div id="manualEntry" class="d-none">
+            <h5 class="section-title">Enter Job Applicant IDs</h5>
+            <p class="text-muted small">Separate multiple IDs by comma, space, or new line.</p>
+        </div>
+
+        <!-- Always present; hidden visually when records were passed in from Salesforce -->
+        <textarea id="jaIds" class="form-control mb-2 d-none" rows="4"
+                  placeholder="Paste Job Applicant IDs...">{{ ctx.prefill_ids }}</textarea>
+
+        <div class="mask-actions">
+            <button id="maskBtn" class="btn btn-primary btn-lg">
+                <span class="btn-label">Mask Profiles</span>
+            </button>
+            <span id="maskSpinner" class="spinner-border spinner-border-sm text-light d-none"></span>
+        </div>
+
+        <div id="maskSummary" class="summary-bar d-none"></div>
+
+        <div class="table-responsive mt-3">
+            <table class="table align-middle status-table">
+                <thead>
+                    <tr>
+                        <th style="width:40%">Job Applicant</th>
+                        <th style="width:18%">Status</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody id="statusBody">
+                    <tr><td colspan="3" class="empty-row">No profiles masked yet.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ── Tab 2: User Settings ─────────────────────────── -->
+    <div class="tab-pane fade" id="settings-pane" role="tabpanel">
+        <h5 class="section-title">Enter User Details Below:</h5>
+        <form id="settingsForm" class="settings-form" autocomplete="off">
+            <div class="mb-3">
+                <label class="form-label">Sales Force User Name</label>
+                <input type="text" id="uname" class="form-control" value="{{ ctx.uname }}" readonly>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Salesforce Environment</label>
+                <select id="login_host_select" class="form-select" required>
+                    <option value="" disabled selected>— Select environment —</option>
+                    <option value="login.salesforce.com">Production / Developer Edition (login.salesforce.com)</option>
+                    <option value="test.salesforce.com">Sandbox (test.salesforce.com)</option>
+                    <option value="__custom__">Custom My Domain host…</option>
+                </select>
+                <input type="text" id="login_host_custom" class="form-control mt-2 d-none"
+                       placeholder="mycompany--sandbox.sandbox.my.salesforce.com">
+                <div class="form-text">
+                    Sandbox usernames (…<code>.sandbox</code>, …<code>.partialcpy</code>) must use
+                    <strong>Sandbox</strong>. Use a custom host if My Domain blocks authentication
+                    via login/test.
+                </div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Sales Force Password</label>
+                <input type="password" id="password" class="form-control" autocomplete="new-password"
+                       placeholder="Enter Salesforce password + security token">
+                <div class="form-text">Password concatenated with the security token, if required.</div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Sales Force Client Key</label>
+                <input type="password" id="client_key" class="form-control" autocomplete="new-password"
+                       placeholder="Connected App Consumer Key">
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Sales Force Client Secret</label>
+                <input type="password" id="client_secret" class="form-control" autocomplete="new-password"
+                       placeholder="Connected App Consumer Secret">
+            </div>
+            <button type="submit" class="btn btn-primary">Save Settings</button>
+            <span id="settingsSpinner" class="spinner-border spinner-border-sm text-primary d-none ms-2"></span>
+            <div id="settingsMsg" class="mt-2 small"></div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>window.APP_CTX = {{ ctx|tojson }};</script>
+<script src="{{ url_for('static', path='js/app.js') }}"></script>
+{% endblock %}

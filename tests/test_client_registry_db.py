@@ -44,12 +44,15 @@ TEST_FERNET_KEY = Fernet.generate_key().decode()
 def _clear_state(monkeypatch):
     sf_client._token_cache.clear()
     sf_client.invalidate_registry_cache()
+    sf_client.invalidate_default_override_cache()
     monkeypatch.delenv("SF_CLIENTS_JSON", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("CLIENT_SECRET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("SF_USERNAME", raising=False)
     yield
     sf_client._token_cache.clear()
     sf_client.invalidate_registry_cache()
+    sf_client.invalidate_default_override_cache()
 
 
 class _FakeDb:
@@ -82,14 +85,35 @@ class _FakeDb:
     def delete_entry(self, client_key: str) -> bool:
         return self.rows.pop(client_key, None) is not None
 
+    def get_default_credentials(self) -> dict | None:
+        return self.default_row
+
+    def upsert_default_credentials(self, encrypted_password, encrypted_client_id,
+                                    encrypted_client_secret, login_host) -> None:
+        self.default_row = {
+            "encrypted_password": encrypted_password,
+            "encrypted_client_id": encrypted_client_id,
+            "encrypted_client_secret": encrypted_client_secret,
+            "login_host": login_host,
+        }
+
+    def delete_default_credentials(self) -> bool:
+        existed = self.default_row is not None
+        self.default_row = None
+        return existed
+
 
 def _install_fake_db(monkeypatch) -> _FakeDb:
     fake = _FakeDb()
+    fake.default_row = None
     monkeypatch.setattr(sf_client.db, "is_configured", fake.is_configured)
     monkeypatch.setattr(sf_client.db, "list_entries", fake.list_entries)
     monkeypatch.setattr(sf_client.db, "get_entry", fake.get_entry)
     monkeypatch.setattr(sf_client.db, "upsert_entry", fake.upsert_entry)
     monkeypatch.setattr(sf_client.db, "delete_entry", fake.delete_entry)
+    monkeypatch.setattr(sf_client.db, "get_default_credentials", fake.get_default_credentials)
+    monkeypatch.setattr(sf_client.db, "upsert_default_credentials", fake.upsert_default_credentials)
+    monkeypatch.setattr(sf_client.db, "delete_default_credentials", fake.delete_default_credentials)
     return fake
 
 
@@ -220,6 +244,160 @@ def test_registry_backend_reflects_db_configuration(monkeypatch):
     assert sf_client.registry_backend() == "env-only"
     _install_fake_db(monkeypatch)
     assert sf_client.registry_backend() == "db+env"
+
+
+# ── Default (no client_key) credential override ─────────────────────────────
+# Backs /candidate/MaskProfileIndex's "User Settings" tab -- lets the
+# password/security-token/Connected-App creds be rotated via Postgres without
+# a Railway redeploy, while SF_USERNAME itself stays an env var.
+
+class _FakeSalesforce:
+    """Captures the kwargs connect() would pass to simple_salesforce.Salesforce,
+    without ever attempting a real login."""
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        _FakeSalesforce.last = self
+
+
+def test_register_default_credentials_requires_password_and_login_host(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    _install_fake_db(monkeypatch)
+    with pytest.raises(sf_client.MissingCredentialsError):
+        sf_client.register_default_credentials("", None, None, "test")
+    with pytest.raises(sf_client.MissingCredentialsError):
+        sf_client.register_default_credentials("pw", None, None, "")
+
+
+def test_register_default_credentials_requires_client_key_and_secret_together(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    _install_fake_db(monkeypatch)
+    with pytest.raises(sf_client.MissingCredentialsError):
+        sf_client.register_default_credentials("pw", "consumer-key-only", None, "test")
+    with pytest.raises(sf_client.MissingCredentialsError):
+        sf_client.register_default_credentials("pw", None, "consumer-secret-only", "test")
+
+
+def test_register_default_credentials_raises_when_postgres_not_configured(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    with pytest.raises(sf_client.PostgresNotConfiguredError):
+        sf_client.register_default_credentials("pw", None, None, "test")
+
+
+def test_register_default_credentials_encrypts_and_invalidates_cache_immediately(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    fake = _install_fake_db(monkeypatch)
+
+    sf_client.register_default_credentials("plain-password", None, None, "test")
+
+    stored = fake.default_row["encrypted_password"]
+    assert stored != "plain-password"
+    assert crypto_util.decrypt_secret(stored) == "plain-password"
+    assert fake.default_row["encrypted_client_id"] is None
+
+    override = sf_client._load_default_override()
+    assert override["password"] == "plain-password"
+    assert override["login_host"] == "test"
+    assert override["client_id"] is None
+
+
+def test_connect_uses_default_override_plain_password_when_no_client_id(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.setenv("SF_USERNAME", "user@org.partialcpy")
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw+token", None, None, "test")
+    monkeypatch.setattr(sf_client, "Salesforce", _FakeSalesforce)
+
+    sf_client.connect()
+
+    kwargs = _FakeSalesforce.last.kwargs
+    assert kwargs["username"] == "user@org.partialcpy"
+    assert kwargs["password"] == "pw+token"
+    assert kwargs["security_token"] == ""
+    assert kwargs["domain"] == "test"
+    assert "consumer_key" not in kwargs
+
+
+def test_connect_uses_default_override_connected_app_when_client_id_present(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.setenv("SF_USERNAME", "user@org.partialcpy")
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw+token", "consumer-key", "consumer-secret", "login")
+    monkeypatch.setattr(sf_client, "Salesforce", _FakeSalesforce)
+
+    sf_client.connect()
+
+    kwargs = _FakeSalesforce.last.kwargs
+    assert kwargs["consumer_key"] == "consumer-key"
+    assert kwargs["consumer_secret"] == "consumer-secret"
+    assert kwargs["domain"] == "login"
+
+
+def test_connect_raises_when_override_present_but_sf_username_unset(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.delenv("SF_USERNAME", raising=False)
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw+token", None, None, "test")
+
+    with pytest.raises(sf_client.MissingCredentialsError):
+        sf_client.connect()
+
+
+def test_connect_falls_back_to_env_vars_when_no_override_stored(monkeypatch):
+    """No Postgres override row -- must behave exactly like before this
+    feature existed (regression guard)."""
+    monkeypatch.setenv("SF_USERNAME", "envuser@org.com")
+    monkeypatch.setenv("SF_PASSWORD", "envpass")
+    monkeypatch.setenv("SF_SECURITY_TOKEN", "envtoken")
+    monkeypatch.delenv("SF_CONSUMER_KEY", raising=False)
+    _install_fake_db(monkeypatch)  # configured, but default_row stays None
+    monkeypatch.setattr(sf_client, "Salesforce", _FakeSalesforce)
+
+    sf_client.connect()
+
+    kwargs = _FakeSalesforce.last.kwargs
+    assert kwargs["username"] == "envuser@org.com"
+    assert kwargs["security_token"] == "envtoken"
+
+
+def test_remove_default_credentials_returns_false_when_none_stored(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    _install_fake_db(monkeypatch)
+    assert sf_client.remove_default_credentials() is False
+
+
+def test_remove_default_credentials_clears_the_override(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.setenv("SF_USERNAME", "envuser@org.com")
+    monkeypatch.setenv("SF_PASSWORD", "envpass")
+    monkeypatch.setenv("SF_SECURITY_TOKEN", "envtoken")
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("bad-password", "bad-key", "bad-secret", "test")
+    assert sf_client._load_default_override() is not None
+
+    assert sf_client.remove_default_credentials() is True
+    assert sf_client._load_default_override() is None
+
+    monkeypatch.setattr(sf_client, "Salesforce", _FakeSalesforce)
+    sf_client.connect()  # must fall back to env vars now, not raise/use the cleared override
+    kwargs = _FakeSalesforce.last.kwargs
+    assert kwargs["username"] == "envuser@org.com"
+    assert kwargs["security_token"] == "envtoken"
+
+
+def test_remove_default_credentials_raises_when_postgres_not_configured():
+    with pytest.raises(sf_client.PostgresNotConfiguredError):
+        sf_client.remove_default_credentials()
+
+
+def test_creds_configured_true_via_default_override_alone(monkeypatch):
+    monkeypatch.setenv("CLIENT_SECRET_ENCRYPTION_KEY", TEST_FERNET_KEY)
+    monkeypatch.setenv("SF_USERNAME", "user@org.partialcpy")
+    monkeypatch.delenv("SF_PASSWORD", raising=False)
+    monkeypatch.delenv("SF_SECURITY_TOKEN", raising=False)
+    _install_fake_db(monkeypatch)
+    sf_client.register_default_credentials("pw+token", None, None, "test")
+
+    assert sf_client.creds_configured() is True
 
 
 # ── crypto_util ───────────────────────────────────────────────────────────
