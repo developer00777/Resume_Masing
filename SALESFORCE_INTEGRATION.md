@@ -14,6 +14,15 @@ flow, and the full API reference.
 > environment-variable reference (written for us/ops; this doc is the one to
 > hand your Apex/Flow team).
 
+> **⚠️ Action needed on your side:** Railway logs show repeated live requests
+> to `GET /candidate/MaskProfileIndex` on this URL — a 404, since this
+> service never defines that route. It has the shape of a leftover path
+> from the old freelancer app that used to live at this same domain. Find
+> where it's configured (custom button URL, a Lightning Component's iframe
+> `src`, a Visualforce page, or a Web Tab) and repoint it to **`/popup`**
+> (embeddable UI) or **`POST /mask`** (direct API call — §4 below). Until
+> this is fixed, whoever clicks that button/page gets a dead link.
+
 ---
 
 ## 1. How to wire the new Contact → Applicant flow
