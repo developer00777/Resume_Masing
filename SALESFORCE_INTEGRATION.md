@@ -257,7 +257,7 @@ join-view "Mask" button (real flow: MassMaskingController -> /candidate/MaskProf
 |---|---|---|
 | `job_applicant_id` | yes | Salesforce Id of the source record (today: Job Applicant). 15 or 18 chars. |
 | `account_id` | no | Client Account Id, for watermark resolution. Auto-resolved from the Job Applicant if omitted. |
-| `mask_strings` | no | Exact PII strings to redact. If omitted, the service runs a regex fallback (email/phone) over the extracted PDF text — less accurate than passing exact values from your data. |
+| `mask_strings` | no | Exact PII strings to redact. If omitted (the real button flow currently never sends it), the service auto-resolves the candidate's Name/Phone/Email from the related Contact record (`SCSCHAMPS__Contact_Talent__c`) and merges that with a regex fallback (email/phone) over the extracted PDF text. The Contact lookup exists because regex-on-text alone can silently miss real PII — confirmed on this org: resumes built from Microsoft's built-in "Contoso" template render the phone/email via a Word content control that can extract as blank or garbled text, even though the correct value sits right there on the Contact. Passing `mask_strings` explicitly (e.g. from your own parsed candidate data) always takes priority over both. |
 | `watermark_text` | no | Fallback text watermark if no image is found. Default `"CONFIDENTIAL"`. |
 | `watermark_base64` | no | Inline watermark image — skips an extra Salesforce round-trip. See §5. |
 | `client_key` | conditional | Required only if we're using multi-org auth (Option C above) — your org's Organization Id (`UserInfo.getOrganizationId()`). Omit for Option A/B. Must be registered first, see §3a. |

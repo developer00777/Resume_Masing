@@ -117,6 +117,86 @@ def test_mask_falls_back_to_detect_pii(monkeypatch):
     assert "98765" not in text, "regex phone not redacted"
 
 
+def test_mask_merges_structured_contact_pii_with_regex_fallback(monkeypatch):
+    """Regression for a real, confirmed PII leak: some resume templates
+    (e.g. Microsoft's built-in "Contoso" template) extract with the
+    phone/email silently blank or garbled, so detect_pii()'s regex-on-text
+    approach finds nothing -- even though the candidate's real contact info
+    sits right there, correct, on the Contact record. When mask_strings
+    isn't supplied (the real Salesforce flow never sends it), the
+    candidate's structured Name/Phone/Email must be pulled from the
+    related Contact and merged in, not left to regex alone.
+
+    "John Doe" is present in the sample PDF's text but detect_pii() alone
+    NEVER catches it (it only regex-matches email/phone, never names) --
+    proving this specific redaction only happened because the structured
+    Contact lookup fed it in, not as a side effect of the existing regex path."""
+    captured = _install_mocks(monkeypatch)
+    monkeypatch.setattr(server.sf_client, "resolve_contact_id", lambda jaid, sf=None: "003RESOLVEDCONTACT01")
+    monkeypatch.setattr(server.sf_client, "fetch_contact_pii_strings",
+                        lambda cid, sf=None: ["John Doe"])
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "ok"
+
+    masked = fitz.open(stream=captured["pdf_bytes"], filetype="pdf")
+    text = "".join(p.get_text() for p in masked)
+    masked.close()
+    assert "John Doe" not in text, "structured Contact name was not merged into mask_strings"
+    assert "john.doe@example.com" not in text, "regex-detected PII still redacted too"
+
+
+def test_mask_calls_fetch_contact_pii_strings_when_contact_resolves(monkeypatch):
+    captured = _install_mocks(monkeypatch)
+    calls = {}
+    monkeypatch.setattr(server.sf_client, "resolve_contact_id", lambda jaid, sf=None: "003RESOLVEDCONTACT01")
+
+    def fake_fetch_contact_pii(cid, sf=None):
+        calls["contact_id"] = cid
+        return ["Jane Candidate", "jane.candidate@example.com"]
+
+    monkeypatch.setattr(server.sf_client, "fetch_contact_pii_strings", fake_fetch_contact_pii)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002"})
+    assert resp.status_code == 200, resp.text
+    assert calls["contact_id"] == "003RESOLVEDCONTACT01"
+
+
+def test_mask_skips_contact_pii_lookup_when_no_contact_resolves(monkeypatch):
+    """No related Contact (resolve_contact_id returns None) -> must not call
+    fetch_contact_pii_strings at all, just fall back to detect_pii()."""
+    _install_mocks(monkeypatch)
+    monkeypatch.setattr(server.sf_client, "resolve_contact_id", lambda jaid, sf=None: None)
+
+    def fail_if_called(cid, sf=None):
+        raise AssertionError("fetch_contact_pii_strings should not run without a resolved contact_id")
+
+    monkeypatch.setattr(server.sf_client, "fetch_contact_pii_strings", fail_if_called)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "ok"  # still succeeds via detect_pii() alone
+
+
+def test_mask_explicit_mask_strings_skips_contact_pii_lookup(monkeypatch):
+    """When the caller DOES supply mask_strings explicitly, the structured
+    Contact lookup must not run at all -- explicit input always wins."""
+    _install_mocks(monkeypatch)
+
+    def fail_if_called(jaid, sf=None):
+        raise AssertionError("resolve_contact_id should not run when mask_strings is explicit")
+
+    monkeypatch.setattr(server.sf_client, "resolve_contact_id", fail_if_called)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002", "mask_strings": ["x"]})
+    assert resp.status_code == 200, resp.text
+
+
 def test_detect_pii_ignores_stacked_dates_across_lines():
     """_PHONE_RE must not span newlines -- real resumes stack education years and
     date ranges on separate lines (e.g. "2023\\n2014\\n2016"), which previously

@@ -640,6 +640,54 @@ def resolve_contact_id(job_applicant_id: str, sf: Salesforce | None = None) -> s
         return None
 
 
+# Fields checked for structured PII, in this order. Confirmed against real
+# candidate data: standard Phone/MobilePhone/HomePhone/OtherPhone are
+# consistently blank on this org -- the actual phone number lives in the
+# custom PhoneNumber__c field instead. Email is the standard field and is
+# reliably populated. Included as a safety net for orgs/records that do use
+# the standard fields, or an alternate-email field.
+_CONTACT_PII_FIELDS = (
+    "Phone", "MobilePhone", "HomePhone", "OtherPhone", "PhoneNumber__c",
+    "SCSCHAMPS__PhoneNumber__c", "SCSCHAMPS__AlternatePhoneNumber__c",
+    "Email", "SCSCHAMPS__AlternateEmail__c",
+)
+
+
+def fetch_contact_pii_strings(contact_id: str, sf: Salesforce | None = None) -> list[str]:
+    """Structured PII (name, phone, email) from the candidate's Contact
+    record -- far more reliable than regex-scanning the resume's extracted
+    text (detect_pii() in server.py). Confirmed against real candidates: a
+    resume using a template with the phone/email in a text box or Word
+    content control (e.g. Microsoft's built-in "Contoso" template) can
+    extract with those fields silently blank or garbled, while the
+    candidate's real email/phone still sit right here on the Contact,
+    completely unmasked in that scenario if this weren't checked.
+
+    Returns [] (never raises) if the Contact can't be read or has none of
+    _CONTACT_PII_FIELDS populated -- caller should still fall back to
+    detect_pii() in that case, not treat this as authoritative on its own.
+    """
+    contact_id = _safe_id(contact_id, "contact_id")
+    sf = sf or connect()
+    try:
+        fields = ", ".join(("Name",) + _CONTACT_PII_FIELDS)
+        res = sf.query(f"SELECT {fields} FROM Contact WHERE Id = '{contact_id}' LIMIT 1")
+        recs = res.get("records", [])
+        if not recs:
+            return []
+        rec = recs[0]
+        out: list[str] = []
+        seen: set[str] = set()
+        for field in ("Name",) + _CONTACT_PII_FIELDS:
+            value = rec.get(field)
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+    except Exception:
+        return []
+
+
 def _pick_by_extension(records: list[dict], ext_of) -> tuple[dict, str] | None:
     """From a list of file-like records, pick the best one by
     _RESUME_EXT_PRIORITY (pdf first, then docx, then doc); anything else

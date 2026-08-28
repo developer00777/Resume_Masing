@@ -259,6 +259,13 @@ Job list (per client) ──click Job Id──▶ joined view: job requirements 
 ## PII detection
 
 Preferred: the caller passes `mask_strings` (the on-prem parser's exact output → no missed chars, no
-over-masking). Fallback: `detect_pii()` regex-matches email + phone from the PDF text layer. A
-`TODO(parser)` hook in `app/server.py` marks where to wire the on-prem parser / OpenRouter LLM for names.
-Scanned image-only PDFs have no text layer → `/mask` returns a clear "needs OCR / route to manual" error.
+over-masking). For `/mask` and `/mask/batch` (which have a live Salesforce session), the fallback when
+`mask_strings` is omitted is now two-layered: `sf_client.fetch_contact_pii_strings()` pulls the
+candidate's structured Name/Phone/Email straight from the related Contact record, merged with
+`detect_pii()`'s regex email/phone scan of the PDF text layer. The Contact-field lookup exists because
+regex-on-text alone can silently miss real PII — confirmed on real candidate data: resumes built from
+Microsoft's built-in "Contoso" template render the phone/email via a Word content control that extracts
+as blank or garbled text after DOCX→PDF conversion, even though the correct value sits right there,
+structured and correct, on the Contact. `/mask/inline` has no Salesforce session, so it's regex-only —
+pass `mask_strings` explicitly there for full accuracy. Scanned image-only PDFs have no text layer →
+`/mask` returns a clear "needs OCR / route to manual" error.

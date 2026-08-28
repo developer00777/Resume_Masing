@@ -294,8 +294,32 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         except docx_convert.DocxConversionError as e:
             return MaskResponse(status="error", detail=f"Could not convert {ext} resume to PDF: {e}"[:300])
 
-    # 2) Determine PII to mask
-    mask_strings = req.mask_strings if req.mask_strings else detect_pii(pdf_bytes)
+    # 2) Determine PII to mask. If the caller didn't supply exact strings
+    #    (the real Salesforce flow never does -- MassMaskingController only
+    #    ever sends job_applicant_id), prefer the candidate's structured
+    #    Contact fields (Name/Phone/Email) over regex-scanning the resume's
+    #    extracted text: confirmed against real candidates that some resume
+    #    templates (e.g. Microsoft's built-in "Contoso" template, which uses
+    #    a Word content control for the phone/email) extract with that
+    #    contact info silently blank or garbled -- detect_pii() alone would
+    #    leave it completely unmasked even though it's sitting right there,
+    #    correct, on the Contact record. Both sources are merged (not
+    #    either/or) since detect_pii() can still catch things the Contact
+    #    record doesn't have (e.g. a second email only written in the resume).
+    if req.mask_strings:
+        mask_strings = req.mask_strings
+    else:
+        contact_strings: list[str] = []
+        contact_id = sf_client.resolve_contact_id(req.job_applicant_id, sf=sf)
+        if contact_id:
+            contact_strings = sf_client.fetch_contact_pii_strings(contact_id, sf=sf)
+        regex_strings = detect_pii(pdf_bytes)
+        seen: set[str] = set()
+        mask_strings = []
+        for s in contact_strings + regex_strings:
+            if s not in seen:
+                seen.add(s)
+                mask_strings.append(s)
     if not mask_strings:
         return MaskResponse(status="error", detail="No PII strings to mask.")
 

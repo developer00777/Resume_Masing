@@ -142,3 +142,39 @@ def test_raises_resume_not_found_when_nothing_anywhere():
     sf = _ScriptedSF([])  # every query returns {"records": []} via the default
     with pytest.raises(sf_client.ResumeNotFoundError):
         sf_client.fetch_resume_pdf(JA_ID, sf=sf)
+
+
+# ── fetch_contact_pii_strings() ──────────────────────────────────────────────
+# Regression coverage for a real, confirmed PII leak: some resume templates
+# (e.g. Microsoft's built-in "Contoso" template, which renders the phone/
+# email via a Word content control) extract with that contact info silently
+# blank or garbled -- detect_pii()'s regex-on-text approach finds nothing,
+# even though the candidate's real email/phone sit right there, correct, on
+# the Contact record. Confirmed against two real candidates on the live org
+# (details not reproduced here -- synthetic values used below instead);
+# their real emails were completely absent from detect_pii()'s output
+# despite being present and correct on Contact.Email.
+
+def test_fetch_contact_pii_strings_returns_populated_fields_only():
+    sf = _ScriptedSF([
+        ("FROM Contact WHERE Id = '003000000000001AAA'", {"records": [{
+            "Name": "Jane Candidate", "Phone": None, "MobilePhone": None, "HomePhone": None,
+            "OtherPhone": None, "PhoneNumber__c": "5550100001",
+            "SCSCHAMPS__PhoneNumber__c": None, "SCSCHAMPS__AlternatePhoneNumber__c": None,
+            "Email": "jane.candidate@example.com", "SCSCHAMPS__AlternateEmail__c": None,
+        }]}),
+    ])
+    result = sf_client.fetch_contact_pii_strings(CONTACT_ID, sf=sf)
+    assert result == ["Jane Candidate", "5550100001", "jane.candidate@example.com"]
+
+
+def test_fetch_contact_pii_strings_empty_when_contact_not_found():
+    sf = _ScriptedSF([])
+    assert sf_client.fetch_contact_pii_strings(CONTACT_ID, sf=sf) == []
+
+
+def test_fetch_contact_pii_strings_never_raises_on_query_failure():
+    class _RaisingSF:
+        def query(self, soql):
+            raise Exception("simulated Salesforce error")
+    assert sf_client.fetch_contact_pii_strings(CONTACT_ID, sf=_RaisingSF()) == []
