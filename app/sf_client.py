@@ -639,6 +639,30 @@ def resolve_account_id(job_applicant_id: str, sf: Salesforce | None = None) -> s
         return None
 
 
+def fetch_job_applicant_name(job_applicant_id: str, sf: Salesforce | None = None) -> str | None:
+    """Look up the Job Applicant's human-readable Name (the SCSCHAMPS
+    auto-number, e.g. "JA-26469") -- display-only convenience for the
+    /candidate/MaskProfileIndex results table, which otherwise only has the
+    raw Salesforce Id to show. Purely additive: masking itself never uses
+    this value, only job_applicant_id (the real Id) -- if this lookup fails
+    or the record has no Name, the frontend falls back to showing the raw
+    Id, exactly as before this existed. Never raises -- unlike resolve_account_id/
+    resolve_contact_id, the Id validation is deliberately inside the try below:
+    this is called unguarded at the very top of _mask_one, before job_applicant_id
+    has been through fetch_resume_pdf's own InvalidIdError handling, so a
+    malformed Id here must not blow up with an uncaught 500."""
+    try:
+        job_applicant_id = _safe_id(job_applicant_id, "job_applicant_id")
+        sf = sf or connect()
+        res = sf.query(f"SELECT Name FROM {_JOB_APPLICANT_OBJECT} WHERE Id = '{job_applicant_id}' LIMIT 1")
+        recs = res.get("records", [])
+        if not recs:
+            return None
+        return recs[0].get("Name") or None
+    except Exception:
+        return None
+
+
 # ── Resume PDF ──────────────────────────────────────────────────────────────
 
 _JOB_APPLICANT_CONTACT_FIELD = "SCSCHAMPS__Contact_Talent__c"

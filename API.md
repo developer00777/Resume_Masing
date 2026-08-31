@@ -199,8 +199,15 @@ the live Mode A connection. Full field reference in
 
 **Response:**
 ```json
-{ "status": "ok", "masked_content_version_id": "068000000000001AAA", "redacted_regions": 3, "watermark_used": "image:account_001XXXXXXXXXXXXAAA", "detail": null }
+{ "status": "ok", "masked_content_version_id": "068000000000001AAA", "redacted_regions": 3, "watermark_used": "image:account_001XXXXXXXXXXXXAAA", "detail": null, "job_applicant_name": "JA-26469" }
 ```
+
+`job_applicant_name` is the Job Applicant's human-readable auto-number
+(e.g. `"JA-26469"`), looked up server-side purely for display — it's
+best-effort and `null` if the lookup fails, and it is never used for any
+Salesforce operation (`job_applicant_id`, the real Id, always is). Present
+on error responses too, since it's resolved before the resume/PII pipeline
+runs.
 
 ### `POST /mask/batch` — bulk version of `/mask`
 
@@ -218,7 +225,7 @@ Max 200 items. One shared Salesforce session per call. One item's failure
 doesn't abort the rest:
 
 ```json
-{ "status": "ok", "succeeded": 1, "failed": 1, "results": [ { "job_applicant_id": "a0X000000000001", "result": {"status":"ok", "masked_content_version_id":"068..."} }, { "job_applicant_id": "a0X000000000002", "result": {"status":"error","detail":"No resume found..."} } ] }
+{ "status": "ok", "succeeded": 1, "failed": 1, "results": [ { "job_applicant_id": "a0X000000000001", "result": {"status":"ok", "masked_content_version_id":"068...", "job_applicant_name":"JA-26469"} }, { "job_applicant_id": "a0X000000000002", "result": {"status":"error","detail":"No resume found...", "job_applicant_name":"JA-26470"} } ] }
 ```
 
 ### `POST /watermark/upload` — set a client's logo (multipart/form-data)

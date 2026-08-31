@@ -147,6 +147,10 @@ class MaskResponse(BaseModel):
     redacted_regions: int | None = None
     watermark_used: str = "none"
     detail: str | None = None
+    job_applicant_name: str | None = Field(
+        default=None,
+        description="Job Applicant's human-readable Name (e.g. \"JA-26469\"), display-only -- "
+                    "never used for masking, which always operates on job_applicant_id.")
 
 
 class WatermarkUploadResponse(BaseModel):
@@ -280,13 +284,19 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     """Run the full mask pipeline for one Job Applicant against an already-connected
     Salesforce session. Shared by /mask and /mask/batch so both retry and batch
     behavior stay in one place."""
+    # 0) Look up the display name (e.g. "JA-26469") up front, best-effort, so
+    #    every return path below -- success or error -- can show it instead of
+    #    the raw Id on the frontend. Purely cosmetic: every Salesforce
+    #    operation from here on still uses req.job_applicant_id, never this.
+    ja_name = sf_client.fetch_job_applicant_name(req.job_applicant_id, sf=sf)
+
     # 1) Fetch resume file -- pdf, docx, or doc (real candidate resumes on
     #    this org are legacy .docx Attachments; see sf_client.fetch_resume_pdf's
     #    docstring for the full lookup order).
     try:
         resume_bytes, ext = sf_client.fetch_resume_pdf(req.job_applicant_id, sf=sf)
     except (sf_client.ResumeNotFoundError, sf_client.InvalidIdError) as e:
-        return MaskResponse(status="error", detail=str(e))
+        return MaskResponse(status="error", detail=str(e), job_applicant_name=ja_name)
 
     if ext == "pdf":
         pdf_bytes = resume_bytes
@@ -296,7 +306,8 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         try:
             pdf_bytes = docx_convert.docx_bytes_to_pdf_bytes(resume_bytes)
         except docx_convert.DocxConversionError as e:
-            return MaskResponse(status="error", detail=f"Could not convert {ext} resume to PDF: {e}"[:300])
+            return MaskResponse(status="error", detail=f"Could not convert {ext} resume to PDF: {e}"[:300],
+                                 job_applicant_name=ja_name)
 
     # 2) Determine PII to mask. If the caller didn't supply exact strings
     #    (the real Salesforce flow never does -- MassMaskingController only
@@ -325,7 +336,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
                 seen.add(s)
                 mask_strings.append(s)
     if not mask_strings:
-        return MaskResponse(status="error", detail="No PII strings to mask.")
+        return MaskResponse(status="error", detail="No PII strings to mask.", job_applicant_name=ja_name)
 
     # 3) Resolve the client watermark image, in priority order:
     #    a) inline base64 (caller sent it directly, no extra round-trip)
@@ -339,7 +350,8 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
             watermark_png = base64.b64decode(req.watermark_base64, validate=True)
             watermark_used = "image:inline_base64"
         except (binascii.Error, ValueError):
-            return MaskResponse(status="error", detail="watermark_base64 is not valid base64.")
+            return MaskResponse(status="error", detail="watermark_base64 is not valid base64.",
+                                 job_applicant_name=ja_name)
     else:
         account_id = req.account_id or sf_client.resolve_account_id(req.job_applicant_id, sf=sf)
         try:
@@ -365,6 +377,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         masked_content_version_id=new_id,
         redacted_regions=hits,
         watermark_used=watermark_used,
+        job_applicant_name=ja_name,
     )
 
 

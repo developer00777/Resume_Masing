@@ -58,8 +58,12 @@
       var detail = ok
         ? "Masked ContentVersion: " + (r.result.masked_content_version_id || "")
         : (r.result && r.result.detail) || "Unknown error";
+      // Prefer the human-readable Job Applicant Name (e.g. "JA-26469") for display --
+      // falls back to the raw Id if the lookup failed. The raw job_applicant_id is
+      // still what's sent to /mask/batch; this only changes what's shown here.
+      var displayId = (r.result && r.result.job_applicant_name) || r.job_applicant_id;
       tr.innerHTML =
-        "<td>" + escapeHtml(r.job_applicant_id) + "</td>" +
+        "<td>" + escapeHtml(displayId) + "</td>" +
         '<td><span class="status-badge ' + (ok ? "ok" : "error") + '">' + (ok ? "Masked" : "Failed") + "</span></td>" +
         "<td>" + escapeHtml(detail) + "</td>";
       statusBody.appendChild(tr);

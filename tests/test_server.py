@@ -65,6 +65,7 @@ def _install_mocks(monkeypatch):
     monkeypatch.setattr(server.sf_client, "resolve_account_id", lambda jaid, sf=None: None)
     monkeypatch.setattr(server.sf_client, "fetch_watermark_png", fake_watermark)
     monkeypatch.setattr(server.sf_client, "upload_masked_pdf", fake_upload)
+    monkeypatch.setattr(server.sf_client, "fetch_job_applicant_name", lambda jaid, sf=None: "JA-00001")
     return captured
 
 
@@ -89,6 +90,7 @@ def test_mask_with_explicit_strings(monkeypatch):
     assert body["status"] == "ok", body
     assert body["masked_content_version_id"] == "068000000000001AAA"
     assert body["redacted_regions"] >= 3
+    assert body["job_applicant_name"] == "JA-00001"
 
     # Inspect the masked bytes that were handed to "upload".
     masked = fitz.open(stream=captured["pdf_bytes"], filetype="pdf")
@@ -180,6 +182,31 @@ def test_mask_skips_contact_pii_lookup_when_no_contact_resolves(monkeypatch):
     resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "ok"  # still succeeds via detect_pii() alone
+
+
+def test_mask_no_pii_error_still_reports_job_applicant_name(monkeypatch):
+    """job_applicant_name is looked up before the resume/PII pipeline runs,
+    so it must show up even on an error response -- e.g. the real
+    "No PII strings to mask" case seen in production."""
+    _install_mocks(monkeypatch)
+
+    def fake_fetch_no_pii(job_applicant_id, sf=None):
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "Nothing detectable here.", fontsize=12)
+        data = doc.tobytes()
+        doc.close()
+        return data, "pdf"
+
+    monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", fake_fetch_no_pii)
+    monkeypatch.setattr(server.sf_client, "resolve_contact_id", lambda jaid, sf=None: None)
+    client = TestClient(server.app)
+
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000099"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["detail"] == "No PII strings to mask."
+    assert body["job_applicant_name"] == "JA-00001"
 
 
 def test_mask_explicit_mask_strings_skips_contact_pii_lookup(monkeypatch):
