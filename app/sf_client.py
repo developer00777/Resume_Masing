@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -30,6 +31,8 @@ from simple_salesforce import Salesforce
 from simple_salesforce.exceptions import SalesforceExpiredSession, SalesforceAuthenticationFailed
 
 from app import crypto_util, db
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -659,7 +662,13 @@ def fetch_job_applicant_name(job_applicant_id: str, sf: Salesforce | None = None
         if not recs:
             return None
         return recs[0].get("Name") or None
-    except Exception:
+    except Exception as e:
+        # Deliberately still never raises (see docstring) -- but log so a
+        # real, recurring cause (bad field/object name, FLS, session issue)
+        # is visible in Railway logs instead of silently always falling
+        # back to the raw Id with no way to tell why.
+        logger.warning("fetch_job_applicant_name(%r) failed: %s: %s",
+                        job_applicant_id, type(e).__name__, e)
         return None
 
 
