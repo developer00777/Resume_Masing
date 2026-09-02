@@ -175,8 +175,14 @@ transform.
 ```
 
 Verified live: PII (name/phone/email) is true-redacted (glyphs removed, not
-covered), non-PII content (experience, marks/%) is preserved, and the
-watermark is stamped.
+covered, filled white), non-PII content (experience, marks/%) is preserved,
+and the watermark is stamped.
+
+Only name, phone and email are ever redacted. Numbers that a resume is full of
+-- date ranges, graduation years, CGPA, credential/certificate ids, ISO/IEEE/RFC
+numbers, library versions, percentages, salary figures, PIN/ZIP codes -- are
+left alone; see `tests/test_mask_precision.py`, which scores both directions
+(leaks and over-masking) against a 96% accuracy floor.
 
 ### `POST /mask` — mask one candidate, fully working live
 

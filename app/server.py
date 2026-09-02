@@ -67,7 +67,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from app import crypto_util, docx_convert, mask, sf_client
+from app import crypto_util, docx_convert, mask, pii, sf_client
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -96,21 +96,31 @@ def require_admin_api_key(x_admin_api_key: str | None = Header(default=None)) ->
 
 
 # --- PII detection fallback ---
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-# Same-line separators only ([ ()\-.], not \s) -- \s also matches newlines, which let
-# this span unrelated stacked lines (e.g. education years, date ranges) and get
-# fuzzy-matched as a "phone number" by mask._phone_rects, blacking out real content.
-_PHONE_RE = re.compile(r"\+?\d[\d ().\-]{8,}\d")
+# Detection itself lives in app/pii.py; see that module on why a digit run must
+# carry positive evidence of being a phone number before we will mask it. The
+# rule this replaced ("a long-ish run of digits and separators") reported
+# employment date ranges and credential ids as phone numbers, and those then
+# got redacted out of the resume.
+_EMAIL_RE = pii.EMAIL_RE
 
 
 def detect_pii(pdf_bytes: bytes) -> list[str]:
+    """Emails and phone numbers found in the resume's own text.
+
+    Names are never detected here -- there is no reliable way to tell a
+    candidate's name from any other capitalised words on the page, so the name
+    only ever comes from the Salesforce Contact record.
+    """
     import fitz
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = "".join(page.get_text() for page in doc)
+    # Page-by-page, joined with a newline: concatenating page text directly
+    # would glue the last line of one page to the first line of the next and
+    # let a phone candidate span the seam.
+    text = "\n".join(page.get_text() for page in doc)
     doc.close()
     found: list[str] = []
-    found += _EMAIL_RE.findall(text)
-    found += [m.strip() for m in _PHONE_RE.findall(text)]
+    found += pii.find_emails(text)
+    found += pii.find_phones(text)
     seen: set[str] = set()
     out: list[str] = []
     for s in found:
@@ -361,7 +371,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         except Exception:
             watermark_png = None
 
-    # 4) True-redact PII text + candidate photos, then overlay watermark
+    # 4) True-redact the PII strings (name/phone/email only), then overlay watermark
     masked_bytes, hits = mask.mask_pdf_bytes(
         pdf_bytes, mask_strings,
         watermark_png=watermark_png,

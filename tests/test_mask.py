@@ -1,5 +1,5 @@
 """Offline self-check — PII true-redacted, custom watermark image centered.
-Run: python -m tests.test_mask"""
+Run: python -m tests.test_mask, or under pytest with the rest of tests/."""
 import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -20,7 +20,7 @@ def _make_sample(path):
     doc.save(path); doc.close()
 
 
-def _test_basic_redact():
+def test_basic_redact():
     """PII is removed, experience/marks preserved."""
     d = tempfile.mkdtemp()
     src = f"{d}/in.pdf"
@@ -35,7 +35,7 @@ def _test_basic_redact():
     print(f"  [BASIC] OK — {hits} redactions, PII gone, experience intact")
 
 
-def _test_watermark_image():
+def test_watermark_image():
     """Custom watermark image is stamped centered."""
     import struct, zlib
     d = tempfile.mkdtemp()
@@ -68,7 +68,7 @@ def _test_watermark_image():
     print(f"  [IMAGE WATERMARK] OK — {hits} redactions, PNG watermark centered")
 
 
-def _test_fallback_text():
+def test_fallback_text():
     """Fallback text watermark when no image provided."""
     d = tempfile.mkdtemp()
     src = f"{d}/in.pdf"
@@ -81,7 +81,7 @@ def _test_fallback_text():
     print(f"  [TEXT FALLBACK] OK — {hits} redactions, text watermark applied")
 
 
-def _test_no_pii():
+def test_no_pii():
     """No redactions needed — watermark still applied."""
     d = tempfile.mkdtemp()
     src = f"{d}/in.pdf"
@@ -93,7 +93,7 @@ def _test_no_pii():
     print(f"  [EMPTY] OK — 0 redactions, watermark applied")
 
 
-def _test_phone_format_mismatch():
+def test_phone_format_mismatch():
     """Parser hands back a normalized phone (E.164, no spaces) that doesn't literally
     match the formatted phone on the page -- this used to leak the phone entirely
     (the client's original complaint) because search_for() is exact-substring only."""
@@ -111,11 +111,11 @@ def _test_phone_format_mismatch():
 
 def main():
     print("MASK TESTS")
-    _test_basic_redact()
-    _test_watermark_image()
-    _test_fallback_text()
-    _test_no_pii()
-    _test_phone_format_mismatch()
+    test_basic_redact()
+    test_watermark_image()
+    test_fallback_text()
+    test_no_pii()
+    test_phone_format_mismatch()
     print("\nALL PASSED")
 
 

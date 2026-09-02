@@ -5,7 +5,9 @@ recruiting team's **"Generate Masking"** button.
 
 Given a **Job Applicant Id**, it:
 1. pulls the resume PDF from Salesforce (`simple-salesforce`, SOQL on `ContentVersion`),
-2. **true-redacts** the candidate PII (name / phone / email — glyphs deleted, not a black box),
+2. **true-redacts** the candidate PII — name / phone / email, and nothing else
+   (glyphs deleted, not covered; the region is filled **white**, so the masked copy
+   reads as blank space rather than a page of censor bars),
 3. stamps a **centered watermark** on every page,
 4. writes the masked copy **back into the same record** as a new `ContentVersion`,
 5. returns JSON — **no redirect, no popup**.
@@ -42,7 +44,8 @@ under that client.
 
 | File | Purpose |
 |------|---------|
-| `app/mask.py` | Masking core — PyMuPDF true-redact + centered watermark. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
+| `app/pii.py` | PII detection & classification. Strict, precision-first phone detection (a digit run must carry positive evidence of being a phone), so employment date ranges, credential ids, ISO/IEEE/RFC numbers, versions, percentages and PIN codes are never reported as PII. |
+| `app/mask.py` | Masking core — PyMuPDF true-redact (white fill) + centered watermark. Per-kind matching: email exact, phone by digit-equivalence, name whole-word only. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
 | `app/docx_convert.py` | `.docx`/`.doc` → PDF via headless LibreOffice (`soffice`, installed in the Dockerfile) — real candidate resumes on this org are legacy Word attachments, not PDFs, so this runs before `app/mask.py` whenever the fetched resume isn't already a PDF. |
 | `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)` (checks modern Files + legacy Attachments, on the Job Applicant and its related Contact — returns `(bytes, extension)`), `upload_masked_pdf(id, bytes, filename)`. Creds from ENV or the Postgres-backed override (`register_default_credentials`). |
 | `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `POST /mask/inline`, `GET /health`, `detect_pii()` fallback. |
