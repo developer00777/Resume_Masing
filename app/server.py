@@ -104,6 +104,24 @@ def require_admin_api_key(x_admin_api_key: str | None = Header(default=None)) ->
 _EMAIL_RE = pii.EMAIL_RE
 
 
+def _build_revision() -> str:
+    """Which commit is actually serving requests.
+
+    Reported by /health because without it there is no way to tell a masking
+    bug from a stale deploy. That distinction is not academic: over-masking
+    "came back" once after it had already been fixed and pushed, and the only
+    real difference was that the running container predated the fix.
+
+    Railway injects RAILWAY_GIT_COMMIT_SHA on every deploy; the others are
+    there so this still says something useful on Heroku or a plain container.
+    """
+    for var in ("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT_SHA", "SOURCE_VERSION"):
+        sha = os.environ.get(var)
+        if sha:
+            return sha[:12]
+    return "unknown"
+
+
 def detect_pii(pdf_bytes: bytes) -> list[str]:
     """Emails and phone numbers found in the resume's own text.
 
@@ -284,6 +302,7 @@ class CandidateSettingsStatusResponse(BaseModel):
 def health() -> dict:
     return {
         "status": "ok",
+        "revision": _build_revision(),
         "salesforce_configured": sf_client.creds_configured(),
         "client_keys": sf_client.list_client_keys(),
         "registry_backend": sf_client.registry_backend(),
@@ -319,32 +338,41 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
             return MaskResponse(status="error", detail=f"Could not convert {ext} resume to PDF: {e}"[:300],
                                  job_applicant_name=ja_name)
 
-    # 2) Determine PII to mask. If the caller didn't supply exact strings
-    #    (the real Salesforce flow never does -- MassMaskingController only
-    #    ever sends job_applicant_id), prefer the candidate's structured
-    #    Contact fields (Name/Phone/Email) over regex-scanning the resume's
-    #    extracted text: confirmed against real candidates that some resume
-    #    templates (e.g. Microsoft's built-in "Contoso" template, which uses
-    #    a Word content control for the phone/email) extract with that
-    #    contact info silently blank or garbled -- detect_pii() alone would
-    #    leave it completely unmasked even though it's sitting right there,
-    #    correct, on the Contact record. Both sources are merged (not
-    #    either/or) since detect_pii() can still catch things the Contact
-    #    record doesn't have (e.g. a second email only written in the resume).
+    # 2) Determine PII to mask, from two sources that are always MERGED, never
+    #    either/or:
+    #
+    #    a) structured values -- the candidate's Name/Phone/Email. Either the
+    #       caller sent them (MassMaskingController reads the Contact in Apex
+    #       and puts them in mask_strings, which is authoritative, so we skip
+    #       our own lookup and save the SOQL round-trip), or we resolve the
+    #       Contact ourselves. Needed because some resume templates (e.g.
+    #       Microsoft's built-in "Contoso" template, which puts the phone and
+    #       email in a Word content control) extract with that contact info
+    #       silently blank or garbled -- confirmed against real candidates --
+    #       so a text scan alone would leave it completely unmasked even
+    #       though it sits right there, correct, on the Contact record.
+    #
+    #    b) detect_pii() over the resume's own text, which catches PII the
+    #       record doesn't have: a second email or a phone written only in the
+    #       document.
+    #
+    #    Supplied strings used to REPLACE both sources rather than merge with
+    #    them, which quietly turned (b) off for exactly the callers most likely
+    #    to care about accuracy. Merging is safe now that detection is
+    #    precision-first (see app/pii.py) and no longer invents PII.
     if req.mask_strings:
-        mask_strings = req.mask_strings
+        contact_strings = list(req.mask_strings)
     else:
-        contact_strings: list[str] = []
+        contact_strings = []
         contact_id = sf_client.resolve_contact_id(req.job_applicant_id, sf=sf)
         if contact_id:
             contact_strings = sf_client.fetch_contact_pii_strings(contact_id, sf=sf)
-        regex_strings = detect_pii(pdf_bytes)
-        seen: set[str] = set()
-        mask_strings = []
-        for s in contact_strings + regex_strings:
-            if s not in seen:
-                seen.add(s)
-                mask_strings.append(s)
+    seen: set[str] = set()
+    mask_strings = []
+    for s in contact_strings + detect_pii(pdf_bytes):
+        if s and s not in seen:
+            seen.add(s)
+            mask_strings.append(s)
     if not mask_strings:
         return MaskResponse(status="error", detail="No PII strings to mask.", job_applicant_name=ja_name)
 

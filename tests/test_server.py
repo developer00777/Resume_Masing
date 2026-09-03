@@ -150,6 +150,39 @@ def test_mask_merges_structured_contact_pii_with_regex_fallback(monkeypatch):
     assert "john.doe@example.com" not in text, "regex-detected PII still redacted too"
 
 
+def test_mask_merges_supplied_mask_strings_with_text_scan(monkeypatch):
+    """Caller-supplied mask_strings must ADD to detect_pii(), not replace it.
+
+    This is the Apex path: MassMaskingController reads the candidate's
+    Name/Phone/Email off the Contact and sends them, which is authoritative
+    for those three values. It says nothing about PII that exists only in the
+    document -- so the resume text scan has to keep running alongside it.
+    Supplied strings used to replace both other sources outright, quietly
+    turning the scan off for exactly the callers most likely to care."""
+    captured = _install_mocks(monkeypatch)
+
+    def fail_if_called(jaid, sf=None):
+        raise AssertionError("supplied mask_strings are authoritative -- "
+                             "the Contact lookup should be skipped")
+
+    monkeypatch.setattr(server.sf_client, "resolve_contact_id", fail_if_called)
+    client = TestClient(server.app)
+
+    # "John Doe" only ever comes from the caller (detect_pii never finds names);
+    # the email only ever comes from the text scan. Both must be gone.
+    resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002",
+                                      "mask_strings": ["John Doe"]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "ok"
+
+    masked = fitz.open(stream=captured["pdf_bytes"], filetype="pdf")
+    text = "".join(p.get_text() for p in masked)
+    masked.close()
+    assert "John Doe" not in text, "supplied mask_string was not applied"
+    assert "john.doe@example.com" not in text, \
+        "supplied mask_strings suppressed the resume text scan"
+
+
 def test_mask_calls_fetch_contact_pii_strings_when_contact_resolves(monkeypatch):
     captured = _install_mocks(monkeypatch)
     calls = {}
