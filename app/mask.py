@@ -181,10 +181,12 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         words = page.get_text("words")
 
         page_rects: list[fitz.Rect] = []
-        for s in mask_strings:
-            if not s or not str(s).strip():
-                continue
-            page_rects.extend(_rects_for(page, str(s), words))
+        # expand() splits a Contact field holding several phone numbers into
+        # one entry per number. Left whole, such a value is too long to
+        # classify as a phone and gets searched as a single literal that
+        # appears in no resume -- so the candidate's phone goes unmasked.
+        for s in pii.expand([str(s) for s in mask_strings]):
+            page_rects.extend(_rects_for(page, s, words))
 
         for rect in _dedupe_rects(page_rects):
             page.add_redact_annot(rect, fill=REDACT_FILL)

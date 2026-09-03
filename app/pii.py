@@ -207,6 +207,98 @@ def classify(s: str) -> str:
     return NAME
 
 
+#: Separators that mean "and another number", as opposed to the single spaces
+#: *inside* one number ("98765 43210"). Splitting on a single space would tear
+#: every normally-formatted Indian mobile in half, so a single space is only
+#: used as a last resort (see _regroup below). A "+" is always a new number,
+#: however little whitespace precedes it.
+_PHONE_LIST_SPLIT_RE = re.compile(r"\s{2,}|[,;/|\n\r]+|\s+(?=\+)")
+
+#: One phone-shaped run inside a value that also contains other characters --
+#: "9876543210 (A)", where a trailing annotation stops the whole value from
+#: being recognisable as phone punctuation at all. Anchored to end on a digit
+#: so it does not trail the separators leading up to the annotation.
+_PHONE_RUN_RE = re.compile(r"\+?\d(?:[\d ().\-]*\d)?")
+
+
+def _valid(part: str) -> bool:
+    return MIN_PHONE_DIGITS <= len(digits(part)) <= MAX_PHONE_DIGITS
+
+
+def _regroup(part: str) -> list[str]:
+    """Recover numbers from an oversized part, splitting on single spaces.
+
+    Handles "999999 9999999999" -- a 6-digit fragment and a real mobile
+    separated by one space, which the primary split leaves fused at 16 digits.
+    Accumulates tokens until they form a valid number and drops what cannot,
+    rather than guessing at boundaries: a fabricated number would be worse
+    than a missed one, since it could match unrelated resume content.
+    """
+    out: list[str] = []
+    buffer: list[str] = []
+    for token in part.split():
+        candidate = buffer + [token]
+        if len(digits(" ".join(candidate))) > MAX_PHONE_DIGITS:
+            if buffer and _valid(" ".join(buffer)):
+                out.append(" ".join(buffer))
+            buffer = [token]
+        else:
+            buffer = candidate
+    if buffer and _valid(" ".join(buffer)):
+        out.append(" ".join(buffer))
+    return out
+
+
+def split_phone_list(value: str) -> list[str]:
+    """Split one Contact field holding several phone numbers into each number.
+
+    Confirmed against live data: 22% of Contacts on this org (439 of ~1990)
+    have two or more numbers crammed into a single PhoneNumber__c
+    ("9876543210    9123456789"), 16-32 digits in total. Left whole, such a
+    value is over MAX_PHONE_DIGITS, so classify() calls it a NAME, so it gets
+    looked for as one literal 20-digit string -- which appears in no resume.
+    The candidate's phone then goes unmasked from the Contact record
+    entirely, and only the resume text scan stands between that and a leak.
+
+    Returns [value] unchanged unless the value really does hold multiple valid
+    numbers, so a name that happens to contain two spaces is never torn apart.
+    """
+    value = str(value).strip()
+    if len(digits(value)) <= MAX_PHONE_DIGITS and _PHONE_STRING_RE.fullmatch(value):
+        return [value]                    # a single number already
+
+    numbers: list[str] = []
+    for part in (p.strip() for p in _PHONE_LIST_SPLIT_RE.split(value)):
+        if not part:
+            continue
+        if _valid(part) and _PHONE_STRING_RE.fullmatch(part):
+            numbers.append(part)
+        elif len(digits(part)) > MAX_PHONE_DIGITS:
+            numbers.extend(_regroup(part))
+        else:
+            # Mixed content ("9876543210 (A)"): keep only the phone-shaped runs.
+            numbers.extend(r.strip() for r in _PHONE_RUN_RE.findall(part) if _valid(r))
+    return numbers or [value]
+
+
+def expand(values: list[str]) -> list[str]:
+    """Every PII string to actually look for, deduped in first-seen order.
+
+    Only splitting happens here: a multi-number phone field becomes one entry
+    per number. Everything else passes through untouched.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value or not str(value).strip():
+            continue
+        for part in split_phone_list(value):
+            if part and part not in seen:
+                seen.add(part)
+                out.append(part)
+    return out
+
+
 def is_id_context(pre_text: str) -> bool:
     """Does `pre_text` end in a label naming something that is not a phone?
 

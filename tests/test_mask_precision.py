@@ -353,6 +353,78 @@ def test_id_labelled_run_is_not_masked_as_phone():
     assert "9876543210" not in text.replace("4319876543210", "")
 
 
+# Shapes taken from real PhoneNumber__c values on the live org, where 439 of
+# ~1990 Contacts (22%) hold more than one number in that single field. Digits
+# are substituted but the separator layout is exactly as stored.
+MULTI_PHONE_VALUES = [
+    ("9876543210    9123456789",       ["9876543210", "9123456789"]),
+    ("9876543210  22  9123456789",     ["9876543210", "9123456789"]),
+    ("9876543210   123456",            ["9876543210"]),
+    ("9876543210   123456 9123456789", ["9876543210", "9123456789"]),
+    ("9876543210 +91-9123456789",      ["9876543210", "+91-9123456789"]),
+    ("9876543210 (A)",                 ["9876543210"]),
+    ("9876543210, 9123456789",         ["9876543210", "9123456789"]),
+    ("9876543210 / 9123456789",        ["9876543210", "9123456789"]),
+]
+
+
+@pytest.mark.parametrize("value,expected", MULTI_PHONE_VALUES,
+                         ids=[v[0][:34] for v in MULTI_PHONE_VALUES])
+def test_multi_number_contact_field_is_split(value, expected):
+    """A Contact field holding several numbers must yield each one.
+
+    Left whole these values exceed MAX_PHONE_DIGITS, so classify() calls them
+    a name and they get searched as one long literal that appears in no
+    resume -- the candidate's phone then goes unmasked from the Contact
+    record entirely."""
+    assert pii.split_phone_list(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "Rahul Sharma",
+    "Rahul  Sharma",          # two spaces: still one name, not two numbers
+    "Sean O Brien",
+    "rahul.sharma@example.com",
+    "9876543210",
+    "+91 98765 43210",
+    "98765 43210",            # the single space is INSIDE the number
+    "022-2345-6789",
+])
+def test_single_values_are_never_split(value):
+    """Splitting must not touch a name, an email, or one ordinary number."""
+    assert pii.split_phone_list(value) == [value]
+
+
+def test_multi_number_field_masks_every_number_and_nothing_else():
+    """End-to-end for the 22% case, against the traps it sits next to."""
+    pdf = _make_pdf([
+        "PRIYA VENKATESAN",
+        "Mobile: 9876543210",
+        "Alternate: 9123456789",
+        "Senior Engineer, Acme Corp    2019 - 2023",
+        "B.Tech 2012 - 2016, CGPA 8.94/10.0",
+        "Credential ID 4821-9930-1177",
+    ])
+    # exactly as it comes off the Contact record
+    masked, _ = mask.mask_pdf_bytes(
+        pdf, ["Priya Venkatesan", "9876543210    9123456789"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = _norm(doc[0].get_text())
+    doc.close()
+
+    assert "9876543210" not in text, "first number leaked"
+    assert "9123456789" not in text, "second number leaked"
+    assert "PriyaVenkatesan" not in text.replace("PRIYA", "Priya")
+    for survivor in ("2019-2023", "2012-2016", "8.94/10.0", "4821-9930-1177"):
+        assert survivor in text, f"over-masked {survivor}"
+
+
+def test_expand_dedupes_across_fields():
+    """The same number in two Contact fields must not be redacted twice."""
+    assert pii.expand(["9876543210    9123456789", "9123456789", "", None]) == \
+        ["9876543210", "9123456789"]
+
+
 def test_name_shorter_than_three_chars_is_never_matched():
     """A 1-2 character name would hit half the page; refuse rather than guess."""
     pdf = _make_pdf(["Li Wei", "An analysis of an anomaly in Anaheim."])
