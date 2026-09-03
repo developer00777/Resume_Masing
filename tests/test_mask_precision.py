@@ -425,6 +425,88 @@ def test_expand_dedupes_across_fields():
         ["9876543210", "9123456789"]
 
 
+def _mask_text(lines, mask_strings):
+    pdf = _make_pdf(lines)
+    masked, hits = mask.mask_pdf_bytes(pdf, mask_strings, watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = "\n".join(p.get_text() for p in doc)
+    doc.close()
+    return text, hits
+
+
+# Both directions of the mismatch, taken from live records: the Contact holds a
+# middle name the resume omits, or the resume prints one the Contact lacks.
+NAME_MISMATCHES = [
+    ("contact has the middle name", "Sitendra Kumar Chakra",
+     "SITENDRA CHAKRA", ["SITENDRA", "CHAKRA"]),
+    ("resume has the middle name", "Samar Wadyalkar",
+     "SAMAR SHIVAJI WADYALKAR", ["SAMAR", "SHIVAJI", "WADYALKAR"]),
+    ("both have it, different case", "rahul kumar sharma",
+     "Rahul Kumar Sharma", ["Rahul", "Kumar", "Sharma"]),
+]
+
+
+@pytest.mark.parametrize("label,contact_name,heading,gone",
+                         NAME_MISMATCHES, ids=[m[0] for m in NAME_MISMATCHES])
+def test_name_masked_despite_middle_name_mismatch(label, contact_name, heading, gone):
+    """The name must be redacted even when it is not present verbatim.
+
+    This was a live PII leak: search_for() needs the whole string, so on a
+    third of sampled records the candidate's name was left sitting in the page
+    heading of the masked copy while phone and email were blacked out."""
+    text, hits = _mask_text(
+        [heading, "Civil Engineer", "EXPERIENCE", "Acme Corp   2019 - 2023"],
+        [contact_name])
+    assert hits >= 1, f"{label}: nothing was redacted"
+    for token in gone:
+        assert token not in text, f"{label}: {token!r} leaked"
+    assert "2019 - 2023" in text, f"{label}: over-masked the date range"
+    assert "Civil Engineer" in text
+
+
+def test_single_token_name_is_not_loosely_matched():
+    """One token is not enough evidence to match on.
+
+    A candidate named Will, Rose or Mark would otherwise have every ordinary
+    occurrence of that word redacted out of their own resume."""
+    text, _ = _mask_text(
+        ["Will", "I will manage delivery and will own the roadmap."],
+        ["Will"])
+    assert "will manage" in text
+    assert "will own" in text
+
+
+def test_lone_name_token_is_redacted():
+    """A surname on its own is still the candidate's name.
+
+    These were the bulk of what still leaked once full-name matching worked --
+    22 across 40 live resumes, typically a surname in a footer or a first name
+    above a signature."""
+    text, _ = _mask_text(
+        ["RAHUL SHARMA", "Prepared by Sharma, Acme Corp", "2019 - 2023"],
+        ["Rahul Sharma"])
+    assert "Sharma" not in text, "lone surname leaked"
+    assert "Acme Corp" in text, "over-masked the employer"
+    assert "2019 - 2023" in text, "over-masked the date range"
+
+
+def test_lone_token_shorter_than_four_chars_is_left_alone():
+    """Below four characters a lone token is too easily an acronym."""
+    text, _ = _mask_text(
+        ["RAJ MEHRA", "Built ETL and SQL pipelines; RAJ certified"],
+        ["Raj Mehra"])
+    assert "SQL" in text and "ETL" in text
+    assert "RAJ certified" in text, "a 3-char lone token should not be acted on"
+
+
+def test_name_match_does_not_span_across_a_long_gap():
+    """Tokens far apart on a line are not one name."""
+    text, _ = _mask_text(
+        ["Rahul reviewed the account held by Mr Sharma at Acme Corp"],
+        ["Rahul Sharma"])
+    assert "account held by" in text, "redacted the words between two tokens"
+
+
 def test_name_shorter_than_three_chars_is_never_matched():
     """A 1-2 character name would hit half the page; refuse rather than guess."""
     pdf = _make_pdf(["Li Wei", "An analysis of an anomaly in Anaheim."])

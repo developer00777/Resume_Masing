@@ -23,6 +23,8 @@ fetched at mask-time, stamped center-aligned on every page of the resume PDF.
 """
 from __future__ import annotations
 
+import re
+
 import fitz
 
 from . import pii
@@ -144,6 +146,144 @@ def _covers_whole_words(rect: fitz.Rect, words: list) -> bool:
     return True
 
 
+#: Letters only — how a name token is compared, so "Sharma," and "SHARMA"
+#: both reduce to "sharma".
+_NAME_TOKEN_RE = re.compile(r"[^\W\d_]+")
+
+#: How many unmatched words may sit between two matched name tokens. One
+#: covers the common case of a middle name printed on the resume but absent
+#: from the Contact record. More than that and we would start joining up
+#: unrelated words that happen to share a surname.
+_NAME_MAX_GAP = 1
+
+#: A match must cover at least this many letters in total. Stops two short
+#: coincidental tokens from being read as a name.
+_NAME_MIN_CHARS = 6
+
+
+def _name_token_list(name: str) -> list[str]:
+    """Name tokens worth matching on, initials dropped.
+
+    A single initial carries no evidence and matches far too much, so "Samar S
+    Wadyalkar" is matched as ["samar", "wadyalkar"].
+    """
+    return [t.casefold() for t in _NAME_TOKEN_RE.findall(str(name)) if len(t) >= 3]
+
+
+#: Shortest lone name token we will redact on its own. Below this a token is
+#: too easily an acronym or an ordinary short word to act on without the
+#: corroboration of a neighbouring token.
+_NAME_LONE_TOKEN_MIN = 4
+
+
+def _lone_token_rects(tokens: list[str], words: list) -> list[fitz.Rect]:
+    """Redact a single name token standing on its own.
+
+    A surname alone in a page footer, or a first name above a signature, is
+    still the candidate's name -- 22 of these survived across 40 live resumes
+    once the full-name match was working, so they are the bulk of what is left
+    leaking.
+
+    Guarded two ways so ordinary prose is untouched: the token must be at
+    least _NAME_LONE_TOKEN_MIN characters, and it must be capitalised the way
+    a name is. "Kumar" and "KUMAR" match; the "will" in "I will manage
+    delivery" does not, which is what makes this safe for a candidate whose
+    name really is Will.
+    """
+    wanted = {t for t in tokens if len(t) >= _NAME_LONE_TOKEN_MIN}
+    # The tokens run together as one word, which is how a resume heading or a
+    # file-derived title often writes it: "ANILKUMAR" for Contact "Anil
+    # Kumar". Matched only on full equality, never as a substring, so it
+    # cannot behave like the "Ana" inside "Analysis" case.
+    joined = {"".join(tokens[i:j])
+              for i in range(len(tokens))
+              for j in range(i + 2, len(tokens) + 1)}
+    if not wanted and not joined:
+        return []
+    out: list[fitz.Rect] = []
+    for w in words:
+        text = w[4].strip(" .,;:()[]-|/")
+        if not text or "@" in text:
+            continue                      # emails are matched as emails
+        folded = text.casefold()
+        if folded in joined:
+            out.append(fitz.Rect(w[0], w[1], w[2], w[3]))
+            continue
+        if folded not in wanted:
+            continue
+        if not (text.istitle() or text.isupper()):
+            continue                      # lowercase in running prose
+        out.append(fitz.Rect(w[0], w[1], w[2], w[3]))
+    return out
+
+
+def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
+    """Locate a candidate's name even when the resume spells it differently.
+
+    page.search_for() needs the whole string present verbatim, and on real
+    records it very often is not -- the Contact holds a middle name the resume
+    omits, or the resume prints one the Contact lacks:
+
+        Contact "Sitendra Kumar Chakra"   resume "SITENDRA CHAKRA"
+        Contact "Samar Wadyalkar"         resume "SAMAR SHIVAJI WADYALKAR"
+
+    Confirmed on live data, where roughly a third of sampled records had a
+    Contact name that appears nowhere verbatim in the resume -- so the name was
+    not redacted at all, and sat in the page heading of the masked copy while
+    phone and email were blacked out.
+
+    Matches the tokens as an ordered subsequence within a single line, letting
+    either side carry extra words, and redacts the whole span (a middle name
+    on the resume is part of the name, so covering it is correct). Requires at
+    least two tokens to match: one token alone would mask every occurrence of
+    an ordinary word for a candidate named Will, Rose or Mark.
+    """
+    tokens = _name_token_list(name)
+    if not tokens:
+        return []
+
+    out: list[fitz.Rect] = _lone_token_rects(tokens, words)
+    if len(tokens) < 2:
+        return out
+
+    for line in _line_words(words).values():
+        norm = ["".join(_NAME_TOKEN_RE.findall(w[4])).casefold() for w in line]
+        n = len(line)
+        for start in range(n):
+            if not norm[start] or norm[start] not in tokens:
+                continue
+            next_token = 0
+            matched = 0
+            chars = 0
+            last = start
+            gaps = 0
+            for j in range(start, n):
+                if not norm[j]:
+                    continue                       # punctuation-only word
+                hit = next((k for k in range(next_token, len(tokens))
+                            if tokens[k] == norm[j]), None)
+                if hit is not None:
+                    matched += 1
+                    chars += len(norm[j])
+                    next_token = hit + 1
+                    last = j
+                    gaps = 0
+                    if next_token >= len(tokens):
+                        break
+                elif matched and gaps < _NAME_MAX_GAP:
+                    gaps += 1
+                elif matched:
+                    break
+            if matched >= 2 and chars >= _NAME_MIN_CHARS:
+                out.append(fitz.Rect(
+                    min(line[k][0] for k in range(start, last + 1)),
+                    min(line[k][1] for k in range(start, last + 1)),
+                    max(line[k][2] for k in range(start, last + 1)),
+                    max(line[k][3] for k in range(start, last + 1)),
+                ))
+    return out
+
+
 def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
     """Every region of `page` that should be redacted for the PII string `s`,
     using the matching strategy its kind calls for."""
@@ -155,7 +295,36 @@ def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
     # Name (and any literal a caller passed explicitly): whole-word only.
     if len(s.strip()) < 3:
         return []  # too short to match safely — would hit half the page
-    return [r for r in page.search_for(s) if _covers_whole_words(r, words)]
+    literal = [r for r in page.search_for(s) if _covers_whole_words(r, words)]
+    if len(_name_token_list(s)) < 2:
+        # A one-token name has to match case as written. search_for() is
+        # case-insensitive, so a candidate actually named Will, Rose or Mark
+        # otherwise has every ordinary occurrence of that word redacted out of
+        # their own resume ("I will manage delivery" -> "I  manage delivery").
+        # A heading still matches, as "Will" or as "WILL".
+        literal = [r for r in literal if _matches_case(r, words, s)]
+    # Union, not either/or: a resume can print the name verbatim in one place
+    # and with an extra middle name in another, and both have to go.
+    return _dedupe_rects(literal + _name_rects(page, s, words))
+
+
+def _matches_case(rect: fitz.Rect, words: list, needle: str) -> bool:
+    """Is the text under `rect` written the same way as `needle`?
+
+    Accepts the needle as-is or fully upper-cased, which is how a name appears
+    in a resume heading.
+    """
+    covered = []
+    for w in words:
+        wr = fitz.Rect(w[0], w[1], w[2], w[3])
+        inter = wr & rect
+        if inter.is_empty or inter.width <= 0:
+            continue
+        if inter.height < min(wr.height, rect.height) * 0.5:
+            continue
+        covered.append(w[4])
+    text = " ".join(covered).strip(" .,;:()[]-")
+    return text in (needle, needle.upper())
 
 
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
