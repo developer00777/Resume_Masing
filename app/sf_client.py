@@ -678,6 +678,26 @@ _JOB_APPLICANT_CONTACT_FIELD = "SCSCHAMPS__Contact_Talent__c"
 
 _RESUME_EXT_PRIORITY = ("pdf", "docx", "doc")
 
+#: upload_masked_pdf() writes its result back as "masked_<job_applicant_id>.pdf"
+#: linked to the SAME Job Applicant the resume was just read from. That output
+#: is a .pdf and it is newer than the source, so on the next run it wins the
+#: "newest usable file" contest and gets masked instead of the real resume.
+#:
+#: Confirmed on live data (JA-25368, JA-25599, JA-26461): every one had the
+#: masked output as its newest linked file, and re-masking redacted 0 regions
+#: because the PII had already been removed from it. JA-25599 still had its
+#: real resume sitting alongside; the masked copy simply outranked it by date.
+#:
+#: The damage is not a wasted pass. Because the pipeline no longer sees the
+#: original, re-running can never repair a record: whatever the first run got
+#: wrong is frozen in, and every later run reproduces it byte for byte. That
+#: is what made a fixed bug look like it was still happening.
+MASKED_OUTPUT_PREFIX = "masked_"
+
+
+def _is_masked_output(name: str | None) -> bool:
+    return str(name or "").lower().startswith(MASKED_OUTPUT_PREFIX)
+
 
 def resolve_contact_id(job_applicant_id: str, sf: Salesforce | None = None) -> str | None:
     """Look up the related candidate Contact (SCSCHAMPS__Contact_Talent__c)
@@ -753,6 +773,9 @@ def _pick_by_extension(records: list[dict], ext_of) -> tuple[dict, str] | None:
     understands. Returns (record, extension) or None if nothing usable."""
     ranked = []
     for r in records:
+        # Never accept this service's own output as a source resume.
+        if _is_masked_output(r.get("Title") or r.get("Name")):
+            continue
         ext = ext_of(r)
         if ext in _RESUME_EXT_PRIORITY:
             ranked.append((_RESUME_EXT_PRIORITY.index(ext), r, ext))
@@ -816,7 +839,10 @@ def fetch_resume_pdf(job_applicant_id: str, sf: Salesforce | None = None) -> tup
       4. Legacy Attachment on the related Contact -- confirmed against live
          data as where real candidate resumes (as .docx) actually live
     Within each location, pdf > docx > doc if multiple files are present;
-    anything else (images, etc.) is ignored.
+    anything else (images, etc.) is ignored, and so is anything named
+    "masked_*" -- that is this service's own output, and re-masking it
+    permanently freezes whatever the first run got wrong, because the
+    original is never seen again (see MASKED_OUTPUT_PREFIX).
 
     Returns (file_bytes, extension) -- extension is "pdf", "docx", or "doc".
     Callers must convert non-pdf extensions before handing bytes to

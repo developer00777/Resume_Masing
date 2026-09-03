@@ -138,6 +138,71 @@ def test_ignores_non_resume_file_types():
         sf_client.fetch_resume_pdf(JA_ID, sf=sf)
 
 
+def test_skips_our_own_masked_output_on_the_job_applicant():
+    """The masked copy we uploaded must never become the next run's source.
+
+    upload_masked_pdf() writes "masked_<ja_id>.pdf" back onto the same Job
+    Applicant, so it is a .pdf and it is newer than the resume -- it wins the
+    "newest usable file" contest and gets masked again. Confirmed on live
+    data (JA-25368, JA-25599, JA-26461): re-masking redacted 0 regions,
+    because the PII had already been removed from that copy.
+
+    The real cost is that re-running can then never repair a record. The
+    original is never read again, so whatever the first pass got wrong is
+    frozen in and every later pass reproduces it byte for byte."""
+    sf = _ScriptedSF([
+        (f"LinkedEntityId = '{JA_ID}'", _content_version_link()),
+        ("FROM ContentVersion", {"records": [
+            # the masked output, newest -- must be skipped
+            {"VersionData": "/path/to/masked", "FileExtension": "pdf",
+             "Title": f"masked_{JA_ID}"},
+            {"VersionData": "/path/to/real", "FileExtension": "pdf",
+             "Title": "Candidate Resume"},
+        ]}),
+    ])
+    data, ext = sf_client.fetch_resume_pdf(JA_ID, sf=sf)
+    assert ext == "pdf"
+    assert b"/path/to/real" in data, "masked output was used as the source resume"
+
+
+def test_masked_output_alone_is_not_a_resume():
+    """If the ONLY file is our masked output, that is 'no resume found'.
+
+    Reporting it honestly lets the caller fall through to the related
+    Contact, which on this org is where the original actually lives -- all
+    three live records checked had the masked copy as their only Job
+    Applicant file."""
+    sf = _ScriptedSF([
+        (f"LinkedEntityId = '{JA_ID}'", _content_version_link()),
+        ("FROM ContentVersion", {"records": [
+            {"VersionData": "/path/to/masked", "FileExtension": "pdf",
+             "Title": f"masked_{JA_ID}"},
+        ]}),
+        (f"FROM {sf_client._JOB_APPLICANT_OBJECT} WHERE Id = '{JA_ID}'",
+         {"records": [{sf_client._JOB_APPLICANT_CONTACT_FIELD: CONTACT_ID}]}),
+        (f"FROM Attachment WHERE ParentId = '{CONTACT_ID}'",
+         _attachment_record("Candidate Resume.pdf")),
+    ])
+    data, ext = sf_client.fetch_resume_pdf(JA_ID, sf=sf)
+    assert ext == "pdf"
+    assert b"masked" not in data
+
+
+def test_skips_masked_output_stored_as_a_legacy_attachment():
+    """Same rule for legacy Attachments, which key the name off Name."""
+    sf = _ScriptedSF([
+        (f"LinkedEntityId = '{JA_ID}'", {"records": []}),
+        (f"FROM {sf_client._JOB_APPLICANT_OBJECT} WHERE Id = '{JA_ID}'",
+         {"records": [{sf_client._JOB_APPLICANT_CONTACT_FIELD: None}]}),
+        (f"FROM Attachment WHERE ParentId = '{JA_ID}'", {"records": [
+            {"Name": f"masked_{JA_ID}.pdf", "Body": "/path/to/masked"},
+            {"Name": "Candidate Resume.pdf", "Body": "/path/to/real"},
+        ]}),
+    ])
+    data, ext = sf_client.fetch_resume_pdf(JA_ID, sf=sf)
+    assert b"/path/to/real" in data
+
+
 def test_raises_resume_not_found_when_nothing_anywhere():
     sf = _ScriptedSF([])  # every query returns {"records": []} via the default
     with pytest.raises(sf_client.ResumeNotFoundError):
