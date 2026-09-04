@@ -744,6 +744,79 @@ def self_register_client(req: SelfRegisterRequest) -> AdminActionResponse:
     return AdminActionResponse(status="ok", detail=f"Registered '{req.client_key}'.")
 
 
+class WatermarkContextResponse(BaseModel):
+    status: str
+    account_id: str | None = Field(
+        default=None, description="The Account the watermark applies to.")
+    account_ids: list[str] = Field(
+        default_factory=list,
+        description="Every distinct Account resolved from the supplied Job Applicants. "
+                    "More than one means the selection spans clients and the caller has "
+                    "to choose which one the upload is for.")
+    resolved_from: str = "none"
+    configured: bool = False
+    scope: str = "none"
+    bytes: int = 0
+    detail: str | None = None
+
+
+@app.get("/watermark/context", response_model=WatermarkContextResponse,
+         dependencies=[Depends(require_api_key)])
+def watermark_context(job_applicant_ids: str = "", account_id: str = "",
+                      client_key: str | None = None) -> WatermarkContextResponse:
+    """Which client Account a watermark upload is for, plus its current status.
+
+    The frontend should never make someone type an Account Id it can work out
+    for itself: the page is already launched with the selected Job Applicants,
+    and each one carries the client Account (SCSCHAMPS__Account__c) that
+    /mask uses to pick the watermark. Resolving it here keeps the panel
+    consistent with what masking will actually do -- a hand-typed Id could
+    disagree with it.
+
+    A selection spanning several clients returns all of them rather than
+    silently picking one, because uploading a watermark to the wrong client's
+    Account would put one client's branding on another's resumes.
+    """
+    try:
+        sf = sf_client.connect(client_key=client_key)
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
+            sf_client.SalesforceAuthenticationError) as e:
+        return WatermarkContextResponse(status="error", detail=str(e))
+
+    resolved: list[str] = []
+    resolved_from = "none"
+    if account_id.strip():
+        resolved = [account_id.strip()]
+        resolved_from = "supplied"
+    elif job_applicant_ids.strip():
+        # Bounded: the panel only needs to know which client(s) are in play,
+        # and a 200-record selection should not mean 200 SOQL round-trips.
+        ids = [x for x in re.split(r"[\s,;]+", job_applicant_ids) if x][:25]
+        seen: set[str] = set()
+        for ja_id in ids:
+            try:
+                acct = sf_client.resolve_account_id(ja_id, sf=sf)
+            except Exception:
+                acct = None
+            if acct and acct not in seen:
+                seen.add(acct)
+                resolved.append(acct)
+        resolved_from = "job_applicant" if resolved else "unresolved"
+
+    primary = resolved[0] if len(resolved) == 1 else None
+    info = sf_client.watermark_configured(account_id=primary, sf=sf)
+    return WatermarkContextResponse(
+        status="ok",
+        account_id=primary,
+        account_ids=resolved,
+        resolved_from=resolved_from,
+        configured=info["configured"],
+        scope=info["scope"],
+        bytes=info["bytes"],
+        detail=info.get("detail"),
+    )
+
+
 class WatermarkStatusResponse(BaseModel):
     status: str
     configured: bool = False

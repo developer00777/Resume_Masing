@@ -79,13 +79,16 @@
 
         <form id="watermarkForm" class="settings-form" autocomplete="off">
             <div class="mb-3">
-                <label class="form-label">Salesforce Account Id</label>
+                <label class="form-label">Client Account</label>
+                <!-- Filled in automatically from the selected profiles: each Job
+                     Applicant carries the client Account that /mask itself uses to
+                     choose the watermark, so there is nothing to type. Shown rather
+                     than hidden so it is obvious which client is being changed, and
+                     editable for a standalone open with no selection. -->
+                <select id="wmAccountPicker" class="form-select mb-2 d-none"></select>
                 <input type="text" id="wmAccountId" class="form-control"
-                       placeholder="001xxxxxxxxxxxxxxx">
-                <div class="form-text">
-                    The client Account this watermark belongs to. Each client can have its own;
-                    leave blank only to check the org-wide fallback.
-                </div>
+                       placeholder="Resolved from the selected profiles">
+                <div class="form-text" id="wmAccountNote"></div>
             </div>
             <div class="mb-3">
                 <label class="form-label">Watermark image</label>

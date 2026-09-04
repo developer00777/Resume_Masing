@@ -286,96 +286,145 @@
   } catch (e) {
     console.error("User Settings tab setup failed:", e);
   }
-})();
 
+  // ── Watermark tab ─────────────────────────────────────────────────────
+  // Inside the file's IIFE on purpose: authHeaders and escapeHtml live here,
+  // and an earlier version of this block sat after the IIFE closed, so it
+  // threw a ReferenceError on load and the status line never left "Checking
+  // current watermark...". Wrapped in its own try/catch to match the other
+  // tabs -- a failure here must not take out the masking tab.
+  try {
+    var wmForm = document.getElementById("watermarkForm");
+    if (wmForm) {
+      var wmStatus = document.getElementById("wmStatus");
+      var wmAccount = document.getElementById("wmAccountId");
+      var wmAccountPicker = document.getElementById("wmAccountPicker");
+      var wmAccountNote = document.getElementById("wmAccountNote");
+      var wmFile = document.getElementById("wmFile");
+      var wmSpinner = document.getElementById("wmSpinner");
+      var wmMsg = document.getElementById("wmMsg");
+      var wmRefresh = document.getElementById("wmRefresh");
 
-  // ── Watermark panel ────────────────────────────────────────────────────
-  // Wired to POST /watermark/upload and GET /watermark/status. The status line
-  // has to be able to say "none configured" plainly: nothing is stamped when
-  // no image exists, so a silent panel would imply a watermark is being
-  // applied when it is not.
-  (function () {
-    var form = document.getElementById("watermarkForm");
-    if (!form) return;
-    var statusBox = document.getElementById("wmStatus");
-    var accountId = document.getElementById("wmAccountId");
-    var fileInput = document.getElementById("wmFile");
-    var spinner = document.getElementById("wmSpinner");
-    var msg = document.getElementById("wmMsg");
-    var refresh = document.getElementById("wmRefresh");
+      function wmBusy(on) {
+        wmSpinner.classList.toggle("d-none", !on);
+        wmForm.querySelector('button[type="submit"]').disabled = on;
+      }
 
-    function busy(on) {
-      spinner.classList.toggle("d-none", !on);
-      form.querySelector('button[type="submit"]').disabled = on;
-    }
+      function wmSetStatus(cls, html) {
+        wmStatus.className = "alert " + cls + " mb-3";
+        wmStatus.innerHTML = html;
+      }
 
-    function setStatus(cls, html) {
-      statusBox.className = "alert " + cls + " mb-3";
-      statusBox.innerHTML = html;
-    }
+      // The Account is never typed by hand when it can be derived: the page
+      // already knows which Job Applicants were selected, and each carries the
+      // client Account that /mask itself uses to choose the watermark. Typing
+      // one could disagree with what masking actually does.
+      async function wmLoad() {
+        wmSetStatus("alert-secondary", "Checking current watermark…");
+        var params = new URLSearchParams();
+        if (wmAccount.value.trim()) {
+          params.set("account_id", wmAccount.value.trim());
+        } else if (ctx.prefill_ids) {
+          params.set("job_applicant_ids", ctx.prefill_ids);
+        }
+        try {
+          var resp = await fetch("/watermark/context?" + params.toString(),
+                                 { headers: authHeaders });
+          var data = await resp.json();
+          if (data.status !== "ok") {
+            wmSetStatus("alert-warning", "Could not check: " + escapeHtml(data.detail || "unknown error"));
+            return;
+          }
 
-    async function loadStatus() {
-      setStatus("alert-secondary", "Checking current watermark…");
-      try {
-        var qs = accountId.value.trim() ? "?account_id=" + encodeURIComponent(accountId.value.trim()) : "";
-        var resp = await fetch("/watermark/status" + qs, { headers: authHeaders });
-        var data = await resp.json();
-        if (data.status !== "ok") {
-          setStatus("alert-warning", "Could not check: " + escapeHtml(data.detail || "unknown error"));
+          var accounts = data.account_ids || [];
+          wmAccountPicker.innerHTML = "";
+          if (accounts.length > 1) {
+            // Several clients in one selection. Picking one silently could put
+            // one client's branding on another client's resumes.
+            wmAccountPicker.classList.remove("d-none");
+            accounts.forEach(function (id) {
+              var opt = document.createElement("option");
+              opt.value = id;
+              opt.textContent = id;
+              wmAccountPicker.appendChild(opt);
+            });
+            wmAccount.value = accounts[0];
+            wmAccountNote.textContent =
+              "The selected profiles span " + accounts.length +
+              " client Accounts. Choose which one this watermark is for.";
+          } else {
+            wmAccountPicker.classList.add("d-none");
+            if (data.account_id && !wmAccount.value.trim()) {
+              wmAccount.value = data.account_id;
+            }
+            wmAccountNote.textContent = data.account_id
+              ? (data.resolved_from === "job_applicant"
+                  ? "Filled in automatically from the selected profiles."
+                  : "")
+              : "No Account could be resolved from the selection — enter one to target a specific client.";
+          }
+
+          if (data.configured) {
+            wmSetStatus("alert-success",
+              "<strong>Watermark configured</strong> (" + escapeHtml(data.scope) +
+              (data.scope === "global" ? " fallback, used by every client" : " specific") +
+              ", " + data.bytes + " bytes). It is stamped in the centre of every page.");
+          } else {
+            wmSetStatus("alert-secondary",
+              "<strong>No watermark configured.</strong> Masked resumes are produced without one — " +
+              "no placeholder text is added. Upload an image below to change that.");
+          }
+        } catch (e) {
+          wmSetStatus("alert-warning", "Could not check: " + escapeHtml(e.message));
+        }
+      }
+
+      wmRefresh.addEventListener("click", wmLoad);
+      wmAccountPicker.addEventListener("change", function () {
+        wmAccount.value = wmAccountPicker.value;
+        wmLoad();
+      });
+
+      wmForm.addEventListener("submit", async function (ev) {
+        ev.preventDefault();
+        wmMsg.textContent = "";
+        var id = wmAccount.value.trim();
+        if (!id) {
+          wmMsg.className = "mt-2 small text-danger";
+          wmMsg.textContent = "No client Account resolved. Enter the Account Id this watermark belongs to.";
           return;
         }
-        if (data.configured) {
-          setStatus("alert-success",
-            "<strong>Watermark configured</strong> (" + escapeHtml(data.scope) +
-            (data.scope === "global" ? " fallback, used by every client" : " specific") +
-            ", " + data.bytes + " bytes). It is stamped in the centre of every page.");
-        } else {
-          setStatus("alert-secondary",
-            "<strong>No watermark configured.</strong> Masked resumes are produced without one — " +
-            "no placeholder text is added. Upload an image below to change that.");
+        if (!wmFile.files || !wmFile.files[0]) {
+          wmMsg.className = "mt-2 small text-danger";
+          wmMsg.textContent = "Choose a PNG or JPEG to upload.";
+          return;
         }
-      } catch (e) {
-        setStatus("alert-warning", "Could not check: " + escapeHtml(e.message));
-      }
+        wmBusy(true);
+        try {
+          var fd = new FormData();
+          fd.append("account_id", id);
+          fd.append("file", wmFile.files[0]);
+          var up = await fetch("/watermark/upload",
+                               { method: "POST", headers: authHeaders, body: fd });
+          var res = await up.json();
+          wmMsg.className = "mt-2 small " + (res.status === "ok" ? "text-success" : "text-danger");
+          wmMsg.textContent = res.detail || (res.status === "ok" ? "Uploaded." : "Upload failed.");
+          if (res.status === "ok") {
+            wmFile.value = "";
+            wmLoad();
+          }
+        } catch (e) {
+          wmMsg.className = "mt-2 small text-danger";
+          wmMsg.textContent = "Upload failed: " + e.message;
+        } finally {
+          wmBusy(false);
+        }
+      });
+
+      wmLoad();
     }
+  } catch (e) {
+    console.error("Watermark tab setup failed:", e);
+  }
 
-    refresh.addEventListener("click", loadStatus);
-    accountId.addEventListener("change", loadStatus);
-
-    form.addEventListener("submit", async function (ev) {
-      ev.preventDefault();
-      msg.textContent = "";
-      var id = accountId.value.trim();
-      if (!id) {
-        msg.className = "mt-2 small text-danger";
-        msg.textContent = "Enter the Salesforce Account Id this watermark belongs to.";
-        return;
-      }
-      if (!fileInput.files || !fileInput.files[0]) {
-        msg.className = "mt-2 small text-danger";
-        msg.textContent = "Choose a PNG or JPEG to upload.";
-        return;
-      }
-      busy(true);
-      try {
-        var fd = new FormData();
-        fd.append("account_id", id);
-        fd.append("file", fileInput.files[0]);
-        var resp = await fetch("/watermark/upload", { method: "POST", headers: authHeaders, body: fd });
-        var data = await resp.json();
-        msg.className = "mt-2 small " + (data.status === "ok" ? "text-success" : "text-danger");
-        msg.textContent = data.detail || (data.status === "ok" ? "Uploaded." : "Upload failed.");
-        if (data.status === "ok") {
-          fileInput.value = "";
-          loadStatus();
-        }
-      } catch (e) {
-        msg.className = "mt-2 small text-danger";
-        msg.textContent = "Upload failed: " + e.message;
-      } finally {
-        busy(false);
-      }
-    });
-
-    loadStatus();
-  })();
+})();
