@@ -958,6 +958,55 @@ def upload_masked_pdf(job_applicant_id: str, pdf_bytes: bytes, filename: str,
     return created["id"]
 
 
+def masked_file_url(content_version_id: str, sf: Salesforce | None = None) -> str | None:
+    """A Salesforce URL a recruiter can open to read the masked resume.
+
+    Links to the ContentDocument rather than the ContentVersion: the document
+    URL keeps working when a newer version is added, and it opens Salesforce's
+    own file preview instead of forcing a download.
+
+    Returns None (never raises) if the lookup fails -- a missing link is a
+    cosmetic loss on the results table, not a reason to fail a mask that has
+    already been written back to Salesforce successfully.
+    """
+    sf = sf or connect()
+    try:
+        safe_id = _safe_id(content_version_id, "content_version_id")
+        res = sf.query(
+            f"SELECT ContentDocumentId FROM ContentVersion WHERE Id = '{safe_id}' LIMIT 1")
+        recs = res.get("records", [])
+        if not recs:
+            return None
+        doc_id = recs[0].get("ContentDocumentId")
+        if not doc_id:
+            return None
+        return f"https://{sf.sf_instance}/lightning/r/ContentDocument/{doc_id}/view"
+    except Exception:
+        return None
+
+
+def watermark_configured(account_id: str | None = None,
+                         sf: Salesforce | None = None) -> dict:
+    """Whether a watermark image exists, and where it was found.
+
+    Drives the frontend's watermark panel, which has to be able to say "no
+    watermark configured -- masked resumes will carry none" rather than
+    implying one is in use.
+    """
+    try:
+        if account_id:
+            png = fetch_watermark_png(account_id=account_id, sf=sf)
+            if png:
+                return {"configured": True, "scope": "account", "bytes": len(png)}
+        png = fetch_watermark_png(account_id=None, sf=sf)
+        if png:
+            return {"configured": True, "scope": "global", "bytes": len(png)}
+        return {"configured": False, "scope": "none", "bytes": 0}
+    except Exception as e:
+        return {"configured": False, "scope": "unknown", "bytes": 0,
+                "detail": type(e).__name__}
+
+
 # ── Internal ────────────────────────────────────────────────────────────────
 
 def _download_version_data(sf: Salesforce, version_data_path: str) -> bytes:

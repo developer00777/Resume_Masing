@@ -197,6 +197,12 @@ class MaskResponse(BaseModel):
         default=None,
         description="Job Applicant's human-readable Name (e.g. \"JA-26469\"), display-only -- "
                     "never used for masking, which always operates on job_applicant_id.")
+    masked_file_url: str | None = Field(
+        default=None,
+        description="Salesforce URL for the masked resume, so a recruiter can open and check "
+                    "it in Salesforce directly. Links to the ContentDocument rather than the "
+                    "ContentVersion so it survives a later version being added. Null if the "
+                    "link could not be resolved -- cosmetic only, the file itself is uploaded.")
 
 
 class WatermarkUploadResponse(BaseModel):
@@ -422,7 +428,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     masked_bytes, hits = mask.mask_pdf_bytes(
         pdf_bytes, mask_strings,
         watermark_png=watermark_png,
-        watermark_text=req.watermark_text or "CONFIDENTIAL",
+        watermark_text=req.watermark_text,
     )
 
     # 5) Upload masked PDF back to Salesforce
@@ -435,6 +441,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         redacted_regions=hits,
         watermark_used=watermark_used,
         job_applicant_name=ja_name,
+        masked_file_url=sf_client.masked_file_url(new_id, sf=sf),
     )
 
 
@@ -651,7 +658,7 @@ def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
         masked_bytes, hits = mask.mask_pdf_bytes(
             pdf_bytes, mask_strings,
             watermark_png=watermark_png,
-            watermark_text=req.watermark_text or "CONFIDENTIAL",
+            watermark_text=req.watermark_text,
         )
     except Exception as e:
         return InlineMaskResponse(status="error", detail=f"Masking failed: {e}"[:300])
@@ -735,6 +742,34 @@ def self_register_client(req: SelfRegisterRequest) -> AdminActionResponse:
     except crypto_util.EncryptionKeyError as e:
         return AdminActionResponse(status="error", detail=str(e))
     return AdminActionResponse(status="ok", detail=f"Registered '{req.client_key}'.")
+
+
+class WatermarkStatusResponse(BaseModel):
+    status: str
+    configured: bool = False
+    scope: str = "none"
+    bytes: int = 0
+    detail: str | None = None
+
+
+@app.get("/watermark/status", response_model=WatermarkStatusResponse,
+         dependencies=[Depends(require_api_key)])
+def watermark_status(account_id: str = "", client_key: str | None = None) -> WatermarkStatusResponse:
+    """Is a watermark image configured, and at what scope?
+
+    The frontend needs this to state plainly that a client has none, rather
+    than leaving the impression one is being applied. Nothing is stamped when
+    none is configured -- there is no stand-in text.
+    """
+    try:
+        sf = sf_client.connect(client_key=client_key)
+    except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
+            sf_client.SalesforceAuthenticationError) as e:
+        return WatermarkStatusResponse(status="error", detail=str(e))
+    info = sf_client.watermark_configured(account_id=account_id or None, sf=sf)
+    return WatermarkStatusResponse(
+        status="ok", configured=info["configured"], scope=info["scope"],
+        bytes=info["bytes"], detail=info.get("detail"))
 
 
 @app.post("/watermark/upload", response_model=WatermarkUploadResponse,

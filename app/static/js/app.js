@@ -49,7 +49,7 @@
   function renderStatusRows(results) {
     statusBody.innerHTML = "";
     if (!results || results.length === 0) {
-      statusBody.innerHTML = '<tr><td colspan="2" class="empty-row">No profiles masked yet.</td></tr>';
+      statusBody.innerHTML = '<tr><td colspan="3" class="empty-row">No profiles masked yet.</td></tr>';
       return;
     }
     results.forEach(function (r) {
@@ -59,11 +59,28 @@
       // falls back to the raw Id if the lookup failed. The raw job_applicant_id is
       // still what's sent to /mask/batch; this only changes what's shown here.
       var displayId = (r.result && r.result.job_applicant_name) || r.job_applicant_id;
+      // Link straight to the masked file in Salesforce so the client can read
+      // it there rather than hunting through the record's Files. Points at the
+      // ContentDocument, so it still resolves if a newer version is added.
+      var url = r.result && r.result.masked_file_url;
+      var link = url
+        ? '<a href="' + escapeAttr(url) + '" target="_blank" rel="noopener noreferrer">Open in Salesforce</a>'
+        : '<span class="text-muted">&mdash;</span>';
       tr.innerHTML =
         "<td>" + escapeHtml(displayId) + "</td>" +
-        '<td><span class="status-badge ' + (ok ? "ok" : "error") + '">' + (ok ? "Masked" : "Failed") + "</span></td>";
+        '<td><span class="status-badge ' + (ok ? "ok" : "error") + '">' + (ok ? "Masked" : "Failed") + "</span></td>" +
+        "<td>" + (ok ? link : '<span class="text-muted">&mdash;</span>') + "</td>";
       statusBody.appendChild(tr);
     });
+  }
+
+  // Only ever used on a URL the service itself built from a Salesforce
+  // instance host and record Id, but escaped anyway rather than trusting that
+  // an attribute value can never contain a quote.
+  function escapeAttr(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
   function escapeHtml(s) {
@@ -270,3 +287,95 @@
     console.error("User Settings tab setup failed:", e);
   }
 })();
+
+
+  // ── Watermark panel ────────────────────────────────────────────────────
+  // Wired to POST /watermark/upload and GET /watermark/status. The status line
+  // has to be able to say "none configured" plainly: nothing is stamped when
+  // no image exists, so a silent panel would imply a watermark is being
+  // applied when it is not.
+  (function () {
+    var form = document.getElementById("watermarkForm");
+    if (!form) return;
+    var statusBox = document.getElementById("wmStatus");
+    var accountId = document.getElementById("wmAccountId");
+    var fileInput = document.getElementById("wmFile");
+    var spinner = document.getElementById("wmSpinner");
+    var msg = document.getElementById("wmMsg");
+    var refresh = document.getElementById("wmRefresh");
+
+    function busy(on) {
+      spinner.classList.toggle("d-none", !on);
+      form.querySelector('button[type="submit"]').disabled = on;
+    }
+
+    function setStatus(cls, html) {
+      statusBox.className = "alert " + cls + " mb-3";
+      statusBox.innerHTML = html;
+    }
+
+    async function loadStatus() {
+      setStatus("alert-secondary", "Checking current watermark…");
+      try {
+        var qs = accountId.value.trim() ? "?account_id=" + encodeURIComponent(accountId.value.trim()) : "";
+        var resp = await fetch("/watermark/status" + qs, { headers: authHeaders });
+        var data = await resp.json();
+        if (data.status !== "ok") {
+          setStatus("alert-warning", "Could not check: " + escapeHtml(data.detail || "unknown error"));
+          return;
+        }
+        if (data.configured) {
+          setStatus("alert-success",
+            "<strong>Watermark configured</strong> (" + escapeHtml(data.scope) +
+            (data.scope === "global" ? " fallback, used by every client" : " specific") +
+            ", " + data.bytes + " bytes). It is stamped in the centre of every page.");
+        } else {
+          setStatus("alert-secondary",
+            "<strong>No watermark configured.</strong> Masked resumes are produced without one — " +
+            "no placeholder text is added. Upload an image below to change that.");
+        }
+      } catch (e) {
+        setStatus("alert-warning", "Could not check: " + escapeHtml(e.message));
+      }
+    }
+
+    refresh.addEventListener("click", loadStatus);
+    accountId.addEventListener("change", loadStatus);
+
+    form.addEventListener("submit", async function (ev) {
+      ev.preventDefault();
+      msg.textContent = "";
+      var id = accountId.value.trim();
+      if (!id) {
+        msg.className = "mt-2 small text-danger";
+        msg.textContent = "Enter the Salesforce Account Id this watermark belongs to.";
+        return;
+      }
+      if (!fileInput.files || !fileInput.files[0]) {
+        msg.className = "mt-2 small text-danger";
+        msg.textContent = "Choose a PNG or JPEG to upload.";
+        return;
+      }
+      busy(true);
+      try {
+        var fd = new FormData();
+        fd.append("account_id", id);
+        fd.append("file", fileInput.files[0]);
+        var resp = await fetch("/watermark/upload", { method: "POST", headers: authHeaders, body: fd });
+        var data = await resp.json();
+        msg.className = "mt-2 small " + (data.status === "ok" ? "text-success" : "text-danger");
+        msg.textContent = data.detail || (data.status === "ok" ? "Uploaded." : "Upload failed.");
+        if (data.status === "ok") {
+          fileInput.value = "";
+          loadStatus();
+        }
+      } catch (e) {
+        msg.className = "mt-2 small text-danger";
+        msg.textContent = "Upload failed: " + e.message;
+      } finally {
+        busy(false);
+      }
+    });
+
+    loadStatus();
+  })();

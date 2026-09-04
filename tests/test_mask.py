@@ -105,8 +105,13 @@ def test_phone_format_mismatch():
     masked, hits = mask_pdf_bytes(pdf_bytes, ["+919876543210"])  # no spaces
     txt = "".join(pg.get_text() for pg in fitz.open(stream=masked, filetype="pdf"))
     assert "98765" not in txt and "43210" not in txt, "phone leaked on format mismatch"
-    assert "Phone:" in txt, "over-masked the label, not just the digits"
-    print(f"  [PHONE FORMAT MISMATCH] OK — {hits} redactions, digits gone, label intact")
+    # The label goes with the value. A bare "Phone:" over blank space still
+    # tells the reader exactly what was removed and reads as a defect on the
+    # page, so _absorb_label() takes it too. This assertion used to require
+    # the opposite -- reversed deliberately, not worked around.
+    assert "Phone:" not in txt, "the contact label should be redacted with the value"
+    assert "Experience" in txt and "85%" in txt, "over-masked real content"
+    print(f"  [PHONE FORMAT MISMATCH] OK — {hits} redactions, digits and label gone")
 
 
 def main():

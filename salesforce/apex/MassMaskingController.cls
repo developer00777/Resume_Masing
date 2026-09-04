@@ -4,7 +4,6 @@ public class MassMaskingController {
     private static final Integer CHUNK_SIZE = 5;
     private static final Integer SYNC_MAX_ITEMS = 10;
     private static final Integer CALLOUT_TIMEOUT_MS = 120000;
-    private static final String WATERMARK_FALLBACK_TEXT = 'CONFIDENTIAL';
 
     private static final List<String> CONTACT_PII_FIELDS = new List<String>{
         'Name',
@@ -225,7 +224,6 @@ public class MassMaskingController {
         JSONGenerator g = JSON.createGenerator(false);
         g.writeStartObject();
         g.writeStringField('client_key', UserInfo.getOrganizationId());
-        g.writeStringField('watermark_text', WATERMARK_FALLBACK_TEXT);
         g.writeFieldName('items');
         g.writeStartArray();
         for (CandidatePii p : chunk) {

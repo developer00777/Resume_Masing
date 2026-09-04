@@ -7,6 +7,10 @@
                 data-bs-target="#mask-pane" type="button" role="tab">Mask Profile</button>
     </li>
     <li class="nav-item" role="presentation">
+        <button class="nav-link" id="watermark-tab" data-bs-toggle="tab"
+                data-bs-target="#watermark-pane" type="button" role="tab">Watermark</button>
+    </li>
+    <li class="nav-item" role="presentation">
         <button class="nav-link" id="settings-tab" data-bs-toggle="tab"
                 data-bs-target="#settings-pane" type="button" role="tab">User Settings</button>
     </li>
@@ -49,18 +53,53 @@
             <table class="table align-middle status-table">
                 <thead>
                     <tr>
-                        <th style="width:70%">Job Applicant</th>
+                        <th style="width:55%">Job Applicant</th>
                         <th>Status</th>
+                        <th>Masked resume</th>
                     </tr>
                 </thead>
                 <tbody id="statusBody">
-                    <tr><td colspan="2" class="empty-row">No profiles masked yet.</td></tr>
+                    <tr><td colspan="3" class="empty-row">No profiles masked yet.</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
-    <!-- ── Tab 2: User Settings ─────────────────────────── -->
+    <!-- ── Tab 2: Watermark ─────────────────────────────── -->
+    <div class="tab-pane fade" id="watermark-pane" role="tabpanel">
+        <h5 class="section-title">Client Watermark</h5>
+        <p class="text-muted small">
+            A PNG or JPEG stamped in the centre of every page of the masked resume.
+            Give the image a transparent background so the text underneath stays readable.
+            <strong>If no watermark is uploaded, masked resumes carry none</strong> — no
+            placeholder text is added.
+        </p>
+
+        <div id="wmStatus" class="alert alert-secondary mb-3">Checking current watermark…</div>
+
+        <form id="watermarkForm" class="settings-form" autocomplete="off">
+            <div class="mb-3">
+                <label class="form-label">Salesforce Account Id</label>
+                <input type="text" id="wmAccountId" class="form-control"
+                       placeholder="001xxxxxxxxxxxxxxx">
+                <div class="form-text">
+                    The client Account this watermark belongs to. Each client can have its own;
+                    leave blank only to check the org-wide fallback.
+                </div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Watermark image</label>
+                <input type="file" id="wmFile" class="form-control" accept="image/png,image/jpeg">
+                <div class="form-text">PNG or JPEG, up to about 800×800px.</div>
+            </div>
+            <button type="submit" class="btn btn-primary">Upload Watermark</button>
+            <button type="button" id="wmRefresh" class="btn btn-outline-secondary ms-2">Refresh status</button>
+            <span id="wmSpinner" class="spinner-border spinner-border-sm text-primary d-none ms-2"></span>
+            <div id="wmMsg" class="mt-2 small"></div>
+        </form>
+    </div>
+
+    <!-- ── Tab 3: User Settings ─────────────────────────── -->
     <div class="tab-pane fade" id="settings-pane" role="tabpanel">
         <h5 class="section-title">Enter User Details Below:</h5>
         <div id="settingsStatus" class="alert {{ 'alert-success' if ctx.settings_configured else 'alert-secondary' }} mb-3">

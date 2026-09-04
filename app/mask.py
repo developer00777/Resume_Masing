@@ -385,14 +385,56 @@ def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
     return out
 
 
+#: The label sitting immediately before a contact value. Redacted along with
+#: the value, because a bare "Contact:" or "Email:" followed by white space
+#: still tells the reader exactly what was removed, and reads as a defect on
+#: the page. Matched on the whole word so a sentence beginning "Contact the
+#: site engineer" is untouched.
+_CONTACT_LABEL_RE = re.compile(
+    r"^(?:e[-\s]?mail|email|mail|phone|mobile|mob|cell(?:ular)?|tel(?:ephone)?|"
+    r"contact(?:\s*no)?|whats?app|ph|no)"
+    r"[\s.:\-–—#]*$",
+    re.I,
+)
+
+
+def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
+    """Grow `rect` leftwards over a contact label that precedes the value.
+
+    On a real resume this is the difference between
+
+        Contact:                       and        (nothing)
+        Email:
+
+    left standing over blank space, and a clean page. The label is only taken
+    when it sits immediately to the left on the same line and the whole word is
+    a label, so prose is never eaten.
+    """
+    candidates = [w for w in words
+                  if w[2] <= rect.x0 + 1.0
+                  and w[3] > rect.y0 and w[1] < rect.y1]
+    if not candidates:
+        return rect
+    nearest = max(candidates, key=lambda w: w[2])
+    if rect.x0 - nearest[2] > 12.0:
+        return rect                      # too far away to be this value's label
+    if not _CONTACT_LABEL_RE.match(nearest[4].strip()):
+        return rect
+    grown = fitz.Rect(nearest[0], min(rect.y0, nearest[1]),
+                      rect.x1, max(rect.y1, nearest[3]))
+    # Absorbing the label must not drag the rect onto another line.
+    return _clip_to_line(grown, (nearest[5], nearest[6]), words)
+
+
 def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
     """Every region of `page` that should be redacted for the PII string `s`,
     using the matching strategy its kind calls for."""
     kind = pii.classify(s)
     if kind == pii.PHONE:
-        return _phone_rects(page, s, words)
+        return [_absorb_label(r, words) for r in _phone_rects(page, s, words)]
     if kind == pii.EMAIL:
-        return [_clip_literal(r, words) for r in page.search_for(s)]
+        return [_absorb_label(_clip_literal(r, words), words)
+                for r in page.search_for(s)]
     # Name (and any literal a caller passed explicitly): whole-word only.
     if len(s.strip()) < 3:
         return []  # too short to match safely — would hit half the page
@@ -465,7 +507,9 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
 
         page.apply_redactions()
 
-        # Apply watermark
+        # Watermark only when the client actually has one. No stand-in text:
+        # a "CONFIDENTIAL" default was being stamped on every masked resume
+        # for clients who had never configured a watermark at all.
         if watermark_png:
             _watermark_image(page, watermark_png)
         elif watermark_text:
