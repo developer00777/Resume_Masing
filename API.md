@@ -184,6 +184,47 @@ numbers, library versions, percentages, salary figures, PIN/ZIP codes -- are
 left alone; see `tests/test_mask_precision.py`, which scores both directions
 (leaks and over-masking) against a 96% accuracy floor.
 
+### `POST /mask/batch/async` — queue a batch, poll for progress
+
+Queues the batch and returns immediately with a `job_id`. Same request body as
+`/mask/batch`.
+
+```json
+{ "status": "ok", "job_id": "3f1c...", "queued": 200, "max_concurrent": 20 }
+```
+
+The queue drains **20 items at a time** (`MASK_MAX_CONCURRENT`) and holds the
+rest, so submitting 200 does not open 200 Salesforce sessions or 200
+LibreOffice processes. The backlog lives in Redis, so a restart or redeploy
+mid-drain resumes rather than losing the remainder.
+
+Use this rather than `/mask/batch` whenever the caller cannot hold an HTTP
+request open for the whole batch. Salesforce Apex cannot: it allows 120 seconds
+of cumulative callout time per transaction, which is roughly ten resumes.
+
+Requires `REDIS_URL`. Without it this returns
+`{"status":"error","detail":"Async masking is not enabled..."}` and
+`/mask/batch` continues to work unchanged.
+
+### `GET /mask/jobs/{job_id}` — progress for a queued batch
+
+```json
+{ "status": "ok", "job_id": "3f1c...", "job_status": "running",
+  "total": 200, "succeeded": 137, "failed": 2, "pending": 61,
+  "results": [ { "job_applicant_id": "a0X...", "result": {"status":"ok", "masked_content_version_id":"068..."} } ] }
+```
+
+`job_status` is `queued`, `running` or `done`. Results accumulate as items
+finish, so partial progress can be shown. Records expire after `MASK_JOB_TTL`
+(7 days) — the masked PDFs live in Salesforce, so this is progress reporting,
+not a system of record.
+
+`GET /health` also reports queue depth:
+
+```json
+"queue": { "backend": "redis", "queued": 61, "in_flight": 20, "max_concurrent": 20 }
+```
+
 ### `POST /mask` — mask one candidate, fully working live
 
 ```json

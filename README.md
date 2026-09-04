@@ -44,6 +44,7 @@ under that client.
 
 | File | Purpose |
 |------|---------|
+| `app/jobs.py` | Redis-backed async batch queue. FIFO backlog (`mask:queue`), a global concurrency gate capped at `MASK_MAX_CONCURRENT` (default 20) as a crash-safe lease ZSET, and per-job progress. Drives `POST /mask/batch/async` + `GET /mask/jobs/{id}`. Inert without `REDIS_URL`. |
 | `app/pii.py` | PII detection & classification. Strict, precision-first phone detection (a digit run must carry positive evidence of being a phone), so employment date ranges, credential ids, ISO/IEEE/RFC numbers, versions, percentages and PIN codes are never reported as PII. |
 | `app/mask.py` | Masking core — PyMuPDF true-redact (white fill) + centered watermark. Per-kind matching: email exact, phone by digit-equivalence, name whole-word only. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
 | `app/docx_convert.py` | `.docx`/`.doc` → PDF via headless LibreOffice (`soffice`, installed in the Dockerfile) — real candidate resumes on this org are legacy Word attachments, not PDFs, so this runs before `app/mask.py` whenever the fetched resume isn't already a PDF. |

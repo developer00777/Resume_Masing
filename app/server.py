@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from contextlib import asynccontextmanager
 import os
 import re
 
@@ -67,11 +68,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from app import crypto_util, docx_convert, mask, pii, sf_client
+from app import crypto_util, docx_convert, jobs, mask, pii, sf_client
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app = FastAPI(title="Salesforce Resume Masking Service", version="1.3.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Run the async masking queue's consumer pool alongside the API.
+
+    Nothing starts when REDIS_URL is unset, so a deployment without the Redis
+    service keeps working exactly as before on the synchronous endpoints.
+    _queued_item_worker is defined further down the module; by the time this
+    runs at startup the module is fully imported.
+    """
+    handle = await jobs.start_workers(_queued_item_worker)
+    try:
+        yield
+    finally:
+        await jobs.stop_workers(handle)
+
+
+app = FastAPI(title="Salesforce Resume Masking Service", version="1.4.0",
+              lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(_APP_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(_APP_DIR, "templates"))
 
@@ -299,10 +317,11 @@ class CandidateSettingsStatusResponse(BaseModel):
 # --- Routes ---
 
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
     return {
         "status": "ok",
         "revision": _build_revision(),
+        "queue": await jobs.stats(),
         "salesforce_configured": sf_client.creds_configured(),
         "client_keys": sf_client.list_client_keys(),
         "registry_backend": sf_client.registry_backend(),
@@ -487,6 +506,116 @@ def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
     except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
             sf_client.SalesforceAuthenticationError) as e:
         return BatchMaskResponse(status="error", detail=str(e))
+
+
+class AsyncSubmitResponse(BaseModel):
+    status: str
+    job_id: str | None = None
+    queued: int = 0
+    max_concurrent: int = jobs.MAX_CONCURRENT
+    detail: str | None = None
+
+
+class AsyncJobResponse(BaseModel):
+    status: str
+    job_id: str | None = None
+    job_status: str | None = Field(default=None,
+        description="queued | running | done")
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    pending: int = 0
+    results: list[BatchMaskResult] = Field(default_factory=list)
+    detail: str | None = None
+
+
+def _queued_item_worker(payload: dict) -> dict:
+    """Mask one queued item. Runs on a worker thread, not the event loop.
+
+    Each item opens its own Salesforce session rather than sharing one across
+    the batch. That costs a token lookup per item (cached by sf_client), and
+    buys isolation: a session expiring mid-drain fails that one item instead of
+    forcing a whole batch to be re-run, which is what the synchronous
+    /mask/batch has to do.
+    """
+    item = payload["item"]
+    req = MaskRequest(
+        job_applicant_id=item["job_applicant_id"],
+        account_id=item.get("account_id"),
+        mask_strings=item.get("mask_strings"),
+        watermark_text=payload.get("watermark_text") or "",
+        watermark_base64=item.get("watermark_base64") or payload.get("watermark_base64"),
+        client_key=payload.get("client_key"),
+    )
+    try:
+        return sf_client.with_session(
+            lambda sf: _mask_one(req, sf), client_key=payload.get("client_key")
+        ).model_dump()
+    except Exception as e:
+        return {"status": "error", "detail": f"{type(e).__name__}: {e}"[:300]}
+
+
+@app.post("/mask/batch/async", response_model=AsyncSubmitResponse,
+          dependencies=[Depends(require_api_key)])
+async def mask_batch_async_endpoint(req: BatchMaskRequest) -> AsyncSubmitResponse:
+    """Queue a batch and return immediately with a job id.
+
+    Use this instead of /mask/batch whenever the caller has more resumes than
+    it is willing to hold an HTTP request open for. Salesforce Apex in
+    particular cannot: it allows 120 seconds of cumulative callout time per
+    transaction, which is roughly ten resumes.
+
+    The queue drains MAX_CONCURRENT items at a time and holds the rest, so
+    submitting 200 is safe -- it does not open 200 Salesforce sessions or 200
+    LibreOffice processes. Poll GET /mask/jobs/{job_id} for progress.
+    """
+    if not jobs.configured():
+        return AsyncSubmitResponse(
+            status="error",
+            detail="Async masking is not enabled: REDIS_URL is not configured. "
+                   "Use POST /mask/batch for synchronous masking.")
+    if not await jobs.ping():
+        return AsyncSubmitResponse(
+            status="error", detail="Redis is configured but unreachable.")
+
+    job_id = await jobs.submit(
+        [item.model_dump() for item in req.items],
+        client_key=req.client_key,
+        watermark_text=req.watermark_text,
+        watermark_base64=req.watermark_base64,
+    )
+    return AsyncSubmitResponse(status="ok", job_id=job_id, queued=len(req.items))
+
+
+@app.get("/mask/jobs/{job_id}", response_model=AsyncJobResponse,
+         dependencies=[Depends(require_api_key)])
+async def mask_job_status_endpoint(job_id: str) -> AsyncJobResponse:
+    """Progress and per-item results for a queued batch.
+
+    Results accumulate as items finish, so a caller can show partial progress
+    rather than waiting for the whole batch. Records expire after MASK_JOB_TTL;
+    the masked PDFs themselves live in Salesforce, so this is progress
+    reporting rather than a system of record.
+    """
+    if not jobs.configured():
+        return AsyncJobResponse(status="error", job_id=job_id,
+                                detail="Async masking is not enabled (REDIS_URL unset).")
+    snapshot = await jobs.status(job_id)
+    if snapshot is None:
+        return AsyncJobResponse(status="error", job_id=job_id,
+                                detail="Unknown or expired job_id.")
+    return AsyncJobResponse(
+        status="ok",
+        job_id=job_id,
+        job_status=snapshot["status"],
+        total=snapshot["total"],
+        succeeded=snapshot["succeeded"],
+        failed=snapshot["failed"],
+        pending=snapshot["pending"],
+        results=[BatchMaskResult(job_applicant_id=r["job_applicant_id"],
+                                 result=MaskResponse(**r["result"]))
+                 for r in snapshot["results"]],
+    )
 
 
 @app.post("/mask/inline", response_model=InlineMaskResponse, dependencies=[Depends(require_api_key)])

@@ -1,0 +1,38 @@
+# Local stack: the masking service plus the Redis the async queue needs.
+# On Railway, add a Redis service instead and it injects REDIS_URL itself.
+services:
+  redis:
+    image: redis:7-alpine
+    # appendonly so a restart does not drop a half-drained queue -- the whole
+    # point of putting the backlog in Redis rather than in process memory.
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  masker:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # How many resumes are masked at once, across every replica.
+      MASK_MAX_CONCURRENT: "20"
+      SF_USERNAME: ${SF_USERNAME:-}
+      SF_PASSWORD: ${SF_PASSWORD:-}
+      SF_SECURITY_TOKEN: ${SF_SECURITY_TOKEN:-}
+      SF_DOMAIN: ${SF_DOMAIN:-login}
+      MASK_API_KEY: ${MASK_API_KEY:-}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      CLIENT_SECRET_ENCRYPTION_KEY: ${CLIENT_SECRET_ENCRYPTION_KEY:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
