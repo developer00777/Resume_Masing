@@ -507,6 +507,57 @@ def test_name_match_does_not_span_across_a_long_gap():
     assert "account held by" in text, "redacted the words between two tokens"
 
 
+def test_tall_heading_redaction_does_not_wipe_the_line_below():
+    """A big-font name must not take the tagline underneath it with it.
+
+    get_text("words") reports a word box far taller than its glyphs for a
+    heading font -- 37pt for two words on one live resume -- and
+    apply_redactions() deletes every character whose box merely INTERSECTS the
+    annotation. The tall rect therefore erased the tagline, leaving "Elec" and
+    "nce" stranded either side of a white gap. Reported as a white box
+    covering information for no reason."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((56, 70), "AASIM SOHAIL", fontsize=26)
+    page.insert_text((56, 88), "Electrical Safety Engineer | 5 Years Experience",
+                     fontsize=9)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, hits = mask.mask_pdf_bytes(pdf, ["Aasim Sohail"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+
+    assert hits >= 1
+    assert "AASIM" not in text and "SOHAIL" not in text, "the name leaked"
+    assert _norm("Electrical Safety Engineer | 5 Years Experience") in _norm(text), \
+        f"the tagline below the heading was destroyed: {text!r}"
+
+
+def test_separator_between_two_redactions_is_absorbed():
+    """The slash between two masked numbers must not be left floating.
+
+    A Contact field holding "9876543210 / 9123456789" redacted both numbers
+    and left the slash sitting alone in the white gap. Reported as "some slash
+    and , is not covered"."""
+    text, _ = _mask_text(
+        ["Mobile: 9876543210 / 9123456789", "Acme Corp   2019 - 2023"],
+        ["9876543210    9123456789"])
+    stripped = text.replace(" ", "")
+    assert "9876543210" not in stripped and "9123456789" not in stripped
+    assert "/" not in stripped, f"stray separator left behind: {text!r}"
+    assert "2019-2023" in stripped, "over-masked the date range"
+
+
+def test_bridging_never_joins_across_real_content():
+    """Two redactions with actual words between them stay separate."""
+    text, _ = _mask_text(
+        ["9876543210 reported to Acme and 9123456789 covered nights"],
+        ["9876543210    9123456789"])
+    assert "reported to Acme and" in text, "bridged across real content"
+
+
 def test_name_shorter_than_three_chars_is_never_matched():
     """A 1-2 character name would hit half the page; refuse rather than guess."""
     pdf = _make_pdf(["Li Wei", "An analysis of an anomaly in Anaheim."])

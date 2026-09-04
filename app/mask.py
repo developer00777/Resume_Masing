@@ -97,14 +97,115 @@ def _phone_rects(page: fitz.Page, target: str, words: list | None = None) -> lis
                 if len(run) > len(target_digits) + 4:
                     break
                 if pii.phone_digits_equivalent(run, target_digits):
-                    out.append(fitz.Rect(
+                    out.append(_clip_to_line(fitz.Rect(
                         min(line[k][0] for k in range(i, j + 1)),
                         min(line[k][1] for k in range(i, j + 1)),
                         max(line[k][2] for k in range(i, j + 1)),
                         max(line[k][3] for k in range(i, j + 1)),
-                    ))
+                    ), (line[i][5], line[i][6]), words))
                     break
     return _dedupe_rects(out)
+
+
+def _clip_literal(rect: fitz.Rect, words: list) -> fitz.Rect:
+    """_clip_to_line for a search_for() hit, whose line has to be inferred
+    from whichever line contributes most of the words the hit covers."""
+    best, best_area = None, 0.0
+    for w in words:
+        overlap = fitz.Rect(w[:4]) & rect
+        if overlap.is_empty:
+            continue
+        area = overlap.get_area()
+        if area > best_area:
+            best, best_area = (w[5], w[6]), area
+    return rect if best is None else _clip_to_line(rect, best, words)
+
+
+def _clip_to_line(rect: fitz.Rect, line_key: tuple[int, int], words: list) -> fitz.Rect:
+    """Shrink `rect` vertically so it cannot reach text on neighbouring lines.
+
+    A word box for a large heading font is far taller than its glyphs -- a
+    candidate name on one live resume measured 37pt tall for two words -- and
+    apply_redactions() deletes every character whose box merely INTERSECTS the
+    annotation. So the tall heading rect silently wiped the tagline underneath
+    it, leaving "Elec" and "nce" stranded either side of a white gap, which is
+    the "white box covering info for no reason" that got reported.
+
+    Trimming back is safe: the name's own characters still intersect the
+    smaller rect, so they are still deleted. If the two genuinely overlap and
+    no separating rect exists, the original is kept -- removing the PII wins
+    over preserving the line.
+    """
+    own = [w for w in words
+           if (w[5], w[6]) == line_key and not (fitz.Rect(w[:4]) & rect).is_empty]
+    if not own:
+        return rect
+
+    mid = (rect.y0 + rect.y1) / 2
+    top, bottom = rect.y0, rect.y1
+    for w in words:
+        if (w[5], w[6]) == line_key:
+            continue
+        wr = fitz.Rect(w[:4])
+        overlap = wr & rect
+        if wr.is_empty or overlap.is_empty or overlap.width <= 0:
+            continue
+        if (wr.y0 + wr.y1) / 2 >= mid:
+            bottom = min(bottom, wr.y0)
+        else:
+            top = max(top, wr.y1)
+
+    clipped = fitz.Rect(rect.x0, top, rect.x1, bottom)
+    if clipped.height < 1:
+        return rect
+    # The clipped rect must still touch every word it was meant to remove.
+    if any((fitz.Rect(w[:4]) & clipped).is_empty for w in own):
+        return rect
+    return clipped
+
+
+#: Widest horizontal gap that a stranded separator may span, in points.
+#: Comfortably wider than a slash or comma plus its spaces, narrower than the
+#: gutter between two columns.
+_BRIDGE_MAX_GAP = 24.0
+
+
+def _bridge_separators(rects: list[fitz.Rect], words: list) -> list[fitz.Rect]:
+    """Absorb a separator left stranded between two redactions.
+
+    A Contact field holding "9876543210 / 9123456789" redacts both numbers and
+    leaves the slash floating in the white gap between them; the same happens
+    to the comma between two email addresses. Reported as "some slash and , is
+    not covered".
+
+    Two rects are merged only when they sit on the same line, are close
+    together, and every word strictly between them is punctuation -- so this
+    can never join two redactions across real content.
+    """
+    if len(rects) < 2:
+        return rects
+
+    merged = sorted(rects, key=lambda r: (round(r.y0, 1), r.x0))
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged) - 1):
+            a, b = merged[i], merged[i + 1]
+            if a.y1 <= b.y0 or b.y1 <= a.y0:
+                continue                       # not on the same line
+            gap = b.x0 - a.x1
+            if gap < 0 or gap > _BRIDGE_MAX_GAP:
+                continue
+            between = [w for w in words
+                       if w[0] >= a.x1 - 0.5 and w[2] <= b.x0 + 0.5
+                       and w[3] > min(a.y0, b.y0) and w[1] < max(a.y1, b.y1)]
+            if any(any(c.isalnum() for c in w[4]) for w in between):
+                continue                       # real content in the gap
+            merged[i:i + 2] = [fitz.Rect(a.x0, min(a.y0, b.y0),
+                                         b.x1, max(a.y1, b.y1))]
+            changed = True
+            break
+    return merged
 
 
 def _dedupe_rects(rects: list[fitz.Rect]) -> list[fitz.Rect]:
@@ -207,13 +308,13 @@ def _lone_token_rects(tokens: list[str], words: list) -> list[fitz.Rect]:
             continue                      # emails are matched as emails
         folded = text.casefold()
         if folded in joined:
-            out.append(fitz.Rect(w[0], w[1], w[2], w[3]))
+            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), words))
             continue
         if folded not in wanted:
             continue
         if not (text.istitle() or text.isupper()):
             continue                      # lowercase in running prose
-        out.append(fitz.Rect(w[0], w[1], w[2], w[3]))
+        out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), words))
     return out
 
 
@@ -275,12 +376,12 @@ def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
                 elif matched:
                     break
             if matched >= 2 and chars >= _NAME_MIN_CHARS:
-                out.append(fitz.Rect(
+                out.append(_clip_to_line(fitz.Rect(
                     min(line[k][0] for k in range(start, last + 1)),
                     min(line[k][1] for k in range(start, last + 1)),
                     max(line[k][2] for k in range(start, last + 1)),
                     max(line[k][3] for k in range(start, last + 1)),
-                ))
+                ), (line[start][5], line[start][6]), words))
     return out
 
 
@@ -291,11 +392,12 @@ def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
     if kind == pii.PHONE:
         return _phone_rects(page, s, words)
     if kind == pii.EMAIL:
-        return page.search_for(s)
+        return [_clip_literal(r, words) for r in page.search_for(s)]
     # Name (and any literal a caller passed explicitly): whole-word only.
     if len(s.strip()) < 3:
         return []  # too short to match safely — would hit half the page
-    literal = [r for r in page.search_for(s) if _covers_whole_words(r, words)]
+    literal = [_clip_literal(r, words) for r in page.search_for(s)
+               if _covers_whole_words(r, words)]
     if len(_name_token_list(s)) < 2:
         # A one-token name has to match case as written. search_for() is
         # case-insensitive, so a candidate actually named Will, Rose or Mark
@@ -357,7 +459,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         for s in pii.expand([str(s) for s in mask_strings]):
             page_rects.extend(_rects_for(page, s, words))
 
-        for rect in _dedupe_rects(page_rects):
+        for rect in _bridge_separators(_dedupe_rects(page_rects), words):
             page.add_redact_annot(rect, fill=REDACT_FILL)
             hits += 1
 
