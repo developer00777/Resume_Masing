@@ -410,20 +410,29 @@ def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
     when it sits immediately to the left on the same line and the whole word is
     a label, so prose is never eaten.
     """
-    candidates = [w for w in words
-                  if w[2] <= rect.x0 + 1.0
-                  and w[3] > rect.y0 and w[1] < rect.y1]
-    if not candidates:
+    grown = rect
+    line_key = None
+    # Labels come in runs: "Mob No.- 98765...", "Contact No :", "E-Mail ID:".
+    # Taking only the nearest word left "Mob" standing on a real resume, so
+    # this walks leftwards while each next word is still a label.
+    for _ in range(3):
+        candidates = [w for w in words
+                      if w[2] <= grown.x0 + 1.0
+                      and w[3] > grown.y0 and w[1] < grown.y1]
+        if not candidates:
+            break
+        nearest = max(candidates, key=lambda w: w[2])
+        if grown.x0 - nearest[2] > 12.0:
+            break                        # too far away to be this value's label
+        if not _CONTACT_LABEL_RE.match(nearest[4].strip()):
+            break
+        grown = fitz.Rect(nearest[0], min(grown.y0, nearest[1]),
+                          grown.x1, max(grown.y1, nearest[3]))
+        line_key = (nearest[5], nearest[6])
+    if line_key is None:
         return rect
-    nearest = max(candidates, key=lambda w: w[2])
-    if rect.x0 - nearest[2] > 12.0:
-        return rect                      # too far away to be this value's label
-    if not _CONTACT_LABEL_RE.match(nearest[4].strip()):
-        return rect
-    grown = fitz.Rect(nearest[0], min(rect.y0, nearest[1]),
-                      rect.x1, max(rect.y1, nearest[3]))
-    # Absorbing the label must not drag the rect onto another line.
-    return _clip_to_line(grown, (nearest[5], nearest[6]), words)
+    # Absorbing labels must not drag the rect onto another line.
+    return _clip_to_line(grown, line_key, words)
 
 
 def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
@@ -567,12 +576,25 @@ def prepare_watermark(image_bytes: bytes) -> fitz.Pixmap | None:
         if len(data) != pix.width * pix.height * 4:
             return pix                              # unexpected layout; leave it alone
         cutoff = WATERMARK_WHITE_CUTOFF
+        opacity = WATERMARK_OPACITY
         for i in range(0, len(data), 4):
             if not had_alpha and (data[i] >= cutoff and data[i + 1] >= cutoff
                                   and data[i + 2] >= cutoff):
-                data[i + 3] = 0                     # background -> transparent
-            elif data[i + 3]:
-                data[i + 3] = max(1, int(data[i + 3] * WATERMARK_OPACITY))
+                data[i] = data[i + 1] = data[i + 2] = data[i + 3] = 0
+                continue                            # background -> transparent
+            if not data[i + 3]:
+                continue                            # already transparent
+            # PyMuPDF pixmap alpha is PREMULTIPLIED, so the colour channels
+            # have to be scaled by the same factor as alpha. Writing straight
+            # RGBA here turned the client's blue logo into a green smear:
+            # (20,74,138,40) rendered as (218,247,216) instead of the correct
+            # (218,227,237). Scaling all four channels keeps premultiplied
+            # samples premultiplied, which is also right for a source that
+            # already carried alpha.
+            data[i] = int(data[i] * opacity)
+            data[i + 1] = int(data[i + 1] * opacity)
+            data[i + 2] = int(data[i + 2] * opacity)
+            data[i + 3] = max(1, int(data[i + 3] * opacity))
         return fitz.Pixmap(fitz.csRGB, pix.width, pix.height, bytes(data), True)
     except Exception:
         return None
@@ -598,7 +620,11 @@ def _watermark_image(page: fitz.Page, pixmap: fitz.Pixmap) -> None:
     page.insert_image(
         fitz.Rect(cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2),
         pixmap=pixmap,
-        overlay=True,
+        # BEHIND the text, not over it: overlay=False puts the image at the
+        # start of the content stream so every glyph is painted on top of it.
+        # Faded and underneath is the only combination that reads as a
+        # watermark rather than as something spilled on the page.
+        overlay=False,
         keep_proportion=True,
     )
 
