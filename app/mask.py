@@ -487,6 +487,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     hits = 0
+    watermark = prepare_watermark(watermark_png) if watermark_png else None
 
     for page in doc:
         # Read the word layout once per page — every mask string is matched
@@ -510,8 +511,8 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         # Watermark only when the client actually has one. No stand-in text:
         # a "CONFIDENTIAL" default was being stamped on every masked resume
         # for clients who had never configured a watermark at all.
-        if watermark_png:
-            _watermark_image(page, watermark_png)
+        if watermark is not None:
+            _watermark_image(page, watermark)
         elif watermark_text:
             _watermark_text(page, watermark_text)
 
@@ -520,24 +521,83 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     return out, hits
 
 
-def _watermark_image(page: fitz.Page, png_bytes: bytes) -> None:
-    """Stamp a centered watermark image overlay on the page.
+#: Watermark width as a fraction of the page width. The old value effectively
+#: filled a 50%-by-50% box, which on A4 is a ~300pt block across the middle of
+#: the resume.
+WATERMARK_WIDTH_RATIO = 0.28
 
-    Image is scaled to ~50% of page width, centered both axes.
-    For semi-transparency, the PNG itself should have an alpha channel.
+#: How much of the watermark's own opacity survives. A logo has to read as a
+#: stamp behind the content, not as a panel over it.
+WATERMARK_OPACITY = 0.16
+
+#: A pixel at least this bright in every channel counts as background and is
+#: knocked out completely -- but only for a source with no alpha channel of its
+#: own. The client logo on the live org is a 554x554 RGB PNG with alpha=0: a
+#: solid white square with the logo painted on it. Fading that uniformly would
+#: leave a pale grey box over the text; the white has to become transparent.
+WATERMARK_WHITE_CUTOFF = 240
+
+
+def prepare_watermark(image_bytes: bytes) -> fitz.Pixmap | None:
+    """Turn an uploaded logo into something safe to stamp over a resume.
+
+    Two corrections, both driven by what clients actually upload:
+
+      * an opaque background is made transparent, so the logo does not arrive
+        as a filled rectangle sitting on top of the text;
+      * what remains is faded to WATERMARK_OPACITY, so the text underneath
+        stays readable.
+
+    A source that already carries alpha is trusted about which pixels are
+    background -- its transparency is scaled, not second-guessed.
+
+    Done once per document rather than per page: it walks every pixel, and a
+    554x554 logo is ~300k of them.
     """
-    rect = page.rect
-    target_w = rect.width * 0.50
-    target_h = rect.height * 0.50
+    if not image_bytes:
+        return None
+    try:
+        pix = fitz.Pixmap(image_bytes)
+        if pix.n - pix.alpha < 3:
+            pix = fitz.Pixmap(fitz.csRGB, pix)      # greyscale/CMYK -> RGB
+        had_alpha = bool(pix.alpha)
+        if not had_alpha:
+            pix = fitz.Pixmap(pix, 1)               # add a fully opaque alpha
+        data = bytearray(pix.samples)
+        if len(data) != pix.width * pix.height * 4:
+            return pix                              # unexpected layout; leave it alone
+        cutoff = WATERMARK_WHITE_CUTOFF
+        for i in range(0, len(data), 4):
+            if not had_alpha and (data[i] >= cutoff and data[i + 1] >= cutoff
+                                  and data[i + 2] >= cutoff):
+                data[i + 3] = 0                     # background -> transparent
+            elif data[i + 3]:
+                data[i + 3] = max(1, int(data[i + 3] * WATERMARK_OPACITY))
+        return fitz.Pixmap(fitz.csRGB, pix.width, pix.height, bytes(data), True)
+    except Exception:
+        return None
 
+
+def _watermark_image(page: fitz.Page, pixmap: fitz.Pixmap) -> None:
+    """Stamp the prepared watermark, centred on both axes.
+
+    Sized from WATERMARK_WIDTH_RATIO with the aspect ratio preserved, so a
+    wide logo does not get blown up to fill a square box the way the previous
+    50%-by-50% target did.
+    """
+    page_rect = page.rect
+    width = page_rect.width * WATERMARK_WIDTH_RATIO
+    height = width * (pixmap.height / pixmap.width) if pixmap.width else width
+    # Never taller than a third of the page, however tall the source is.
+    max_height = page_rect.height / 3
+    if height > max_height:
+        width *= max_height / height
+        height = max_height
+
+    cx, cy = page_rect.width / 2, page_rect.height / 2
     page.insert_image(
-        fitz.Rect(
-            rect.width / 2 - target_w / 2,
-            rect.height / 2 - target_h / 2,
-            rect.width / 2 + target_w / 2,
-            rect.height / 2 + target_h / 2,
-        ),
-        stream=png_bytes,
+        fitz.Rect(cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2),
+        pixmap=pixmap,
         overlay=True,
         keep_proportion=True,
     )
@@ -558,8 +618,15 @@ def _watermark_text(page: fitz.Page, text: str) -> None:
     while font_size > 8 and font.text_length(text, fontsize=font_size) > max_width:
         font_size -= 2
 
+    # insert_textbox aligns horizontally but starts at the TOP of the box, so
+    # passing the whole page put the "centered" watermark across the header.
+    # A box one line tall, centred vertically, actually centres it.
+    band = font_size * 1.6
+    box = fitz.Rect(rect.x0, rect.height / 2 - band / 2,
+                    rect.x1, rect.height / 2 + band / 2)
+
     page.insert_textbox(
-        rect,
+        box,
         text,
         fontsize=font_size,
         color=(0.4, 0.4, 0.4),

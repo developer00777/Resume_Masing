@@ -637,3 +637,79 @@ def test_overall_accuracy_meets_floor():
     assert not leaks, report
     assert accuracy >= ACCURACY_FLOOR, report
     print(report)
+
+
+def _logo_png(width=64, height=64, opaque=True):
+    """A solid-white-background logo, the shape clients actually upload.
+
+    The live org's ResumeWatermark is a 554x554 RGB PNG with no alpha at all:
+    a white square with the logo painted on it.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=width, height=height)
+    page.draw_rect(page.rect, color=None, fill=(1, 1, 1))          # white ground
+    page.draw_rect(fitz.Rect(width * 0.2, height * 0.2, width * 0.8, height * 0.8),
+                   color=None, fill=(0.1, 0.25, 0.6))              # the mark
+    pix = page.get_pixmap(alpha=not opaque)
+    png = pix.tobytes("png")
+    doc.close()
+    return png
+
+
+def test_opaque_logo_background_is_knocked_out_and_faded():
+    """An uploaded logo must not arrive as a filled rectangle over the text.
+
+    The reported fault: the client's 554x554 opaque logo was stamped at 50% of
+    the page with overlay=True, blotting out the middle of every resume and
+    cutting lines off mid-word."""
+    prepared = mask.prepare_watermark(_logo_png())
+    assert prepared is not None and prepared.alpha == 1
+
+    data = prepared.samples
+    alphas = [data[i] for i in range(3, len(data), 4)]
+    assert min(alphas) == 0, "the white background was not made transparent"
+    ceiling = int(255 * mask.WATERMARK_OPACITY) + 1
+    assert max(alphas) <= ceiling, f"mark is too opaque: {max(alphas)} > {ceiling}"
+
+
+def test_watermark_leaves_the_text_readable():
+    """The whole page's text must survive the stamp."""
+    lines = ["RAHUL SHARMA", "Senior Engineer, Acme Corp   2019 - 2023",
+             "Prepared Single Line Diagrams (SLD) of panels and schematic diagrams.",
+             "ACDB Panel, DCDB Panel, DOL Panel, STAR-DELTA Starter Panel"]
+    pdf = _make_pdf(lines)
+    masked, _ = mask.mask_pdf_bytes(pdf, ["Rahul Sharma"], watermark_png=_logo_png())
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = _norm(doc[0].get_text())
+    doc.close()
+    for line in lines[1:]:
+        assert _norm(line) in text, f"watermark destroyed: {line!r}"
+
+
+def test_watermark_is_centred_and_bounded():
+    """Centred on both axes, and never more than a third of the page tall."""
+    pdf = _make_pdf(["one line"])
+    masked, _ = mask.mask_pdf_bytes(pdf, [], watermark_png=_logo_png(64, 400))
+    doc = fitz.open(stream=masked, filetype="pdf")
+    page = doc[0]
+    images = page.get_image_info()
+    assert len(images) == 1, f"expected exactly one watermark, got {len(images)}"
+    box = fitz.Rect(images[0]["bbox"])
+    page_rect = fitz.Rect(page.rect)      # copy before close; page dies with doc
+    doc.close()
+
+    assert box.height <= page_rect.height / 3 + 1, "watermark taller than a third of the page"
+    assert abs(box.x0 + box.x1 - page_rect.width) < 2, "not horizontally centred"
+    assert abs(box.y0 + box.y1 - page_rect.height) < 2, "not vertically centred"
+
+
+def test_no_watermark_at_all_when_none_is_configured():
+    """No image and no explicit text means no stamp -- not a placeholder."""
+    pdf = _make_pdf(["RAHUL SHARMA", "Acme Corp 2019 - 2023"])
+    masked, _ = mask.mask_pdf_bytes(pdf, ["Rahul Sharma"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    page = doc[0]
+    text, images = page.get_text(), page.get_image_info()
+    doc.close()
+    assert "CONFIDENTIAL" not in text
+    assert images == [], "an image was stamped with no watermark configured"
