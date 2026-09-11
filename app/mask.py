@@ -27,7 +27,7 @@ import re
 
 import fitz
 
-from . import pii
+from . import pii, residual
 
 #: Redaction fill. White, not black — the redacted region should read as blank
 #: space on the page rather than a censor bar.
@@ -390,10 +390,26 @@ def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
 #: still tells the reader exactly what was removed, and reads as a defect on
 #: the page. Matched on the whole word so a sentence beginning "Contact the
 #: site engineer" is untouched.
+#:
+#: A real label is written as several words -- "Alternate E-Mail ID :",
+#: "Personal Mob No." -- and _absorb_label walks them right to left, so all
+#: three kinds of word have to be listed or the walk stops early and strands
+#: what it did not reach. The reported defect was exactly that: "Email ID:"
+#: matched "Email" but not "ID", so absorption stopped at the colon and the
+#: masked page kept an "Email ID:" sitting over white space.
 _CONTACT_LABEL_RE = re.compile(
-    r"^(?:e[-\s]?mail|email|mail|phone|mobile|mob|cell(?:ular)?|tel(?:ephone)?|"
-    r"contact(?:\s*no)?|whats?app|ph|no)"
-    r"[\s.:\-–—#]*$",
+    # the contact channel
+    r"^(?:e[-\s]?mail|email|mail|e|phone|mobile|mob|cell(?:ular)?|"
+    r"tel(?:ephone)?|contact|whats?[\s-]?app|ph|landline|fax|skype|"
+    # the qualifier in front of it
+    r"alt(?:\.|ernat(?:e|ive))?|second(?:ary)?|primary|personal|official|"
+    r"office|work|home|res(?:idence|idential)?|permanent|current|"
+    r"name|candidate|applicant|"
+    # the trailing noun
+    r"id|ids|i\.?d\.?|address|addr|detail(?:s)?|info|no|nos|num(?:ber)?"
+    r")[\s.:\-–—#|()]*$"
+    # a separator stranded on its own between two label words ("E - Mail ID")
+    r"|^[\s.:\-–—#|/]+$",
     re.I,
 )
 
@@ -414,8 +430,10 @@ def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
     line_key = None
     # Labels come in runs: "Mob No.- 98765...", "Contact No :", "E-Mail ID:".
     # Taking only the nearest word left "Mob" standing on a real resume, so
-    # this walks leftwards while each next word is still a label.
-    for _ in range(3):
+    # this walks leftwards while each next word is still a label. Five steps,
+    # because "Alternate E - Mail ID :" is five words and stopping short of
+    # the start of a label run is what leaves half of it on the page.
+    for _ in range(5):
         candidates = [w for w in words
                       if w[2] <= grown.x0 + 1.0
                       and w[3] > grown.y0 and w[1] < grown.y1]
@@ -457,8 +475,12 @@ def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
         # A heading still matches, as "Will" or as "WILL".
         literal = [r for r in literal if _matches_case(r, words, s)]
     # Union, not either/or: a resume can print the name verbatim in one place
-    # and with an extra middle name in another, and both have to go.
-    return _dedupe_rects(literal + _name_rects(page, s, words))
+    # and with an extra middle name in another, and both have to go. The
+    # label goes too, for the same reason it does on a phone or an email: a
+    # "Candidate Name:" left standing over white space is the defect, not the
+    # fix.
+    return [_absorb_label(r, words)
+            for r in _dedupe_rects(literal + _name_rects(page, s, words))]
 
 
 def _matches_case(rect: fitz.Rect, words: list, needle: str) -> bool:
@@ -482,14 +504,26 @@ def _matches_case(rect: fitz.Rect, words: list, needle: str) -> bool:
 
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
                    watermark_png: bytes | None = None,
-                   watermark_text: str = "") -> tuple[bytes, int]:
+                   watermark_text: str = "",
+                   residual_sweep: bool = True) -> tuple[bytes, int]:
     """True-redact PII strings, then overlay watermark.
+
+    Two passes, in this order and for a reason. The first removes the values
+    it was handed -- the Contact record's name/phone/email. The second
+    (app/residual.py) then reads the page as it now stands and removes the
+    phone numbers and addresses still on it: the alternate mobile that only
+    ever existed in the resume body, and the address whose PDF word boxes
+    search_for() could not match. Running it second rather than merging the
+    two means it scores only what genuinely survived, so it cannot re-redact
+    a region the first pass already cleared.
 
     Args:
         pdf_bytes: Raw resume PDF bytes.
         mask_strings: Exact strings to redact (name, phone, email from parser).
         watermark_png: Client watermark image bytes (PNG/JPEG). Centered on every page.
         watermark_text: Fallback text watermark if no image provided.
+        residual_sweep: Run the second pass. Off only for measuring what the
+            first pass does on its own.
 
     Returns:
         (masked_pdf_bytes, redacted_region_count)
@@ -517,6 +551,25 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
 
         page.apply_redactions()
 
+        # --- second pass --------------------------------------------------
+        # Re-read the page: `words` above describes the page before
+        # redaction, and every rect from here has to be measured against
+        # what is actually left. Clipping and label absorption are the same
+        # ones the first pass uses, so a residual hit is redacted exactly
+        # like a Contact-record hit, label and all.
+        if residual_sweep:
+            left = page.get_text("words")
+            found = [_absorb_label(_clip_to_line(rect, key, left), left)
+                     for rect, key in residual.find_residual_rects(page, left)]
+            if found:
+                for rect in _bridge_separators(_dedupe_rects(found), left):
+                    page.add_redact_annot(rect, fill=REDACT_FILL)
+                    hits += 1
+                page.apply_redactions()
+            # The glyphs under a mailto: link are gone by now; the link's own
+            # URI still holds the address until this runs.
+            residual.scrub_links(page)
+
         # Watermark only when the client actually has one. No stand-in text:
         # a "CONFIDENTIAL" default was being stamped on every masked resume
         # for clients who had never configured a watermark at all.
@@ -524,6 +577,12 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
             _watermark_image(page, watermark)
         elif watermark_text:
             _watermark_text(page, watermark_text)
+
+    # Word writes the candidate's name into /Title and /Author from the
+    # original filename ("Rahul Sharma CV 2024.docx"), and it survives
+    # redaction untouched -- it is not on any page.
+    if residual_sweep:
+        residual.scrub_metadata(doc)
 
     out = doc.tobytes(garbage=4, deflate=True)
     doc.close()

@@ -45,7 +45,8 @@ under that client.
 | File | Purpose |
 |------|---------|
 | `app/jobs.py` | Redis-backed async batch queue. FIFO backlog (`mask:queue`), a global concurrency gate capped at `MASK_MAX_CONCURRENT` (default 20) as a crash-safe lease ZSET, and per-job progress. Drives `POST /mask/batch/async` + `GET /mask/jobs/{id}`. Inert without `REDIS_URL`. |
-| `app/pii.py` | PII detection & classification. Strict, precision-first phone detection (a digit run must carry positive evidence of being a phone), so employment date ranges, credential ids, ISO/IEEE/RFC numbers, versions, percentages and PIN codes are never reported as PII. |
+| `app/pii.py` | PII detection & classification. Strict, precision-first phone detection (a digit run must carry positive evidence of being a phone), so employment date ranges, credential ids, ISO/IEEE/RFC numbers, versions, percentages and PIN codes are never reported as PII. Also holds the **second-pass scanners** (`scan_phones`/`scan_emails`), which decide from the Indian numbering plan rather than from evidence: ten national digits starting 6-9 is a mobile, so `91 9812345678` and `09812345678` are caught without a label, while Aadhaar/UAN/account numbers and ten-digit magnitudes are not. |
+| `app/residual.py` | **Second pass.** Runs on each page *after* the first pass has applied its redactions, and removes the phone numbers and addresses still on it — the alternate mobile that exists only in the resume body, and the address whose PDF word boxes `search_for()` could never match. Also strips `mailto:`/`tel:` link annotations (whose URI survives redaction) and the `/Title` + `/Author` metadata Word fills from the original filename. |
 | `app/mask.py` | Masking core — PyMuPDF true-redact (white fill) + centered watermark. Per-kind matching: email exact, phone by digit-equivalence, name whole-word only. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
 | `app/docx_convert.py` | `.docx`/`.doc` → PDF via headless LibreOffice (`soffice`, installed in the Dockerfile) — real candidate resumes on this org are legacy Word attachments, not PDFs, so this runs before `app/mask.py` whenever the fetched resume isn't already a PDF. |
 | `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)` (checks modern Files + legacy Attachments, on the Job Applicant and its related Contact — returns `(bytes, extension)`), `upload_masked_pdf(id, bytes, filename)`. Creds from ENV or the Postgres-backed override (`register_default_credentials`). |
@@ -53,6 +54,8 @@ under that client.
 | `app/assets/watermark.png` | (Optional) company logo. If present, stamped centered; else a faint text watermark. |
 | `app/templates/`, `app/static/` | Jinja2 templates + CSS/JS for `GET /candidate/MaskProfileIndex` — the real Salesforce-embedded masking UI (driven by `MassMaskingController` Apex). |
 | `API.md` | Full endpoint + environment-variable reference, including the **current live Railway config** (today: only `DATABASE_URL` is set) and exactly what each endpoint does/doesn't do as a result. |
+| `tests/test_residual_sweep.py` | Second-pass trap tables (every Indian/international phone form that must be found, every identifier that must not; addresses including PDF-broken ones) + scored fixtures, reported with and without the sweep. |
+| `tests/verify_job_applicants.py` | READ-ONLY: masks a named Job Applicant's real resume in memory and reports what PII survived, as shapes. `python tests/verify_job_applicants.py JA-26753 JA-26708 JA-26631`. |
 | `tests/test_server.py` | `/mask`, `/mask/batch`, `/mask/inline` + `/health` with Salesforce mocked, PyMuPDF real. |
 | `tests/test_sf_client_multitenant.py` | Multi-client token registry, cache eviction, `with_session()` retry — network mocked. |
 | `Dockerfile`, `railway.json`, `Procfile` | Railway deploy. |
@@ -273,3 +276,14 @@ as blank or garbled text after DOCX→PDF conversion, even though the correct va
 structured and correct, on the Contact. `/mask/inline` has no Salesforce session, so it's regex-only —
 pass `mask_strings` explicitly there for full accuracy. Scanned image-only PDFs have no text layer →
 `/mask` returns a clear "needs OCR / route to manual" error.
+
+Whatever that produces, masking then runs a **second pass** over the redacted page (`app/residual.py`).
+The first pass can only remove values something upstream already knew about; the second reads the page
+as it now stands and removes any phone number or email address still on it. That is what catches an
+alternate mobile typed into the resume and nowhere else, a personal address alongside the work one, and
+an address whose PDF word boxes `page.search_for()` cannot match because the file kerned it apart.
+Phone decisions there come from the numbering plan rather than from formatting, so `91 9812345678`,
+`09812345678` and `0091 9876543210` are all recognised without a label, while Aadhaar, UAN, account
+numbers, timestamps and round magnitudes are not. Names are deliberately **not** swept for — there is
+no way to tell a candidate's name from any other capitalised words on a page, so a name still only ever
+comes from the Contact record.

@@ -313,6 +313,13 @@ PHONE_TRAPS = [
     ("Postal code 400001", []),
     ("IFSC HDFC0001234", []),
     ("Marks 456789 out of 500000", []),
+    # Ten digits, no label, no punctuation -- the shape a bare \d{10} waved
+    # through. Both were redacted out of live resumes as if they were phone
+    # numbers; neither is in the Indian mobile series (1-5 are landline area
+    # codes, and nothing starting 1 is a subscriber number).
+    ("Processed 1500000000 records in the pipeline", []),
+    ("Handled 1200000000 monthly page views", []),
+    ("Epoch timestamp 1609459200 recorded", []),
 ]
 
 

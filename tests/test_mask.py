@@ -81,16 +81,44 @@ def test_fallback_text():
     print(f"  [TEXT FALLBACK] OK — {hits} redactions, text watermark applied")
 
 
-def test_no_pii():
-    """No redactions needed — watermark still applied."""
+def test_no_mask_strings_still_sweeps_the_page():
+    """Nothing handed in, and the resume's own contact details still go.
+
+    This used to assert 0 redactions, which described the old behaviour
+    rather than the wanted one: the sample has a phone and an email printed
+    on it, and a masked copy that keeps them is a leak however little the
+    caller passed. The second pass reads the page itself, so an empty
+    mask_strings is no longer an instruction to hand the resume back intact.
+    """
     d = tempfile.mkdtemp()
     src = f"{d}/in.pdf"
     _make_sample(src)
     with open(src, "rb") as f:
         pdf_bytes = f.read()
     masked, hits = mask_pdf_bytes(pdf_bytes, [], watermark_text="TEST")
-    assert hits == 0
-    print(f"  [EMPTY] OK — 0 redactions, watermark applied")
+    txt = "".join(pg.get_text() for pg in fitz.open(stream=masked, filetype="pdf"))
+    assert hits >= 2
+    assert "98765" not in txt and "john.doe@example.com" not in txt
+    assert "Experience" in txt and "85%" in txt, "OVER-MASKED experience/marks"
+    print(f"  [SWEEP-ONLY] OK — {hits} redactions with no mask_strings at all")
+
+
+def test_page_with_no_pii_is_left_alone():
+    """A page that really has no contact details gets no redactions."""
+    doc = fitz.open()
+    doc.new_page().insert_text(
+        (72, 72),
+        "Experience: 5 years at Acme Corp\n"
+        "10th: 85%   12th: 88%\n"
+        "Credential ID 4821-9930-1177\n"
+        "Revenue grew 3400000 to 9100000 between 2020 and 2023",
+        fontsize=12)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    masked, hits = mask_pdf_bytes(pdf_bytes, [], watermark_text="TEST")
+    txt = "".join(pg.get_text() for pg in fitz.open(stream=masked, filetype="pdf"))
+    assert hits == 0, f"over-masked a page with no PII on it: {hits} regions"
+    assert "4821-9930-1177" in txt and "9100000" in txt
 
 
 def test_phone_format_mismatch():

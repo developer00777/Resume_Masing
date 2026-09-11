@@ -91,7 +91,12 @@ _PHONE_SHAPES = tuple(re.compile(p) for p in (
     r"\d{4}[ .\-]\d{3}[ .\-]\d{3}",           # 9876-543-210
     r"\d{4}[ .\-]\d{6}",                      # 0755-123456   (IN landline)
     r"0\d{2}[ .\-]\d{4}[ .\-]\d{4}",          # 022-2345-6789
-    r"\d{10}",                                # 9876543210
+    # An unpunctuated, unlabelled ten-digit run, constrained to the Indian
+    # mobile series. It used to be a bare \d{10}, which also accepts
+    # "Processed 1500000000 records" and "Handled 1200000000 users" -- both
+    # of which were being redacted out of real resumes. See is_indian_mobile()
+    # below; the second pass applies the same rule, so the two agree.
+    r"[6-9]\d{9}",                            # 9876543210
 ))
 
 #: A phone label sitting flush against the number (anchored with $). Checked
@@ -125,8 +130,12 @@ _ID_LABEL_RE = re.compile(
     r"acc(?:ount|t)?|ifsc|swift|iban|routing|"
     r"employee|emp|staff|student|matric|"
     r"score|rank|marks|salary|ctc|package|budget|revenue|"
-    r"ver(?:sion)?|v|build|release|sku|part|model|serial)"
-    r"[ \t]*(?:no\.?|num(?:ber)?|#)?[ \t]*[:\-|" + EN_DASH + EM_DASH + r"]?[ \t]*$",
+    r"ver(?:sion)?|v|build|release|sku|part|model|serial|code)"
+    # "Employee Code 9876543210" reads as a mobile number the moment you stop
+    # reading the label, so "code" belongs in the trailing noun group as well
+    # as in the list above -- it is how HR systems name an id.
+    r"[ \t]*(?:no\.?|num(?:ber)?|code|id|#)?[ \t]*"
+    r"[:\-|" + EN_DASH + EM_DASH + r"]?[ \t]*$",
     re.I,
 )
 
@@ -340,3 +349,338 @@ def phone_digits_equivalent(a: str, b: str) -> bool:
     # national number stops a 7-8 digit local number from matching the tail of
     # an arbitrary longer run.
     return len(short) >= 10
+
+
+# =========================================================================
+# SECOND PASS -- residual sweep
+# =========================================================================
+# Everything above answers "is this string, which somebody handed us, PII?".
+# Everything below answers a different question: once the values we were
+# *told* about have been removed from the page, what PII is still sitting
+# there?
+#
+# That is a strictly harder problem and it needs its own rules, because the
+# values that leaked in production share one property -- no upstream system
+# ever knew about them:
+#
+#     an alternate mobile typed into the resume body and nowhere else
+#     a personal address next to the work one on the Contact record
+#     "91 9876543210" and "09876543210" -- real numbers the first-pass
+#         detector rejects, because neither matches a shape in _PHONE_SHAPES
+#         and neither starts with "+"
+#
+# So this pass does not reuse the first pass's evidence rules. It replaces
+# them with the actual numbering plan. India's NNP fixes every subscriber
+# number at ten digits and reserves the 6/7/8/9 series for mobiles, which
+# means a ten-digit run starting 6-9 *is* a mobile -- no label, no
+# punctuation and no country code required. That one fact is what lets this
+# pass be simultaneously more aggressive and more precise than the first: a
+# bare \d{10} (which _PHONE_SHAPES accepts) also matches a unix timestamp, a
+# ten-digit order id and a ten-figure revenue number, and [6-9]\d{9} matches
+# none of them.
+#
+# Recall is bought from the numbering plan, not by loosening the guards --
+# every reject rule the first pass applies is applied here too.
+
+#: India's national significant number is exactly this long, always.
+NSN_LEN = 10
+
+#: The mobile series. Landline area codes live in 1-5; 6-9 are mobile only.
+MOBILE_FIRST_DIGITS = frozenset("6789")
+
+#: How the country code and/or trunk prefix get written in front of those ten
+#: digits. Longest first, so "0091..." is not read as trunk "0" + 13 digits.
+_IN_PREFIXES = ("0091", "091", "91", "0")
+
+
+def india_nsn(d: str) -> str | None:
+    """The ten-digit Indian national number inside digit-string `d`, or None.
+
+    Accepts it bare, with the country code (91), with the trunk prefix (0),
+    or with both -- between them those cover every way the reported resumes
+    wrote it. Anything that is not exactly ten digits after a recognised
+    prefix is not an Indian number and gets None, which is what keeps
+    12-digit Aadhaar/UAN numbers and 11-16 digit account numbers out: none of
+    them reduce to ten.
+    """
+    for p in _IN_PREFIXES:
+        if len(d) == NSN_LEN + len(p) and d.startswith(p):
+            return d[len(p):]
+    return d if len(d) == NSN_LEN else None
+
+
+def is_indian_mobile(d: str) -> bool:
+    """Does digit-string `d` denote an Indian mobile number?
+
+    The whole second pass rests on this predicate, so it is deliberately the
+    narrowest true statement available: ten national digits, the first of
+    them in the mobile series.
+    """
+    nsn = india_nsn(d)
+    return nsn is not None and nsn[0] in MOBILE_FIRST_DIGITS
+
+
+#: Layouts that are a dialable number anywhere in the world and that nothing
+#: else on a resume is written as. Note what is *not* here, unlike
+#: _PHONE_SHAPES: a bare \d{10}, and a bare \d{5} \d{5}. In this pass a run
+#: carrying neither a country code nor a label is accepted only when the
+#: numbering plan vouches for it.
+_RESIDUAL_SHAPES = tuple(re.compile(p) for p in (
+    r"\(\d{3}\)[ .\-]?\d{3}[ .\-]?\d{4}",     # (415) 555-0132
+    r"\d{3}[ .\-]\d{3}[ .\-]\d{4}",           # 555-123-4567
+    r"0\d{2}[ .\-]\d{4}[ .\-]\d{4}",          # 022-2345-6789
+    r"0\d{1,4}[ .\-]\d{6,8}",                 # 011-23456789, 0755-123456
+))
+
+#: dd-mm-yyyy and friends. Slash-separated dates never survive harvesting (a
+#: "/" is not phone punctuation, so it splits the run), but dashed ones do.
+_DATE_RUN_RE = re.compile(
+    r"^\d{1,2}[ ]?[.\-" + EN_DASH + EM_DASH + r"][ ]?"
+    r"\d{1,2}[ ]?[.\-" + EN_DASH + EM_DASH + r"][ ]?\d{2,4}$"
+)
+
+#: A generous run of phone punctuation bounded by digits. It only decides
+#: where to look; every window inside it is then validated. "/" and "," are
+#: excluded on purpose -- they are what separates 06/2016 from 05/2019 and
+#: what groups 2,500,000, and excluding them splits both into fragments too
+#: short to be a number at all.
+_RESIDUAL_RUN_RE = re.compile(
+    r"[(+]{0,2}\d[\d \t()+.\-" + EN_DASH + EM_DASH + r"]*\d"
+)
+
+
+def _residual_phone_ok(cand: str, start: int, end: int, text: str) -> bool:
+    """Is `text[start:end]` (which is `cand`) a phone number?
+
+    The reject layer runs first and is inherited wholesale from the first
+    pass: date ranges, uniform 4-digit id groups, decimals and id labels are
+    exactly as unwelcome here. Only then does the numbering plan get a vote.
+    """
+    d = digits(cand)
+    if not (MIN_PHONE_DIGITS <= len(d) <= MAX_PHONE_DIGITS):
+        return False
+
+    groups = _DIGITS_RE.findall(cand)
+    line_start = text.rfind("\n", 0, start) + 1
+    pre = text[line_start:start]
+
+    # --- reject layer -----------------------------------------------------
+    if sum(1 for g in groups if _year_like(g)) >= 2:
+        return False                       # "2019 - 2023"
+    if len(groups) >= 3 and all(len(g) == 4 for g in groups):
+        return False                       # "4821-9930-1177", Aadhaar
+    if "." in cand and not all(len(g) in (3, 4) for g in groups):
+        return False                       # "8.94/10.0", "2.7.1", "802.11ac"
+    if _DATE_RUN_RE.match(cand.strip()):
+        return False
+    if (len(groups) == 1 and len(d) == NSN_LEN and d.endswith("000000")
+            and not _PHONE_LABEL_RE.search(pre)):
+        # The one shape that is ten digits, starts 6-9, and is not a phone: a
+        # round magnitude written without separators. "9500000000 in annual
+        # revenue" is 9.5 billion; a subscriber number with six trailing
+        # zeros is not something the series ever allocates.
+        return False
+
+    if text[end:end + 1].isalpha():
+        return False                       # glued suffix: "9876543 B2"
+
+    if _ID_LABEL_RE.search(pre):
+        return False                       # "Employee No 9876543210"
+    if start > line_start and text[start - 1].isalpha() \
+            and not _PHONE_LABEL_RE.search(pre):
+        # Glued to a word. "Mobile9876543210" is a number whose space the PDF
+        # lost; "HDFC0001234" is an IFSC code. The label is what separates them.
+        return False
+
+    # --- positive evidence ------------------------------------------------
+    if is_indian_mobile(d):
+        return True
+    lead = cand.lstrip()
+    if lead.startswith(("+", "(+")) or d.startswith("00"):
+        return len(d) >= 8                 # written for international dialling
+    if _PHONE_LABEL_RE.search(pre):
+        return True                        # "Alt. Mobile - 22 2345 6789"
+    nsn = india_nsn(d)
+    if nsn is not None and len(d) > NSN_LEN and nsn[0] != "0" and len(groups) >= 2:
+        return True                        # "91 22 2345 6789", "0120-2345678"
+    return any(r.fullmatch(cand.strip()) for r in _RESIDUAL_SHAPES)
+
+
+def scan_phones(text: str) -> list[tuple[int, int]]:
+    """Spans of `text` holding a phone number, left to right, non-overlapping.
+
+    One harvested run can hold more than one number -- "9876543210 9123456789"
+    is 20 digits and therefore no number at all -- so each run is walked as
+    digit groups and the LONGEST valid window starting at each group wins.
+    Longest-first is what makes that safe: for "+91 98765 43210" the 7-digit
+    prefix "+91 98765" is also internationally plausible, and taking it would
+    redact half the number and leave the other half on the page.
+    """
+    out: list[tuple[int, int]] = []
+    for run_m in _RESIDUAL_RUN_RE.finditer(text):
+        run, base = run_m.group(0), run_m.start()
+        # An id label applies to the whole run, not only to the digits
+        # touching it: in "Credential ID 4821 9876543210" the second group
+        # reads as a perfect mobile number once you stop looking at the label,
+        # and it is not one. Testing per-window would clear the run as a whole
+        # and then accept its tail.
+        line_start = text.rfind("\n", 0, base) + 1
+        if _ID_LABEL_RE.search(text[line_start:base]):
+            continue
+        groups = [(m.start(), m.end()) for m in _DIGITS_RE.finditer(run)]
+        i = 0
+        while i < len(groups):
+            taken = None
+            for j in range(len(groups) - 1, i - 1, -1):
+                # From the first group the window starts at the run start, so
+                # a leading "+" or "(" belongs to it -- without the "(",
+                # "(415) 555-0132" presents as "415) 555-0132" and matches no
+                # shape at all.
+                s = 0 if i == 0 else groups[i][0]
+                e = groups[j][1]
+                if len(digits(run[s:e])) > MAX_PHONE_DIGITS:
+                    continue
+                if _residual_phone_ok(run[s:e], base + s, base + e, text):
+                    taken = (base + s, base + e, j)
+                    break
+            if taken is None:
+                i += 1
+            else:
+                out.append((taken[0], taken[1]))
+                i = taken[2] + 1
+    return out
+
+
+# --- residual email -------------------------------------------------------
+# EMAIL_RE above is the right shape test for clean text. It is not enough
+# here, because the second pass reads text reconstructed from the PDF's own
+# word boxes, and a PDF is free to break one address into several of them:
+# kerning around "@" and "." is the usual cause, and a resume whose address
+# extracted as "rahul.sharma@ gmail.com" is a resume whose email
+# page.search_for() could never find -- which is one of the two ways an
+# address survived masking in production.
+#
+# So harvesting tolerates whitespace, and the whitespace is paid for by a
+# stricter TLD rule: an address that had to be stitched back together must
+# end in a TLD we actually recognise. Without that, "...@acme. Then we
+# shipped" reads as an address in the TLD "Then".
+
+#: Mail providers seen on Indian candidate resumes. Not a filter -- a company
+#: or university address is just as much PII -- but a positive signal used
+#: when an address had to be reassembled from a badly-broken extraction.
+FREEMAIL_DOMAINS = frozenset("""
+gmail.com googlemail.com yahoo.com yahoo.co.in yahoo.in ymail.com rocketmail.com
+hotmail.com outlook.com live.com msn.com rediffmail.com rediff.com
+icloud.com me.com protonmail.com proton.me zoho.com zohomail.in aol.com
+gmx.com mail.com yandex.com inbox.com fastmail.com tutanota.com
+""".split())
+
+#: TLDs accepted for an address that contains whitespace. Covers the generic
+#: and Indian second-levels a candidate's address actually ends in.
+_KNOWN_TLDS = frozenset("""
+com net org edu gov mil int in co io ai me us uk ca au nz de fr nl es it se ch
+jp cn sg ae sa qa om kw bh my ph id th vn hk tw kr ru br za ng ke
+info biz name pro mobi xyz online site tech dev app live cloud email
+""".split())
+
+#: What an "address" ending in one of these really is: a file name
+#: ("logo@2x.png") or a pinned package ("bootstrap@5.min.css"). A version
+#: pin like "react@18.2.0" is already rejected -- its TLD is not alphabetic.
+_NON_EMAIL_TLDS = frozenset("""
+png jpg jpeg gif svg webp bmp ico pdf doc docx xls xlsx ppt pptx zip rar tar gz
+exe dll html htm js jsx css scss json xml csv txt yml yaml
+""".split())
+
+#: "(at)" / "[dot]" obfuscation. Cheap to support and it costs no precision,
+#: because the surrounding pattern still has to produce a real TLD.
+_AT_TOKEN_RE = re.compile(r"[ \t]*(?:@|[(\[]\s*at\s*[)\]])[ \t]*", re.I)
+_DOT_TOKEN_RE = re.compile(r"[ \t]*(?:\.|[(\[]\s*dot\s*[)\]])[ \t]*", re.I)
+
+#: The local part, allowing the whitespace a PDF injects around a dot but
+#: NOT plain spaces -- "Contact me at rahul . sharma@x.com" must yield
+#: "rahul . sharma@x.com" and not swallow "Contact me at". Each alternative
+#: requires a literal space, so it cannot overlap the base character class,
+#: which is what stops this nesting from backtracking catastrophically.
+_LOCAL = (r"[A-Za-z0-9._%+\-]+"
+          r"(?:[ \t]+\.[ \t]*[A-Za-z0-9._%+\-]+"
+          r"|[ \t]*\.[ \t]+[A-Za-z0-9._%+\-]+){0,4}")
+
+_SCAN_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])"
+    r"(" + _LOCAL + r")"
+    r"[ \t]*(?:@|[(\[]\s*at\s*[)\]])[ \t]*"
+    r"([A-Za-z0-9\-]+(?:[ \t]*(?:\.|[(\[]\s*dot\s*[)\]])[ \t]*[A-Za-z0-9\-]+){1,5})"
+    r"(?![A-Za-z0-9\-])",
+    re.I,
+)
+
+
+def normalize_email(raw: str) -> str | None:
+    """`raw` as a canonical address, or None if it is not one.
+
+    Undoes both things the harvest tolerates -- the injected whitespace and
+    the (at)/(dot) obfuscation -- and then applies the checks that decide
+    whether what is left is an address at all.
+    """
+    s = _DOT_TOKEN_RE.sub(".", _AT_TOKEN_RE.sub("@", raw))
+    s = re.sub(r"[ \t]+", "", s)
+    if s.count("@") != 1:
+        return None
+    local, domain = s.split("@")
+    labels = domain.split(".")
+    if not local or len(labels) < 2 or not all(labels):
+        return None
+    tld = labels[-1].lower()
+    if not tld.isalpha() or not (2 <= len(tld) <= 24):
+        return None
+    if tld in _NON_EMAIL_TLDS:
+        return None                        # "logo@2x.png"
+    if any(c.isspace() for c in raw) and tld not in _KNOWN_TLDS:
+        return None                        # "...@acme. Then we shipped"
+    return s
+
+
+def scan_emails(text: str) -> list[tuple[int, int]]:
+    """Spans of `text` holding an email address.
+
+    Both shapes are harvested -- the strict one and the whitespace-tolerant
+    one -- and where they disagree about the same address, the candidate that
+    starts EARLIER wins, and at the same start the SHORTER one wins. That
+    single ordering settles both of the ways they can disagree:
+
+        "rahul . sharma@x.com"   strict finds "sharma@x.com" (starts later);
+                                 the loose match starts earlier and takes it,
+                                 recovering the local part the PDF broke up
+        "rahul@x.com. Net sales" strict finds "rahul@x.com" (same start,
+                                 shorter); the loose match has reached past a
+                                 complete address into the next sentence, and
+                                 loses
+
+    Redacting the first as "sharma@x.com" would leave "rahul ." on the page;
+    redacting the second as the loose match would blank a real word.
+    """
+    seen: set[tuple[int, int]] = set()
+    for regex in (EMAIL_RE, _SCAN_EMAIL_RE):
+        for m in regex.finditer(text):
+            if normalize_email(m.group(0)):
+                seen.add((m.start(), m.end()))
+
+    out: list[tuple[int, int]] = []
+    for start, end in sorted(seen, key=lambda se: (se[0], se[1] - se[0])):
+        if not any(s < end and start < e for s, e in out):
+            out.append((start, end))
+    return out
+
+
+def scan_residual(text: str) -> list[tuple[int, int, str]]:
+    """Every (start, end, kind) in `text` the second pass wants redacted.
+
+    Emails win any overlap: "9876543210@example.com" is one address, not an
+    address next to a mobile number, and redacting it as two regions would
+    report two hits for one value.
+    """
+    spans = [(s, e, EMAIL) for s, e in scan_emails(text)]
+    for s, e in scan_phones(text):
+        if not any(a < e and s < b for a, b, _ in spans):
+            spans.append((s, e, PHONE))
+    return sorted(spans)
