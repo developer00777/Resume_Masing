@@ -20,13 +20,23 @@ It prints SHAPES, never values: "9999999999" for a number, "aaaaa.aaaaa@aaaaa.aa
 for an address. A verification run that pastes candidate PII into a terminal
 transcript or a CI log has created a second leak to fix.
 
-Run:
+Run, against the org:
     python tests/verify_job_applicants.py JA-26753 JA-26708 JA-26631
     python tests/verify_job_applicants.py a0X...  a0X...        (record Ids)
 
 Credentials come from the environment or a local .env (which .gitignore
 already excludes) -- the same ones tests/diagnose_contact_pii.py uses. Do not
 pass them on the command line; a shell history is not a secret store.
+
+Or offline, against files, with no credentials at all:
+    python tests/verify_job_applicants.py ./resumes/JA-26753.docx ...
+
+Any argument that is a path to an existing file is masked from disk instead
+of being looked up. That mode cannot use the Contact record -- there isn't
+one -- so it masks from the resume's own text alone, which is the HARDER of
+the two cases and the one the second pass exists for. A file that comes back
+clean here is clean in production too; the reverse is not guaranteed, since
+production also has the Contact's name to work from.
 """
 from __future__ import annotations
 
@@ -157,18 +167,67 @@ def verify(ref: str, sf) -> bool:
     return not any(after.values())
 
 
+def verify_file(path: Path) -> bool:
+    """Mask a resume from disk and report what survived. No Salesforce."""
+    from app import docx_convert, mask
+    from app.server import detect_pii
+
+    print(f"\n=== {path.name} ===")
+    data = path.read_bytes()
+    ext = path.suffix.lower().lstrip(".")
+    print(f"  resume: {ext}, {len(data)} bytes")
+    if ext != "pdf":
+        try:
+            data = docx_convert.docx_bytes_to_pdf_bytes(data)
+        except Exception as e:
+            print(f"  ! {ext} -> pdf conversion failed (needs LibreOffice): {e}")
+            return False
+
+    # No Contact record off disk, so this is the resume-text-only path.
+    mask_strings = detect_pii(data)
+    print(f"  mask_strings: {len(mask_strings)} (resume text only, no Contact record)")
+
+    both, hits = mask.mask_pdf_bytes(data, mask_strings, watermark_text="")
+    first, first_hits = mask.mask_pdf_bytes(data, mask_strings, watermark_text="",
+                                            residual_sweep=False)
+    print(f"  redacted regions: {first_hits} (first pass) -> {hits} (both)")
+
+    before, after = _residual_report(first), _residual_report(both)
+    for where in ("text", "links", "metadata"):
+        closed = len(before[where]) - len(after[where])
+        if after[where]:
+            print(f"  LEAK in {where}: {after[where]}")
+        elif closed:
+            print(f"  {where}: {closed} closed by the second pass, none left")
+        else:
+            print(f"  {where}: clean")
+    return not any(after.values())
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(__doc__)
         return 2
     load_dotenv()
-    from app import sf_client
-    if not sf_client.creds_configured():
-        print("Salesforce credentials are not configured "
-              "(SF_USERNAME / SF_PASSWORD / SF_SECURITY_TOKEN).")
-        return 2
-    sf = sf_client.connect()
-    ok = [verify(ref, sf) for ref in argv]
+
+    files = [Path(a) for a in argv if Path(a).is_file()]
+    refs = [a for a in argv if not Path(a).is_file()]
+
+    ok: list[bool] = [verify_file(p) for p in files]
+    if refs:
+        from app import sf_client
+        if not sf_client.creds_configured():
+            print("\nSalesforce credentials are not configured "
+                  "(SF_USERNAME / SF_PASSWORD / SF_SECURITY_TOKEN).")
+            print("SF_SECURITY_TOKEN is the 24-character token from "
+                  "Setup > Reset My Security Token -- NOT the short "
+                  "verification code Salesforce emails at UI login.")
+            print("To check these without any credentials, download the "
+                  "resumes and pass their paths instead.")
+            return 2
+        sf = sf_client.connect()
+        ok += [verify(ref, sf) for ref in refs]
+
     print(f"\n{sum(ok)}/{len(ok)} clean")
     return 0 if all(ok) else 1
 
