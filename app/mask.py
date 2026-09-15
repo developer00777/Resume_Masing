@@ -634,16 +634,33 @@ _GLUED_LABEL_RE = re.compile(
     re.I,
 )
 
-#: Widest gap, in points, between a contact label and the value it labels.
-#: Generous, because the guards that matter here are structural rather than
-#: metric: the label has to be the NEAREST word on that side (so everything
-#: between it and the value is whitespace) and it has to sit in the same text
-#: block (so a two-column layout cannot donate its left column to the right).
-#: The old 12pt assumed a label typed up against its value; on real resumes
-#: the contact block is tab-aligned, and both reported labels sat outside it
-#: -- "Email" 20.5pt from its address on JA-26708, "Name :" 38.8pt from its
-#: value on JA-26631 -- so both stayed on the masked page.
+#: Widest gap, in points, between a contact label and the value it labels when
+#: the two sit in the same text block. Generous, because the guards that
+#: matter here are structural rather than metric: the label has to be the
+#: NEAREST word on that side, so everything between it and the value is
+#: whitespace. The old 12pt assumed a label typed up against its value; on
+#: real resumes the contact block is tab-aligned, and both reported labels sat
+#: outside it -- "Email" 20.5pt from its address on JA-26708, "Name :" 38.8pt
+#: from its value on JA-26631 -- so both stayed on the masked page.
 _LABEL_MAX_GAP = 150.0
+
+#: And how far a label may sit when it is in a text BLOCK of its own, which is
+#: how a two-column table extracts: "Name" and ":" and "PRAHLAD KUMAR" are
+#: three blocks on one row (JA-26566, JA-26563), 168pt apart.
+#:
+#: Reaching that far needs evidence, because at that distance the nearest word
+#: to the left is just as likely to be a sidebar heading -- JA-26576 prints
+#: "CONTACT" in the left margin, in the same style as "OBJECTIVE" and
+#: "EDUCATION", level with the candidate's name in the next column. Taking it
+#: would strip a section heading off the address still standing underneath it.
+#:
+#: The evidence is the separator. A field label is bound to its value by the
+#: ":" or "-" facing it -- written as its own word box ("Name" ":" value) or
+#: glued to the label ("MOBILE:-" on JA-26586, 22pt from its number and a
+#: block away) -- and the walk needs one before it may leave the value's own
+#: block or the gap above. A heading has no such tie: nothing separates
+#: "CONTACT" from the name beside it but white space.
+_LABEL_FAR_GAP = 220.0
 
 #: How many words a label may run to. "Alternate E - Mail ID :" is five, and
 #: stopping short of the start of a label run is what leaves half of it on the
@@ -665,11 +682,14 @@ def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
                  forward: bool) -> float | None:
     """How far `rect` may grow along `row` before it stops meeting labels.
 
-    Returns the x to grow to, or None to grow no further. The walk stops at
-    the first word that is not part of a label, and then has to decide whether
-    what it absorbed really was one. The tell is what stopped it: a field
-    label is bounded by the edge of its line, by another field's value, or by
-    a gap -- never by lowercase prose. That single test is what keeps
+    Returns the x to grow to, or None to grow no further.
+
+    Two decisions, in order. How far it may REACH: freely within the value's
+    own text block, and beyond it only once a separator has tied a label to
+    the value (_LABEL_FAR_GAP). And, once it stops, whether what it absorbed
+    really was a label -- the tell there is what stopped it. A field label is
+    bounded by the edge of its line, by another field's value, or by a gap;
+    never by lowercase prose. That single test is what keeps
 
         In case of any problem, please contact at: help@example.org
 
@@ -681,11 +701,10 @@ def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
     """
     edge = rect.x1 if forward else rect.x0
     absorbed: list[tuple[list, bool]] = []
+    tied = False                           # a ":" or "-" crossed so far
     for _ in range(_LABEL_MAX_WORDS):
         nearest = None
         for w in row:
-            if block is not None and w[5] != block:
-                continue
             if forward and w[0] >= edge - 1.0:
                 if nearest is None or w[0] < nearest[0]:
                     nearest = w
@@ -695,11 +714,23 @@ def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
         if nearest is None:
             break                          # the edge of the row: nothing to stop us
         gap = nearest[0] - edge if forward else edge - nearest[2]
-        if gap > _LABEL_MAX_GAP:
+        if gap > _LABEL_FAR_GAP:
             break                          # too far away to be this value's label
         text = nearest[4].strip()
+        # The ":" or "-" that binds a field label to its value, on the face
+        # this word turns towards it -- whether written as its own word box
+        # ("Name" ":" value) or glued to the label ("MOBILE:-"). A section
+        # heading has no such tie; that is the whole of the difference.
+        facing = text[-1:] if not forward else text[:1]
+        separator = bool(facing) and not facing.isalnum()
+        if not (tied or separator) and (gap > _LABEL_MAX_GAP
+                                        or (block is not None
+                                            and nearest[5] != block)):
+            break                          # out of reach, and nothing ties it to
+                                           # the value -- see _LABEL_FAR_GAP
         if _CONTACT_LABEL_RE.match(text):
             absorbed.append((nearest, False))
+            tied = tied or separator
         elif absorbed and _LABEL_CONNECTOR_RE.match(text):
             absorbed.append((nearest, True))
         elif text[:1].islower():

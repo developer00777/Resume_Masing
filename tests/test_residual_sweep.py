@@ -643,6 +643,80 @@ def test_profile_link_spelling_out_the_name_is_redacted():
     assert "example.com/projects/safety-audit" in stripped
 
 
+def test_tab_aligned_label_past_the_gap_is_absorbed_when_a_colon_ties_it():
+    """A two-column table tab-aligns the label 170pt from its value.
+
+    Found by sweeping the org: JA-26566 and JA-26563 masked the value and left
+    "Name" standing on the row, because absorption gave up at the gap. What
+    licenses the extra reach is the separator between them -- the ":" that
+    binds a field label to its value.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    for y, label, value in ((100, "Name", "PRAHLAD KUMAR"),
+                            (130, "Profession", "Surveyor")):
+        page.insert_text((33, y), label, fontsize=10)
+        page.insert_text((231, y), ":", fontsize=10)
+        page.insert_text((295, y), value, fontsize=10)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, ["Prahlad Kumar"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    stripped = _norm(text)
+    assert "PRAHLAD" not in stripped and "KUMAR" not in stripped
+    assert "Name" not in stripped, f"table label left standing: {text!r}"
+    # The row below is not a contact detail: it keeps its label and its value.
+    assert "Profession" in text and "Surveyor" in text
+
+
+def test_a_label_in_another_block_needs_a_separator_to_reach_the_value():
+    """Two layouts that measure alike and must be treated differently.
+
+    A real table puts the label, the colon and the value in three separate
+    text blocks (JA-26563). So does a sidebar heading standing level with the
+    next column's content -- JA-26576 prints "CONTACT" in the left margin, in
+    the same style as "OBJECTIVE" and "EDUCATION" below it, with the
+    candidate's name beside it. Taking that one would strip the heading off
+    the address still standing underneath.
+
+    Only the separator tells them apart, and PyMuPDF merges same-row
+    insert_text() calls into a single block, so the distinction can only be
+    pinned by handing the rules the word layout directly.
+    """
+    y0, y1 = 100.0, 112.0
+
+    def word(x0, x1, s, block):
+        return (x0, y0, x1, y1, s, block, 0, 0)
+
+    # "NAME" : "PRAHLAD KUMAR", each part in a block of its own. The colon
+    # ties the label to the value, so absorption may cross to it.
+    layout = mask._Layout([word(29.5, 63.4, "NAME", 2),
+                           word(206.5, 209.7, ":", 4),
+                           word(211.8, 256.7, "PRAHLAD", 4),
+                           word(260.0, 323.4, "KUMAR", 4)])
+    grown = mask._absorb_labels(fitz.Rect(211.8, y0, 323.4, y1), layout)
+    assert grown.x0 <= 29.5, f"the tied label was not absorbed: {grown}"
+
+    # The tie does not have to be a word of its own. JA-26586 writes it into
+    # the label -- "MOBILE:-" one block, the number the next, 22pt apart --
+    # and requiring a separate ":" left both that and "EMAIL:" on the page.
+    layout = mask._Layout([word(73.5, 117.2, "MOBILE:-", 1),
+                           word(139.0, 210.1, "+919876543210", 15)])
+    grown = mask._absorb_labels(fitz.Rect(139.0, y0, 210.1, y1), layout)
+    assert grown.x0 <= 73.5, f"the glued tie was not honoured: {grown}"
+
+    # The same geometry with nothing between the two: a heading, not a label.
+    layout = mask._Layout([word(28.5, 98.3, "CONTACT", 0),
+                           word(171.0, 288.0, "MR.SANJAY", 7),
+                           word(293.3, 366.7, "KUMAR", 7),
+                           word(372.0, 433.2, "PATEL", 7)])
+    grown = mask._absorb_labels(fitz.Rect(171.0, y0, 433.2, y1), layout)
+    assert grown.x0 >= 170.5, f"a section heading was absorbed: {grown}"
+
+
 def test_email_split_across_word_boxes_is_masked():
     """An address the PDF kerned apart cannot be found by search_for().
 
