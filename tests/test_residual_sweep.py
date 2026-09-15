@@ -722,6 +722,84 @@ def test_a_label_in_another_block_needs_a_separator_to_reach_the_value():
     assert grown.x0 >= 170.5, f"a section heading was absorbed: {grown}"
 
 
+def test_a_drawn_separator_is_covered_but_the_next_field_is_not():
+    """Not everything on a contact row is text.
+
+    JA-26753 sets its header as "... | Work permit: ... | Phone number: <v> |"
+    and paints those bars as vector art with no Unicode mapping, so
+    page.get_text() never reports them and label absorption -- which works on
+    words -- cannot reach one. Redacting the phone left its trailing "|"
+    hanging in the white space: the reported "special character around the
+    masked data".
+
+    Each field's paint box runs from its text to just past its bar, so the
+    redaction already covers nearly all of it and only the last few points are
+    outstanding. Measured off the real page.
+    """
+    y0, y1 = 74.59, 88.16
+    layout = mask._Layout([], [
+        fitz.Rect(220.90, 76.39, 291.85, 86.37),   # "Gender: Male" and its bar
+        fitz.Rect(378.65, 76.39, 507.93, 86.37),   # the phone field and its bar
+    ])
+    rect = fitz.Rect(299.46, y0, 501.27, y1)       # the phone, label and all
+    grown = mask._absorb_marks(rect, layout)
+    assert grown.x1 >= 507.93, f"the drawn separator was left behind: {grown}"
+    assert grown.x0 == rect.x0, f"reached back into the previous field: {grown}"
+
+
+def test_a_table_border_beside_a_redaction_is_left_alone():
+    """The reason a mark is only ever finished, never reached for.
+
+    A table's cell border is also a thin mark sitting beside a redacted value
+    (JA-26355, JA-26708). What separates it from a field's own bar is that it
+    runs PAST the row: the bar is contained in the value's line, the border
+    spans the whole cell.
+    """
+    layout = mask._Layout([], [fitz.Rect(302.2, 206.2, 302.2, 239.2)])
+    rect = fitz.Rect(312.0, 212.0, 420.0, 226.0)
+    assert mask._absorb_marks(rect, layout) == rect, "a table border was eaten"
+
+    # Nor is a section rule running the width of the page.
+    layout = mask._Layout([], [fitz.Rect(28.3, 353.4, 581.1, 354.9)])
+    rect = fitz.Rect(115.8, 348.0, 300.0, 360.0)
+    assert mask._absorb_marks(rect, layout) == rect, "a section rule was eaten"
+
+
+def test_the_field_after_the_value_is_not_read_as_prose():
+    """"Contact no:-9876543210" is the next field, not a sentence.
+
+    The walk rejects a run when lowercase prose stopped it, which is what
+    keeps "please contact at:" intact. JA-26214 sets an address and a phone on
+    one row, and the address -- lowercase, so prose by that test -- made the
+    walk discard the "Contact" label it had just correctly absorbed. Digits
+    are what rule a sentence out.
+    """
+    text, _ = _masked_text(
+        ["rahul1234@example.com    Contact no:-9876543210",
+         "Acme Corp   2019 - 2023"],
+        ["rahul1234@example.com", "9876543210"])
+    stripped = _norm(text)
+    assert "rahul1234" not in stripped and "9876543210" not in stripped
+    assert "Contact" not in stripped, f"label left standing: {text!r}"
+    assert "2019-2023" in stripped
+
+
+def test_punctuation_glued_after_the_value_goes_with_it():
+    """"rahul@example.com." is one word box ending in a full stop.
+
+    search_for() matches only the address, so the redaction stops one
+    character short and JA-26136 kept a "." floating on its own.
+    """
+    text, _ = _masked_text(
+        ["E- Mail: rahul@example.com.",
+         "Acme Corp   2019 - 2023"],
+        ["rahul@example.com"])
+    stripped = _norm(text)
+    assert "rahul" not in stripped and "E-Mail:" not in stripped
+    assert "." not in stripped, f"stranded punctuation left: {text!r}"
+    assert "2019-2023" in stripped
+
+
 def test_email_split_across_word_boxes_is_masked():
     """An address the PDF kerned apart cannot be found by search_for().
 

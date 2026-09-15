@@ -56,6 +56,27 @@ def _digits(s: str) -> str:
     return pii.digits(s)
 
 
+#: A mark covering this much of the page is a background panel or a full-page
+#: frame, never a separator. Skipped so the coverage test below is never asked
+#: about something a redaction could not meaningfully cover anyway.
+_PAGE_MARK_RATIO = 0.25
+
+
+def _mark_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """The page's vector art as bare rects, background panels dropped.
+
+    Read once per page, like the word layout. Never fatal: a page whose
+    content stream will not parse still has to be masked, and decoration is
+    the least of what is at stake there.
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+    limit = page.rect.get_area() * _PAGE_MARK_RATIO
+    return [d["rect"] for d in drawings if d["rect"].get_area() < limit]
+
+
 # --- page layout ----------------------------------------------------------
 
 class _Layout:
@@ -76,12 +97,17 @@ class _Layout:
                    different text lines while printing as one row ("Name" and
                    ":" on line 0, the value on line 1, on JA-26631), so label
                    absorption has to work off geometry, not off line numbers.
+      * `marks`  — the page's vector art, as bare rects. Not everything on a
+                   contact row is text: the bars in "Passport: … | Phone: …"
+                   are drawn, and text extraction never sees them. See
+                   _absorb_marks.
     """
 
-    __slots__ = ("words", "lines", "rows", "_row_bounds")
+    __slots__ = ("words", "lines", "rows", "_row_bounds", "marks")
 
-    def __init__(self, words: list):
+    def __init__(self, words: list, marks: list | None = None):
         self.words = words
+        self.marks = list(marks or ())
 
         lines: dict[tuple[int, int], list] = {}
         for w in words:
@@ -679,6 +705,32 @@ def _absorb_glued_label(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     return rect
 
 
+#: Punctuation a value can trail off into inside its own word box.
+_GLUED_TAIL = ".,;:|/\\-–—)]}>·•~*_"
+
+
+def _absorb_glued_tail(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
+    """Extend `rect` right over punctuation left inside the value's own word.
+
+    "Email: rahul@example.com." is one word box ending in a full stop, and
+    search_for() matches only the address -- so the redaction stops one
+    character short and the masked page keeps a "." floating on its own
+    (JA-26136). Guarded by width: the sliver left uncovered has to be no wider
+    than the punctuation that trails the word, so a rect that genuinely stops
+    mid-word is never stretched over real text.
+    """
+    for w in layout.near(rect):
+        if not (w[0] + 0.5 < rect.x1 < w[2] - 0.5):
+            continue                      # rect does not end inside this word
+        trailing = len(w[4]) - len(w[4].rstrip(_GLUED_TAIL))
+        if not trailing:
+            continue
+        per_char = (w[2] - w[0]) / max(1, len(w[4]))
+        if w[2] - rect.x1 <= per_char * trailing + 1.0:
+            return fitz.Rect(rect.x0, rect.y0, w[2], rect.y1)
+    return rect
+
+
 def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
                  forward: bool) -> float | None:
     """How far `rect` may grow along `row` before it stops meeting labels.
@@ -732,8 +784,12 @@ def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
             tied = tied or separator
         elif absorbed and _LABEL_CONNECTOR_RE.match(text):
             absorbed.append((nearest, True))
-        elif text[:1].islower():
-            return None                    # running prose, not a label
+        elif text[:1].islower() and not any(c.isdigit() for c in text):
+            # Running prose, so the run just crossed was part of a sentence.
+            # Digits rule that out: "Contact no:-9876543210" is the next FIELD
+            # on the row, and reading it as prose threw away the "Contact"
+            # label in front of it (JA-26214).
+            return None
         else:
             break
         edge = nearest[2] if forward else nearest[0]
@@ -746,6 +802,65 @@ def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
     return outermost[2] if forward else outermost[0]
 
 
+#: How much of a vector mark must already lie inside a redaction before the
+#: rest of it is taken too. High, because the point is to finish covering
+#: something the redaction has all but swallowed -- not to reach for a
+#: neighbour.
+_MARK_COVERAGE = 0.7
+
+#: And how far such a mark may stick out past the redaction: a separator and
+#: its padding, never the width of the next field.
+_MARK_OVERHANG = 24.0
+
+
+def _mark_coverage(mark: fitz.Rect, rect: fitz.Rect) -> float:
+    """How much of `mark` lies inside `rect`, 0..1, on its worse axis."""
+    def frac(m0: float, m1: float, r0: float, r1: float) -> float:
+        extent = m1 - m0
+        if extent <= 0.01:                 # a hairline has no extent on this axis
+            return 1.0 if r0 - 0.5 <= m0 <= r1 + 0.5 else 0.0
+        return max(0.0, min(m1, r1) - max(m0, r0)) / extent
+    return min(frac(mark.x0, mark.x1, rect.x0, rect.x1),
+               frac(mark.y0, mark.y1, rect.y0, rect.y1))
+
+
+def _absorb_marks(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
+    """Finish covering a drawn mark the redaction has already all but covered.
+
+    Not everything on a contact row is text. JA-26753 sets its header as
+
+        Passport: U4531302 | Work permit: Burmese | Phone number: <value> |
+
+    and paints those bars as vector art with no Unicode mapping, so
+    page.get_text() never reports them and no amount of label absorption can
+    reach one: absorption works on words, and to the extractor the bar is not
+    a word. Redacting the phone left its trailing "|" hanging in the white
+    space -- the reported "special character around the masked data".
+
+    Each field's paint box runs from its text to just past its bar, so the
+    redaction already covers nearly all of it; this takes the last few points.
+    The email on the same page needed nothing, because its wider redaction had
+    swallowed the box outright -- which is why only two of the four rows came
+    out marked.
+
+    Only a mark that is already mostly inside is taken, and only where it
+    overhangs by less than a separator's width, so the NEXT field's bar, the
+    rules between sections, the page's background panels and every table
+    border elsewhere are left alone. Sideways only, for the same reason
+    label absorption is: the vertical extent is what reaches the line below.
+    """
+    x0, x1 = rect.x0, rect.x1
+    for mark in layout.marks:
+        if mark.x0 < rect.x0 - _MARK_OVERHANG or mark.x1 > rect.x1 + _MARK_OVERHANG:
+            continue
+        if _mark_coverage(mark, rect) < _MARK_COVERAGE:
+            continue
+        x0, x1 = min(x0, mark.x0), max(x1, mark.x1)
+    if (x0, x1) == (rect.x0, rect.x1):
+        return rect
+    return fitz.Rect(x0, rect.y0, x1, rect.y1)
+
+
 def _absorb_labels(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     """Grow `rect` over the label that introduces the value and the annotation
     that trails it, so the masked row says nothing about what was removed.
@@ -755,17 +870,19 @@ def _absorb_labels(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     apply_redactions() deletes every glyph whose box merely INTERSECTS the
     annotation, so covering the label's row is enough to remove it.
     """
-    grown = _absorb_glued_label(rect, layout)
+    grown = _absorb_glued_tail(_absorb_glued_label(rect, layout), layout)
     row = layout.row_for(grown)
-    if not row:
-        return grown
-    block = layout.block_for(grown)
-    x0 = _walk_labels(grown, row, block, forward=False)
-    x1 = _walk_labels(grown, row, block, forward=True)
-    if x0 is None and x1 is None:
-        return grown
-    return fitz.Rect(grown.x0 if x0 is None else x0, grown.y0,
-                     grown.x1 if x1 is None else x1, grown.y1)
+    if row:
+        block = layout.block_for(grown)
+        x0 = _walk_labels(grown, row, block, forward=False)
+        x1 = _walk_labels(grown, row, block, forward=True)
+        if x0 is not None or x1 is not None:
+            grown = fitz.Rect(grown.x0 if x0 is None else x0, grown.y0,
+                              grown.x1 if x1 is None else x1, grown.y1)
+    # Last, so a mark is measured against the whole of what is being removed:
+    # the label's own paint box is part of the field's, and covering only the
+    # value leaves the rest of it behind.
+    return _absorb_marks(grown, layout)
 
 
 def _rects_for(page: fitz.Page, s: str, layout: _Layout) -> list[fitz.Rect]:
@@ -833,9 +950,9 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     wanted = pii.expand([str(s) for s in mask_strings])
 
     for page in doc:
-        # Index the word layout once per page — every mask string is matched
-        # against it, and get_text() is the expensive part of this loop.
-        layout = _Layout(page.get_text("words"))
+        # Index the page once — every mask string is matched against this, and
+        # reading the page is the expensive part of this loop.
+        layout = _Layout(page.get_text("words"), _mark_rects(page))
 
         page_rects: list[fitz.Rect] = []
         for s in wanted:
@@ -854,7 +971,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         # ones the first pass uses, so a residual hit is redacted exactly
         # like a Contact-record hit, label and all.
         if residual_sweep:
-            left = _Layout(page.get_text("words"))
+            left = _Layout(page.get_text("words"), _mark_rects(page))
             found = [_absorb_labels(_clip_to_line(rect, key, left), left)
                      for rect, key in residual.find_residual_rects(page, left.words)]
             if found:
