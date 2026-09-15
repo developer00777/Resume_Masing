@@ -249,3 +249,20 @@ def test_with_session_does_not_retry_on_other_errors(monkeypatch):
     with pytest.raises(sf_client.ResumeNotFoundError):
         sf_client.with_session(fn, client_key="acme")
     assert len(calls) == 1, "non-session errors must not trigger a retry"
+
+
+def test_sf_domain_names_the_host_not_the_org():
+    """SF_DOMAIN is a simple-salesforce host prefix, not a word for the org.
+
+    simple-salesforce builds https://{domain}.salesforce.com out of it, so the
+    deployed SF_DOMAIN="Live" resolved to nothing and failed every connection
+    with a DNS error instead of an auth error. Production is "login" however
+    it is spelled, and the same value arrives from the Settings tab as
+    login_host.
+    """
+    for spelling in ("Live", "live", "PROD", "production", "login", "", None, "  "):
+        assert sf_client._domain(spelling) == "login", spelling
+    for spelling in ("test", "Sandbox"):
+        assert sf_client._domain(spelling) == "test", spelling
+    # A real My Domain host is passed through untouched.
+    assert sf_client._domain("acme--uat.sandbox.my") == "acme--uat.sandbox.my"

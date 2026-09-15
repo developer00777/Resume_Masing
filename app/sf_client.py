@@ -325,6 +325,24 @@ def invalidate_default_override_cache() -> None:
     _default_override_cache_at = 0.0
 
 
+def _domain(value: str | None) -> str:
+    """The simple-salesforce host prefix for `value`.
+
+    simple-salesforce builds https://{domain}.salesforce.com out of this, so it
+    wants "login" or "test", not a word describing the org. The deployed
+    configuration sets SF_DOMAIN="Live", which resolves to nothing and fails
+    every connection with a DNS error rather than an auth error; the same
+    spelling arrives from the Settings tab. Production is "login", whatever it
+    is called.
+    """
+    value = (value or "").strip()
+    if not value or value.lower() in ("live", "prod", "production", "login"):
+        return "login"
+    if value.lower() in ("test", "sandbox"):
+        return "test"
+    return value
+
+
 def connect(client_key: str | None = None, force_refresh: bool = False) -> Salesforce:
     if client_key:
         return _connect_with_client_credentials(client_key, force_refresh=force_refresh)
@@ -338,7 +356,7 @@ def connect(client_key: str | None = None, force_refresh: bool = False) -> Sales
                     "Salesforce credentials not configured. Missing: SF_USERNAME "
                     "(the Settings-tab-stored password/creds need SF_USERNAME set "
                     "in the environment alongside them).")
-            domain = (override["login_host"] or "").strip() or "login"
+            domain = _domain(override["login_host"])
             if override["client_id"] and override["client_secret"]:
                 return Salesforce(username=username, password=override["password"],
                                   consumer_key=override["client_id"], consumer_secret=override["client_secret"],
@@ -351,7 +369,7 @@ def connect(client_key: str | None = None, force_refresh: bool = False) -> Sales
             return Salesforce(username=username, password=override["password"],
                               security_token="", domain=domain)
 
-        domain = os.environ.get("SF_DOMAIN", "login").strip() or "login"
+        domain = _domain(os.environ.get("SF_DOMAIN"))
         if os.environ.get("SF_CONSUMER_KEY"):
             c = _require("SF_USERNAME", "SF_PASSWORD", "SF_CONSUMER_KEY", "SF_CONSUMER_SECRET")
             return Salesforce(username=c["SF_USERNAME"], password=c["SF_PASSWORD"],

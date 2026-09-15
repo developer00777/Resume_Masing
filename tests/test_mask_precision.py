@@ -111,6 +111,31 @@ class Fixture:
 
 FIXTURES = [
     Fixture(
+        # JA-26753: the number is labelled on BOTH sides, the Contact record
+        # abbreviates the surname to an initial, and the profile link spells
+        # the whole name out.
+        "label-on-both-sides-and-a-profile-link",
+        [
+            "Karthik Velayuthan",
+            "Nationality: Indian   Gender: Male   "
+            "Phone number: (+91) 98765 43210 (Mobile)",
+            "Email address: velayuthan.k@example.com",
+            "LinkedIn: https://www.linkedin.com/in/karthikvelayuthan/",
+            "",
+            "Passport: U4531302, valid 2019 - 2029",
+            "HSE Officer, Pacific High Technology Services, 2019 - 2024",
+            "  - Ran permit-to-work for 3 offshore platforms",
+        ],
+        contact=["Karthik V", "+919876543210", "velayuthan.k@example.com"],
+        must_mask=["Karthik", "Velayuthan", "98765 43210",
+                   "velayuthan.k@example.com", "(Mobile)", "karthikvelayuthan"],
+        must_survive=[
+            "Nationality:", "Indian", "Gender:", "Male",
+            "U4531302", "2019 - 2029", "2019 - 2024",
+            "Pacific High Technology Services", "permit-to-work",
+        ],
+    ),
+    Fixture(
         "numeric-dense-indian-resume",
         [
             "RAHUL SHARMA",

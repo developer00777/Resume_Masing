@@ -287,3 +287,15 @@ Phone decisions there come from the numbering plan rather than from formatting, 
 numbers, timestamps and round magnitudes are not. Names are deliberately **not** swept for — there is
 no way to tell a candidate's name from any other capitalised words on a page, so a name still only ever
 comes from the Contact record.
+
+Removing a value is only half of it. What the reader sees is the **row** it sat in, and a row still
+reading `Phone number:` … `(Mobile)` or `Email ID:` over white space has told them exactly what was
+taken out. So every hit grows outwards along its row for as long as what it meets is only a label —
+in front of the value, behind it, glued into its word box, or left as a lone `+`. The walk stops at
+the first word that is not part of a label, and what stopped it decides whether to commit: a field
+label is bounded by the edge of its line, by another field's value, or by a gap — never by lowercase
+prose, so `In case of any problem, please contact at: <address>` keeps its sentence while the address
+goes. A name the Contact abbreviates to an initial (`Karthik V` against a resume printing
+`Karthik Velayuthan`) is matched through the initial, and a profile link that spells the name out
+(`linkedin.com/in/karthikvelayuthan`) is redacted with it — a blank contact block above a link that
+still names the candidate is not anonymised.

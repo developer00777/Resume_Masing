@@ -540,6 +540,109 @@ def test_label_absorption_does_not_cross_a_column_gutter():
         f"absorbed across the gutter: {text!r}"
 
 
+def test_trailing_annotation_is_absorbed():
+    """The label is not always in FRONT of the value.
+
+    JA-26753's contact block reads "Phone number: (+91) 98765 43210 (Mobile)",
+    and redacting the number alone left "(Mobile)" sitting on the row -- the
+    reported "it still has the mobile number tag". Absorption walks both ways
+    out of a hit for exactly this.
+    """
+    text, _ = _masked_text(
+        ["Nationality: Indian   Gender: Male   "
+         "Phone number: (+91) 98765 43210 (Mobile)",
+         "Acme Corp   2019 - 2023"],
+        ["+919876543210"])
+    stripped = _norm(text)
+    assert "98765" not in stripped and "43210" not in stripped
+    assert "(Mobile)" not in text, f"trailing annotation left behind: {text!r}"
+    assert "Phonenumber" not in stripped
+    # The other fields on the same row are not contact details. The walk stops
+    # at "Male" -- a value, not a label -- so they keep their labels and values.
+    assert "Nationality:" in text and "Indian" in text
+    assert "Gender:" in text and "Male" in text
+
+
+def test_label_absorption_does_not_eat_prose():
+    """"please contact at:" is a sentence, not a field label.
+
+    What stopped the walk is what says whether the run it crossed was a label:
+    a field label is bounded by the edge of its line, by another field, or by
+    a gap -- never by lowercase prose. JA-26708's certificate pages carry this
+    line under the candidate's own details, and eating half of it would be a
+    defect of its own.
+    """
+    text, _ = _masked_text(
+        ["In case of any problem, please contact at: help@example.org "
+         "with your details",
+         "Acme Corp   2019 - 2023"],
+        ["help@example.org"])
+    assert "help@example.org" not in _norm(text)
+    assert "please contact at:" in text, f"prose eaten: {text!r}"
+    assert "with your details" in text
+
+
+def test_label_glued_to_the_name_word_is_taken_with_it():
+    """"Name-Anup Kumar Yadav" extracts with the label inside the first word.
+
+    Comparing the word box as a whole ("nameanup") matched no token, so the
+    surname went and the first name stayed: JA-26708's declaration page
+    shipped reading "Name-Anup" with the rest blanked. Name tokens are matched
+    per letter-run instead, and the whole word box goes, label and all.
+    """
+    text, _ = _masked_text(
+        ["Declaration: the above is true to the best of my knowledge.",
+         "Name-Anup Kumar Yadav",
+         "Date-13-08-2026"],
+        ["Anup Kumar Yadav"])
+    stripped = _norm(text)
+    assert "Anup" not in stripped and "Yadav" not in stripped
+    assert "Name-" not in stripped, f"glued label left behind: {text!r}"
+    assert "Declaration:" in text and "13-08-2026" in stripped
+
+
+def test_contact_initial_matches_the_name_part_it_abbreviates():
+    """The Contact holds "Karthik V"; the resume prints "Karthik Velayuthan".
+
+    Initials used to be dropped outright, which left one usable token, no
+    two-token match, and the candidate's surname in 24pt at the top of the
+    masked copy (JA-26753).
+    """
+    text, _ = _masked_text(
+        ["Karthik Velayuthan",
+         "Vendor management and HSE audits across the Vizag site",
+         "Acme Corp   2019 - 2023"],
+        ["Karthik V"])
+    stripped = _norm(text)
+    assert "Karthik" not in stripped and "Velayuthan" not in stripped
+    # An initial is evidence only where it stands -- directly after a part
+    # that already matched. Other capitalised V-words are ordinary content.
+    assert "Vendor" in text and "Vizag" in text
+    assert "2019-2023" in stripped
+
+
+def test_profile_link_spelling_out_the_name_is_redacted():
+    """A blank contact block under a link that still names the candidate is
+    not anonymised.
+
+    JA-26753 was masked down to white space that still carried
+    "https://www.linkedin.com/in/karthikvelayuthan/", which names the
+    candidate as plainly as the heading did. The slug runs the name together,
+    so it can only be matched as a substring -- which is safe here precisely
+    because it is confined to links.
+    """
+    text, _ = _masked_text(
+        ["Karthik Velayuthan",
+         "LinkedIn: https://www.linkedin.com/in/karthikvelayuthan/",
+         "Portfolio: https://www.example.com/projects/safety-audit"],
+        ["Karthik V"])
+    stripped = _norm(text).casefold()
+    assert "karthikvelayuthan" not in stripped, f"profile link left: {text!r}"
+    assert "linkedin:" not in stripped, "the link's label stayed behind"
+    # A link that does not name the candidate is ordinary resume content.
+    assert "example.com/projects/safety-audit" in stripped
+
+
 def test_email_split_across_word_boxes_is_masked():
     """An address the PDF kerned apart cannot be found by search_for().
 

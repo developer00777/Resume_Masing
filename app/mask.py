@@ -13,6 +13,18 @@ strategy rather than one blind substring search:
     name   whole-word literal — a bare search_for() hit can be a fragment
                                inside a longer word ("Ana" inside "Analysis")
 
+Removing the value is only half the job. What the reader sees is the *row* it
+sat in, and a row that still says
+
+    Phone number:                    (Mobile)
+    Email ID:
+
+over white space has told them exactly what was taken out, which is the defect
+clients keep reporting. So every hit is grown outwards along its row over the
+label that introduces it and the annotation that trails it — see
+_absorb_labels, which is the single place that decision is made, for both
+passes and all three kinds.
+
 Redaction is a true redaction — `apply_redactions()` deletes the glyphs, so
 the text is gone from the PDF, not merely covered. The fill is white
 (REDACT_FILL) so the masked copy reads as clean whitespace rather than a page
@@ -44,19 +56,93 @@ def _digits(s: str) -> str:
     return pii.digits(s)
 
 
-def _is_phone_like(s: str) -> bool:
-    return pii.classify(s) == pii.PHONE
+# --- page layout ----------------------------------------------------------
+
+class _Layout:
+    """The word layout of one page, indexed the three ways masking needs it.
+
+    Built once per page and passed down, rather than each helper re-deriving
+    it: matching a dozen mask strings used to regroup every word into lines a
+    dozen times over, and each label absorption then scanned the whole word
+    list again, five times per hit. Every lookup below is against a
+    precomputed index instead.
+
+      * `lines`  — the PDF's own text lines, in reading order. What a phone
+                   candidate may span, and what a name is matched within: a
+                   run must never form across two stacked lines of a
+                   two-column layout.
+      * `rows`   — words grouped by where they sit VERTICALLY, which is not
+                   the same thing. A label and its value routinely land in
+                   different text lines while printing as one row ("Name" and
+                   ":" on line 0, the value on line 1, on JA-26631), so label
+                   absorption has to work off geometry, not off line numbers.
+    """
+
+    __slots__ = ("words", "lines", "rows", "_row_bounds")
+
+    def __init__(self, words: list):
+        self.words = words
+
+        lines: dict[tuple[int, int], list] = {}
+        for w in words:
+            lines.setdefault((w[5], w[6]), []).append(w)
+        for group in lines.values():
+            group.sort(key=lambda w: w[0])
+        self.lines = lines
+
+        # Rows, by vertical overlap. Sorted by top edge, so a word only ever
+        # needs to be offered to the few rows opened most recently.
+        rows: list[list] = []
+        bounds: list[list[float]] = []
+        for w in sorted(words, key=lambda w: (w[1], w[0])):
+            cy = (w[1] + w[3]) / 2
+            for i in range(len(rows) - 1, max(-1, len(rows) - 4), -1):
+                y0, y1 = bounds[i]
+                if y0 < cy < y1 or w[1] < (y0 + y1) / 2 < w[3]:
+                    rows[i].append(w)
+                    bounds[i] = [min(y0, w[1]), max(y1, w[3])]
+                    break
+            else:
+                rows.append([w])
+                bounds.append([w[1], w[3]])
+        for row in rows:
+            row.sort(key=lambda w: w[0])
+        self.rows = rows
+        # Kept from the pass above rather than re-derived: row_for() runs once
+        # per hit, and measuring every row's extent each time walks the whole
+        # page to answer a question already answered here.
+        self._row_bounds = [tuple(b) for b in bounds]
+
+    def row_for(self, rect: fitz.Rect) -> list:
+        """The row `rect` sits in — the one its vertical span overlaps most."""
+        best, best_overlap = [], 0.0
+        for row, (y0, y1) in zip(self.rows, self._row_bounds):
+            overlap = min(rect.y1, y1) - max(rect.y0, y0)
+            if overlap > best_overlap:
+                best, best_overlap = row, overlap
+        return best
+
+    def near(self, rect: fitz.Rect) -> list:
+        """Words that could possibly intersect `rect`, by vertical span.
+
+        Callers that only care about intersections (clipping, coverage) get a
+        row's worth of words to test instead of the page's.
+        """
+        return [w for w in self.words if w[3] > rect.y0 and w[1] < rect.y1]
+
+    def block_for(self, rect: fitz.Rect) -> int | None:
+        """The text block `rect` mostly sits in, or None if it touches none."""
+        best, best_area = None, 0.0
+        for w in self.near(rect):
+            area = (fitz.Rect(w[:4]) & rect).get_area()
+            if area > best_area:
+                best, best_area = w[5], area
+        return best
 
 
-def _line_words(words: list) -> dict[tuple[int, int], list]:
-    """Group page words by (block_no, line_no)."""
-    lines: dict[tuple[int, int], list] = {}
-    for w in words:
-        lines.setdefault((w[5], w[6]), []).append(w)
-    return lines
+# --- phone ----------------------------------------------------------------
 
-
-def _phone_rects(page: fitz.Page, target: str, words: list | None = None) -> list[fitz.Rect]:
+def _phone_rects(target: str, layout: _Layout) -> list[fitz.Rect]:
     """Locate a phone number by its digits, not its literal formatting.
 
     page.search_for() is an exact substring match, so it misses a phone number
@@ -77,11 +163,8 @@ def _phone_rects(page: fitz.Page, target: str, words: list | None = None) -> lis
     if len(target_digits) < pii.MIN_PHONE_DIGITS:
         return []
 
-    if words is None:
-        words = page.get_text("words")  # (x0, y0, x1, y1, text, block_no, line_no, word_no)
-
     out: list[fitz.Rect] = []
-    for line in _line_words(words).values():
+    for key, line in layout.lines.items():
         n = len(line)
         for i in range(n):
             if not _digits(line[i][4]):
@@ -102,26 +185,26 @@ def _phone_rects(page: fitz.Page, target: str, words: list | None = None) -> lis
                         min(line[k][1] for k in range(i, j + 1)),
                         max(line[k][2] for k in range(i, j + 1)),
                         max(line[k][3] for k in range(i, j + 1)),
-                    ), (line[i][5], line[i][6]), words))
+                    ), key, layout))
                     break
     return _dedupe_rects(out)
 
 
-def _clip_literal(rect: fitz.Rect, words: list) -> fitz.Rect:
+# --- geometry -------------------------------------------------------------
+
+def _clip_literal(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     """_clip_to_line for a search_for() hit, whose line has to be inferred
     from whichever line contributes most of the words the hit covers."""
     best, best_area = None, 0.0
-    for w in words:
-        overlap = fitz.Rect(w[:4]) & rect
-        if overlap.is_empty:
-            continue
-        area = overlap.get_area()
+    for w in layout.near(rect):
+        area = (fitz.Rect(w[:4]) & rect).get_area()
         if area > best_area:
             best, best_area = (w[5], w[6]), area
-    return rect if best is None else _clip_to_line(rect, best, words)
+    return rect if best is None else _clip_to_line(rect, best, layout)
 
 
-def _clip_to_line(rect: fitz.Rect, line_key: tuple[int, int], words: list) -> fitz.Rect:
+def _clip_to_line(rect: fitz.Rect, line_key: tuple[int, int],
+                  layout: _Layout) -> fitz.Rect:
     """Shrink `rect` vertically so it cannot reach text on neighbouring lines.
 
     A word box for a large heading font is far taller than its glyphs -- a
@@ -136,14 +219,15 @@ def _clip_to_line(rect: fitz.Rect, line_key: tuple[int, int], words: list) -> fi
     no separating rect exists, the original is kept -- removing the PII wins
     over preserving the line.
     """
-    own = [w for w in words
+    near = layout.near(rect)
+    own = [w for w in near
            if (w[5], w[6]) == line_key and not (fitz.Rect(w[:4]) & rect).is_empty]
     if not own:
         return rect
 
     mid = (rect.y0 + rect.y1) / 2
     top, bottom = rect.y0, rect.y1
-    for w in words:
+    for w in near:
         if (w[5], w[6]) == line_key:
             continue
         wr = fitz.Rect(w[:4])
@@ -170,7 +254,7 @@ def _clip_to_line(rect: fitz.Rect, line_key: tuple[int, int], words: list) -> fi
 _BRIDGE_MAX_GAP = 24.0
 
 
-def _bridge_separators(rects: list[fitz.Rect], words: list) -> list[fitz.Rect]:
+def _bridge_separators(rects: list[fitz.Rect], layout: _Layout) -> list[fitz.Rect]:
     """Absorb a separator left stranded between two redactions.
 
     A Contact field holding "9876543210 / 9123456789" redacts both numbers and
@@ -196,7 +280,7 @@ def _bridge_separators(rects: list[fitz.Rect], words: list) -> list[fitz.Rect]:
             gap = b.x0 - a.x1
             if gap < 0 or gap > _BRIDGE_MAX_GAP:
                 continue
-            between = [w for w in words
+            between = [w for w in layout.words
                        if w[0] >= a.x1 - 0.5 and w[2] <= b.x0 + 0.5
                        and w[3] > min(a.y0, b.y0) and w[1] < max(a.y1, b.y1)]
             if any(any(c.isalnum() for c in w[4]) for w in between):
@@ -224,7 +308,7 @@ def _dedupe_rects(rects: list[fitz.Rect]) -> list[fitz.Rect]:
     return kept
 
 
-def _covers_whole_words(rect: fitz.Rect, words: list) -> bool:
+def _covers_whole_words(rect: fitz.Rect, layout: _Layout) -> bool:
     """Does `rect` cover whole words, rather than clipping into one?
 
     search_for() has no word-boundary option, so a short name matches inside
@@ -232,7 +316,7 @@ def _covers_whole_words(rect: fitz.Rect, words: list) -> bool:
     touches tells the two cases apart: a whole-word hit spans the word, a
     fragment hit covers only part of it.
     """
-    for w in words:
+    for w in layout.near(rect):
         wr = fitz.Rect(w[0], w[1], w[2], w[3])
         if wr.is_empty or wr.width <= 0:
             continue
@@ -247,8 +331,13 @@ def _covers_whole_words(rect: fitz.Rect, words: list) -> bool:
     return True
 
 
+# --- name -----------------------------------------------------------------
+
 #: Letters only — how a name token is compared, so "Sharma," and "SHARMA"
-#: both reduce to "sharma".
+#: both reduce to "sharma". Applied per letter-run rather than to the word as
+#: a whole, which is what lets a name be recognised through the label glued to
+#: the front of it: "Name-Anup" is one word box on JA-26708, and matching the
+#: word whole ("nameanup") left the candidate's first name on the page.
 _NAME_TOKEN_RE = re.compile(r"[^\W\d_]+")
 
 #: How many unmatched words may sit between two matched name tokens. One
@@ -261,23 +350,52 @@ _NAME_MAX_GAP = 1
 #: coincidental tokens from being read as a name.
 _NAME_MIN_CHARS = 6
 
-
-def _name_token_list(name: str) -> list[str]:
-    """Name tokens worth matching on, initials dropped.
-
-    A single initial carries no evidence and matches far too much, so "Samar S
-    Wadyalkar" is matched as ["samar", "wadyalkar"].
-    """
-    return [t.casefold() for t in _NAME_TOKEN_RE.findall(str(name)) if len(t) >= 3]
-
-
 #: Shortest lone name token we will redact on its own. Below this a token is
 #: too easily an acronym or an ordinary short word to act on without the
 #: corroboration of a neighbouring token.
 _NAME_LONE_TOKEN_MIN = 4
 
 
-def _lone_token_rects(tokens: list[str], words: list) -> list[fitz.Rect]:
+def _name_sequence(name: str) -> list[tuple[str, bool]]:
+    """The Contact name as ordered (part, is_initial) entries.
+
+    Initials used to be dropped outright, because a single letter matches far
+    too much on its own. Dropping them also threw away the only evidence that
+    the name continues: the Contact holds "Karthik V", the resume heading says
+    "Karthik Velayuthan", and with the initial gone there was one usable token
+    left, no two-token match, and the candidate's surname stayed in 24pt at
+    the top of the masked copy (JA-26753).
+
+    Kept as a weak entry instead — see _name_rects, where an initial only ever
+    matches a capitalised word sitting immediately after a token that already
+    matched.
+    """
+    return [(t.casefold(), len(t) < 3) for t in _NAME_TOKEN_RE.findall(str(name))]
+
+
+def _name_token_list(name: str) -> list[str]:
+    """The full-length tokens of `name`, which are what may match on their own."""
+    return [t for t, initial in _name_sequence(name) if not initial]
+
+
+def _word_groups(text: str) -> list[str]:
+    """The letter runs in one word box ("Name-Anup" -> ["Name", "Anup"])."""
+    return _NAME_TOKEN_RE.findall(text)
+
+
+def _initial_matches(letter: str, text: str) -> bool:
+    """Could word `text` be the name part the Contact abbreviated to `letter`?
+
+    Capitalisation is the guard that makes this safe: a name is written
+    "Velayuthan" or "VELAYUTHAN", never "velayuthan", so ordinary prose cannot
+    satisfy it even when it starts with the right letter.
+    """
+    groups = _word_groups(text)
+    return bool(groups) and groups[0][:1].casefold() == letter \
+        and (groups[0].istitle() or groups[0].isupper())
+
+
+def _lone_token_rects(tokens: list[str], layout: _Layout) -> list[fitz.Rect]:
     """Redact a single name token standing on its own.
 
     A surname alone in a page footer, or a first name above a signature, is
@@ -302,23 +420,56 @@ def _lone_token_rects(tokens: list[str], words: list) -> list[fitz.Rect]:
     if not wanted and not joined:
         return []
     out: list[fitz.Rect] = []
-    for w in words:
+    for w in layout.words:
         text = w[4].strip(" .,;:()[]-|/")
         if not text or "@" in text:
             continue                      # emails are matched as emails
-        folded = text.casefold()
-        if folded in joined:
-            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), words))
+        groups = _word_groups(text)
+        if "".join(groups).casefold() in joined:
+            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), layout))
             continue
-        if folded not in wanted:
-            continue
-        if not (text.istitle() or text.isupper()):
-            continue                      # lowercase in running prose
-        out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), words))
+        # Per letter-run, so a label glued to the name ("Name-Anup") is
+        # recognised — and taken with it, since the whole word box goes.
+        if any(g.casefold() in wanted and (g.istitle() or g.isupper())
+               for g in groups):
+            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), layout))
     return out
 
 
-def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
+#: A word that is a link or a handle rather than prose. A name inside one of
+#: these is still the candidate's name: JA-26753 was masked down to a blank
+#: contact block that still carried
+#: "https://www.linkedin.com/in/karthikvelayuthan/", which names the candidate
+#: as plainly as the heading did.
+_URLISH_RE = re.compile(
+    r"https?://|www\.|\b[a-z0-9\-]+\.(?:com|in|org|net|io|me|co|dev|info|us|uk)\b",
+    re.I,
+)
+
+
+def _url_name_rects(tokens: list[str], layout: _Layout) -> list[fitz.Rect]:
+    """Redact a URL or handle that spells out the candidate's name.
+
+    Matched as a substring of the link's letters, which is the only way to
+    find it: a profile slug runs the name together and drops the separators
+    ("karthikvelayuthan"). Confined to links, so the substring rule cannot
+    behave like the "Ana" inside "Analysis" case — that only happens in prose,
+    and prose is not a URL.
+    """
+    wanted = [t for t in tokens if len(t) >= _NAME_LONE_TOKEN_MIN]
+    if not wanted:
+        return []
+    out: list[fitz.Rect] = []
+    for w in layout.words:
+        if not _URLISH_RE.search(w[4]):
+            continue
+        letters = "".join(_word_groups(w[4])).casefold()
+        if any(t in letters for t in wanted):
+            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), layout))
+    return out
+
+
+def _name_rects(name: str, layout: _Layout) -> list[fitz.Rect]:
     """Locate a candidate's name even when the resume spells it differently.
 
     page.search_for() needs the whole string present verbatim, and on real
@@ -327,49 +478,60 @@ def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
 
         Contact "Sitendra Kumar Chakra"   resume "SITENDRA CHAKRA"
         Contact "Samar Wadyalkar"         resume "SAMAR SHIVAJI WADYALKAR"
+        Contact "Karthik V"               resume "Karthik Velayuthan"
 
     Confirmed on live data, where roughly a third of sampled records had a
     Contact name that appears nowhere verbatim in the resume -- so the name was
     not redacted at all, and sat in the page heading of the masked copy while
     phone and email were blacked out.
 
-    Matches the tokens as an ordered subsequence within a single line, letting
+    Matches the entries as an ordered subsequence within a single line, letting
     either side carry extra words, and redacts the whole span (a middle name
     on the resume is part of the name, so covering it is correct). Requires at
-    least two tokens to match: one token alone would mask every occurrence of
-    an ordinary word for a candidate named Will, Rose or Mark.
+    least two entries to match: one alone would mask every occurrence of an
+    ordinary word for a candidate named Will, Rose or Mark.
     """
-    tokens = _name_token_list(name)
-    if not tokens:
+    seq = _name_sequence(name)
+    strong = [t for t, initial in seq if not initial]
+    if not strong:
         return []
 
-    out: list[fitz.Rect] = _lone_token_rects(tokens, words)
-    if len(tokens) < 2:
+    out: list[fitz.Rect] = _lone_token_rects(strong, layout) \
+        + _url_name_rects(strong, layout)
+    if len(seq) < 2:
         return out
 
-    for line in _line_words(words).values():
-        norm = ["".join(_NAME_TOKEN_RE.findall(w[4])).casefold() for w in line]
+    for line in layout.lines.values():
+        groups = [[g.casefold() for g in _word_groups(w[4])] for w in line]
         n = len(line)
         for start in range(n):
-            if not norm[start] or norm[start] not in tokens:
+            if not any(g in strong for g in groups[start]):
                 continue
-            next_token = 0
-            matched = 0
-            chars = 0
+            nxt = matched = chars = gaps = 0
             last = start
-            gaps = 0
             for j in range(start, n):
-                if not norm[j]:
+                if not groups[j]:
                     continue                       # punctuation-only word
-                hit = next((k for k in range(next_token, len(tokens))
-                            if tokens[k] == norm[j]), None)
+                hit = None
+                for k in range(nxt, len(seq)):
+                    token, initial = seq[k]
+                    if not initial and token in groups[j]:
+                        hit = k
+                        break
+                    # An initial is evidence only where it stands: directly
+                    # after a part that already matched, never on its own and
+                    # never across a gap.
+                    if initial and matched and not gaps \
+                            and _initial_matches(token, line[j][4]):
+                        hit = k
+                        break
                 if hit is not None:
                     matched += 1
-                    chars += len(norm[j])
-                    next_token = hit + 1
+                    chars += sum(len(g) for g in groups[j])
+                    nxt = hit + 1
                     last = j
                     gaps = 0
-                    if next_token >= len(tokens):
+                    if nxt >= len(seq):
                         break
                 elif matched and gaps < _NAME_MAX_GAP:
                     gaps += 1
@@ -381,40 +543,85 @@ def _name_rects(page: fitz.Page, name: str, words: list) -> list[fitz.Rect]:
                     min(line[k][1] for k in range(start, last + 1)),
                     max(line[k][2] for k in range(start, last + 1)),
                     max(line[k][3] for k in range(start, last + 1)),
-                ), (line[start][5], line[start][6]), words))
+                ), (line[start][5], line[start][6]), layout))
     return out
 
 
-#: The label sitting immediately before a contact value. Redacted along with
-#: the value, because a bare "Contact:" or "Email:" followed by white space
-#: still tells the reader exactly what was removed, and reads as a defect on
-#: the page. Matched on the whole word so a sentence beginning "Contact the
-#: site engineer" is untouched.
-#:
-#: A real label is written as several words -- "Alternate E-Mail ID :",
-#: "Personal Mob No." -- and _absorb_label walks them right to left, so all
-#: three kinds of word have to be listed or the walk stops early and strands
-#: what it did not reach. The reported defect was exactly that: "Email ID:"
-#: matched "Email" but not "ID", so absorption stopped at the colon and the
-#: masked page kept an "Email ID:" sitting over white space.
-_CONTACT_LABEL_RE = re.compile(
+def _matches_case(rect: fitz.Rect, layout: _Layout, needle: str) -> bool:
+    """Is the text under `rect` written the same way as `needle`?
+
+    Accepts the needle as-is or fully upper-cased, which is how a name appears
+    in a resume heading.
+    """
+    covered = []
+    for w in layout.near(rect):
+        wr = fitz.Rect(w[0], w[1], w[2], w[3])
+        inter = wr & rect
+        if inter.is_empty or inter.width <= 0:
+            continue
+        if inter.height < min(wr.height, rect.height) * 0.5:
+            continue
+        covered.append(w[4])
+    text = " ".join(covered).strip(" .,;:()[]-")
+    return text in (needle, needle.upper())
+
+
+# --- labels ---------------------------------------------------------------
+# A redaction that removes only the value leaves the row saying what it was.
+# Clients report that as a defect in its own right ("the emailid tag is also
+# not removed", "it still has the mobile number tag"), and they are right to:
+# a blank space behind "Alternate Mobile No. :" is not anonymised, it is
+# annotated.
+#
+# So a hit grows outwards along its row for as long as what it meets is only a
+# label. That is one rule in one place, applied to both sides, because the
+# label is not reliably on the left:
+#
+#     Phone number: (+91) 98765 43210 (Mobile)      <- trails the value
+#     Name  :        Rahul Sharma                   <- leads it, tab-aligned
+#     Email id:-rahul@example.com                   <- glued into the same word
+#     + 91-9876543210                               <- a sign left by itself
+
+#: The separators a label is written with, and which on their own are all that
+#: is left of one.
+_LABEL_SEPS = r"\s.:\-–—#|/+()\[\]"
+
+#: The words a contact label is built from. A real one is several of them
+#: ("Alternate E-Mail ID :", "Personal Mob No."), and the walk takes them one
+#: at a time, so every kind has to be listed or it stops early and strands
+#: what it did not reach.
+_LABEL_WORDS = (
     # the contact channel
-    r"^(?:e[-\s]?mail|email|mail|e|phone|mobile|mob|cell(?:ular)?|"
+    r"e[-\s]?mail|email|mail|e|phone|mobile|mob|cell(?:ular)?|"
     r"tel(?:ephone)?|contact|whats?[\s-]?app|ph|landline|fax|skype|"
+    r"linked[\s-]?in|"
     # the qualifier in front of it
     r"alt(?:\.|ernat(?:e|ive))?|second(?:ary)?|primary|personal|official|"
     r"office|work|home|res(?:idence|idential)?|permanent|current|"
     r"name|candidate|applicant|"
     # the trailing noun
     r"id|ids|i\.?d\.?|address|addr|detail(?:s)?|info|no|nos|num(?:ber)?"
-    r")[\s.:\-–—#|()]*$"
+)
+
+_CONTACT_LABEL_RE = re.compile(
+    rf"^[{_LABEL_SEPS}]*(?:{_LABEL_WORDS})[{_LABEL_SEPS}]*$"
     # A separator stranded on its own, either between two label words
     # ("E - Mail ID") or left behind by the value itself: a "+" typed as its
     # own word survived redaction of "+ 91-98765 43210" on JA-26631 and sat
     # alone on the masked page.
-    r"|^[\s.:\-–—#|/+()]+$",
+    rf"|^[{_LABEL_SEPS}]+$"
+    # The bracketed annotation a contact block puts AFTER the number to say
+    # which line it is: "(Mobile)", "(R)", "(O)". JA-26753 shipped with
+    # "(Mobile)" alone on the row, which is the reported "mobile number tag".
+    rf"|^\s*[(\[]\s*(?:{_LABEL_WORDS}|[mrowhp])\s*[)\]][{_LABEL_SEPS}]*$",
     re.I,
 )
+
+#: Words that hold a label together without being one ("NAME OF THE
+#: CANDIDATE"). Absorbed only in the middle of a run -- a label never starts
+#: or ends on one, and trailing ones are trimmed back off before committing.
+_LABEL_CONNECTOR_RE = re.compile(
+    rf"^[{_LABEL_SEPS}]*(?:of|the|for|and|to|my|our|&)[{_LABEL_SEPS}]*$", re.I)
 
 #: A label printed inside the SAME word box as the value, which is how
 #: "Email id:-someone@example.com" extracts on JA-26708 -- one word, with the
@@ -429,7 +636,7 @@ _GLUED_LABEL_RE = re.compile(
 
 #: Widest gap, in points, between a contact label and the value it labels.
 #: Generous, because the guards that matter here are structural rather than
-#: metric: the label has to be the NEAREST word to the left (so everything
+#: metric: the label has to be the NEAREST word on that side (so everything
 #: between it and the value is whitespace) and it has to sit in the same text
 #: block (so a two-column layout cannot donate its left column to the right).
 #: The old 12pt assumed a label typed up against its value; on real resumes
@@ -438,125 +645,126 @@ _GLUED_LABEL_RE = re.compile(
 #: value on JA-26631 -- so both stayed on the masked page.
 _LABEL_MAX_GAP = 150.0
 
-
-def _rect_block(rect: fitz.Rect, words: list) -> int | None:
-    """The text block `rect` mostly sits in, or None if it touches no word."""
-    best, best_area = None, 0.0
-    for w in words:
-        inter = fitz.Rect(w[:4]) & rect
-        if inter.is_empty:
-            continue
-        area = inter.get_area()
-        if area > best_area:
-            best, best_area = w[5], area
-    return best
+#: How many words a label may run to. "Alternate E - Mail ID :" is five, and
+#: stopping short of the start of a label run is what leaves half of it on the
+#: page.
+_LABEL_MAX_WORDS = 6
 
 
-def _absorb_glued_label(rect: fitz.Rect, words: list) -> fitz.Rect:
+def _absorb_glued_label(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     """Extend `rect` left over a label printed inside the value's own word."""
-    for w in words:
+    for w in layout.near(rect):
         if not (w[0] < rect.x0 - 0.5 < w[2] - 0.5):
             continue                      # rect does not start inside this word
-        if w[3] <= rect.y0 or w[1] >= rect.y1:
-            continue                      # not on this row
         if _GLUED_LABEL_RE.match(w[4]):
             return fitz.Rect(w[0], rect.y0, rect.x1, rect.y1)
     return rect
 
 
-def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
-    """Grow `rect` leftwards over a contact label that precedes the value.
+def _walk_labels(rect: fitz.Rect, row: list, block: int | None,
+                 forward: bool) -> float | None:
+    """How far `rect` may grow along `row` before it stops meeting labels.
 
-    On a real resume this is the difference between
+    Returns the x to grow to, or None to grow no further. The walk stops at
+    the first word that is not part of a label, and then has to decide whether
+    what it absorbed really was one. The tell is what stopped it: a field
+    label is bounded by the edge of its line, by another field's value, or by
+    a gap -- never by lowercase prose. That single test is what keeps
 
-        Contact:                       and        (nothing)
-        Email:
+        In case of any problem, please contact at: help@example.org
 
-    left standing over blank space, and a clean page. The label is only taken
-    when it sits immediately to the left on the same line and the whole word is
-    a label, so prose is never eaten.
+    intact (stopped by "please") while still taking the whole of
+
+        Nationality: Indian   Gender: Male   Phone number: (+91) 98765 43210
+
+    (stopped by "Male", which is a value, not prose).
     """
-    block = _rect_block(rect, words)
-    grown = _absorb_glued_label(rect, words)
-    absorbed = grown != rect
-    # Labels come in runs: "Mob No.- 98765...", "Contact No :", "E-Mail ID:".
-    # Taking only the nearest word left "Mob" standing on a real resume, so
-    # this walks leftwards while each next word is still a label. Five steps,
-    # because "Alternate E - Mail ID :" is five words and stopping short of
-    # the start of a label run is what leaves half of it on the page.
-    for _ in range(5):
-        candidates = [w for w in words
-                      if w[2] <= grown.x0 + 1.0
-                      and w[3] > grown.y0 and w[1] < grown.y1
-                      # Same text block. A label and its value can sit on
-                      # different PDF text LINES while looking like one row
-                      # ("Name" and ":" are line 0, the value line 1, on
-                      # JA-26631), so the line is too strict a test -- but
-                      # the block still separates two columns.
-                      and (block is None or w[5] == block)]
-        if not candidates:
+    edge = rect.x1 if forward else rect.x0
+    absorbed: list[tuple[list, bool]] = []
+    for _ in range(_LABEL_MAX_WORDS):
+        nearest = None
+        for w in row:
+            if block is not None and w[5] != block:
+                continue
+            if forward and w[0] >= edge - 1.0:
+                if nearest is None or w[0] < nearest[0]:
+                    nearest = w
+            elif not forward and w[2] <= edge + 1.0:
+                if nearest is None or w[2] > nearest[2]:
+                    nearest = w
+        if nearest is None:
+            break                          # the edge of the row: nothing to stop us
+        gap = nearest[0] - edge if forward else edge - nearest[2]
+        if gap > _LABEL_MAX_GAP:
+            break                          # too far away to be this value's label
+        text = nearest[4].strip()
+        if _CONTACT_LABEL_RE.match(text):
+            absorbed.append((nearest, False))
+        elif absorbed and _LABEL_CONNECTOR_RE.match(text):
+            absorbed.append((nearest, True))
+        elif text[:1].islower():
+            return None                    # running prose, not a label
+        else:
             break
-        nearest = max(candidates, key=lambda w: w[2])
-        if grown.x0 - nearest[2] > _LABEL_MAX_GAP:
-            break                        # too far away to be this value's label
-        if not _CONTACT_LABEL_RE.match(nearest[4].strip()):
-            break
-        # Sideways only. Taking the label's vertical extent as well is how a
-        # tall label box reached the line underneath, and it buys nothing:
-        # apply_redactions() deletes every glyph whose box merely INTERSECTS
-        # the annotation, so covering the label's row is enough to remove it.
-        grown = fitz.Rect(nearest[0], grown.y0, grown.x1, grown.y1)
-        absorbed = True
-    return grown if absorbed else rect
+        edge = nearest[2] if forward else nearest[0]
+
+    while absorbed and absorbed[-1][1]:
+        absorbed.pop()                     # a label never ends on a connector
+    if not absorbed:
+        return None
+    outermost = absorbed[-1][0]
+    return outermost[2] if forward else outermost[0]
 
 
-def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:
+def _absorb_labels(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
+    """Grow `rect` over the label that introduces the value and the annotation
+    that trails it, so the masked row says nothing about what was removed.
+
+    Sideways only. Taking a label's vertical extent as well is how a tall
+    label box reached the line underneath, and it buys nothing:
+    apply_redactions() deletes every glyph whose box merely INTERSECTS the
+    annotation, so covering the label's row is enough to remove it.
+    """
+    grown = _absorb_glued_label(rect, layout)
+    row = layout.row_for(grown)
+    if not row:
+        return grown
+    block = layout.block_for(grown)
+    x0 = _walk_labels(grown, row, block, forward=False)
+    x1 = _walk_labels(grown, row, block, forward=True)
+    if x0 is None and x1 is None:
+        return grown
+    return fitz.Rect(grown.x0 if x0 is None else x0, grown.y0,
+                     grown.x1 if x1 is None else x1, grown.y1)
+
+
+def _rects_for(page: fitz.Page, s: str, layout: _Layout) -> list[fitz.Rect]:
     """Every region of `page` that should be redacted for the PII string `s`,
     using the matching strategy its kind calls for."""
     kind = pii.classify(s)
     if kind == pii.PHONE:
-        return [_absorb_label(r, words) for r in _phone_rects(page, s, words)]
-    if kind == pii.EMAIL:
-        return [_absorb_label(_clip_literal(r, words), words)
-                for r in page.search_for(s)]
-    # Name (and any literal a caller passed explicitly): whole-word only.
-    if len(s.strip()) < 3:
-        return []  # too short to match safely — would hit half the page
-    literal = [_clip_literal(r, words) for r in page.search_for(s)
-               if _covers_whole_words(r, words)]
-    if len(_name_token_list(s)) < 2:
-        # A one-token name has to match case as written. search_for() is
-        # case-insensitive, so a candidate actually named Will, Rose or Mark
-        # otherwise has every ordinary occurrence of that word redacted out of
-        # their own resume ("I will manage delivery" -> "I  manage delivery").
-        # A heading still matches, as "Will" or as "WILL".
-        literal = [r for r in literal if _matches_case(r, words, s)]
-    # Union, not either/or: a resume can print the name verbatim in one place
-    # and with an extra middle name in another, and both have to go. The
-    # label goes too, for the same reason it does on a phone or an email: a
-    # "Candidate Name:" left standing over white space is the defect, not the
-    # fix.
-    return [_absorb_label(r, words)
-            for r in _dedupe_rects(literal + _name_rects(page, s, words))]
-
-
-def _matches_case(rect: fitz.Rect, words: list, needle: str) -> bool:
-    """Is the text under `rect` written the same way as `needle`?
-
-    Accepts the needle as-is or fully upper-cased, which is how a name appears
-    in a resume heading.
-    """
-    covered = []
-    for w in words:
-        wr = fitz.Rect(w[0], w[1], w[2], w[3])
-        inter = wr & rect
-        if inter.is_empty or inter.width <= 0:
-            continue
-        if inter.height < min(wr.height, rect.height) * 0.5:
-            continue
-        covered.append(w[4])
-    text = " ".join(covered).strip(" .,;:()[]-")
-    return text in (needle, needle.upper())
+        found = _phone_rects(s, layout)
+    elif kind == pii.EMAIL:
+        found = [_clip_literal(r, layout) for r in page.search_for(s)]
+    else:
+        # Name (and any literal a caller passed explicitly): whole-word only.
+        if len(s.strip()) < 3:
+            return []  # too short to match safely — would hit half the page
+        literal = [_clip_literal(r, layout) for r in page.search_for(s)
+                   if _covers_whole_words(r, layout)]
+        if len(_name_token_list(s)) < 2:
+            # A one-token name has to match case as written. search_for() is
+            # case-insensitive, so a candidate actually named Will, Rose or Mark
+            # otherwise has every ordinary occurrence of that word redacted out of
+            # their own resume ("I will manage delivery" -> "I  manage delivery").
+            # A heading still matches, as "Will" or as "WILL".
+            literal = [r for r in literal if _matches_case(r, layout, s)]
+        # Union, not either/or: a resume can print the name verbatim in one
+        # place and with an extra middle name in another, and both have to go.
+        found = _dedupe_rects(literal + _name_rects(s, layout))
+    # The label goes with the value, whatever kind it was: a "Candidate Name:"
+    # left standing over white space is the defect, not the fix.
+    return [_absorb_labels(r, layout) for r in found]
 
 
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
@@ -588,36 +796,37 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     hits = 0
     watermark = prepare_watermark(watermark_png) if watermark_png else None
+    # expand() splits a Contact field holding several phone numbers into one
+    # entry per number. Left whole, such a value is too long to classify as a
+    # phone and gets searched as a single literal that appears in no resume --
+    # so the candidate's phone goes unmasked. Done once, not per page.
+    wanted = pii.expand([str(s) for s in mask_strings])
 
     for page in doc:
-        # Read the word layout once per page — every mask string is matched
+        # Index the word layout once per page — every mask string is matched
         # against it, and get_text() is the expensive part of this loop.
-        words = page.get_text("words")
+        layout = _Layout(page.get_text("words"))
 
         page_rects: list[fitz.Rect] = []
-        # expand() splits a Contact field holding several phone numbers into
-        # one entry per number. Left whole, such a value is too long to
-        # classify as a phone and gets searched as a single literal that
-        # appears in no resume -- so the candidate's phone goes unmasked.
-        for s in pii.expand([str(s) for s in mask_strings]):
-            page_rects.extend(_rects_for(page, s, words))
+        for s in wanted:
+            page_rects.extend(_rects_for(page, s, layout))
 
-        for rect in _bridge_separators(_dedupe_rects(page_rects), words):
+        for rect in _bridge_separators(_dedupe_rects(page_rects), layout):
             page.add_redact_annot(rect, fill=REDACT_FILL)
             hits += 1
 
         page.apply_redactions()
 
         # --- second pass --------------------------------------------------
-        # Re-read the page: `words` above describes the page before
+        # Re-read the page: the layout above describes the page before
         # redaction, and every rect from here has to be measured against
         # what is actually left. Clipping and label absorption are the same
         # ones the first pass uses, so a residual hit is redacted exactly
         # like a Contact-record hit, label and all.
         if residual_sweep:
-            left = page.get_text("words")
-            found = [_absorb_label(_clip_to_line(rect, key, left), left)
-                     for rect, key in residual.find_residual_rects(page, left)]
+            left = _Layout(page.get_text("words"))
+            found = [_absorb_labels(_clip_to_line(rect, key, left), left)
+                     for rect, key in residual.find_residual_rects(page, left.words)]
             if found:
                 for rect in _bridge_separators(_dedupe_rects(found), left):
                     page.add_redact_annot(rect, fill=REDACT_FILL)
@@ -644,7 +853,6 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     out = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     return out, hits
-
 
 #: Watermark width as a fraction of the page width. The old value effectively
 #: filled a 50%-by-50% box, which on A4 is a ~300pt block across the middle of

@@ -53,7 +53,10 @@ def load_dotenv() -> None:
     path = Path(__file__).resolve().parents[1] / ".env"
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig, not utf-8: a .env saved on Windows starts with a BOM, and
+    # read as plain utf-8 that BOM becomes part of the first key's name,
+    # so the file silently appears to be missing its first variable.
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
