@@ -408,10 +408,60 @@ _CONTACT_LABEL_RE = re.compile(
     # the trailing noun
     r"id|ids|i\.?d\.?|address|addr|detail(?:s)?|info|no|nos|num(?:ber)?"
     r")[\s.:\-–—#|()]*$"
-    # a separator stranded on its own between two label words ("E - Mail ID")
-    r"|^[\s.:\-–—#|/]+$",
+    # A separator stranded on its own, either between two label words
+    # ("E - Mail ID") or left behind by the value itself: a "+" typed as its
+    # own word survived redaction of "+ 91-98765 43210" on JA-26631 and sat
+    # alone on the masked page.
+    r"|^[\s.:\-–—#|/+()]+$",
     re.I,
 )
+
+#: A label printed inside the SAME word box as the value, which is how
+#: "Email id:-someone@example.com" extracts on JA-26708 -- one word, with the
+#: label glued to the front. search_for() matches only the address, so the
+#: rect starts partway through the word and "id:-" stays on the masked page.
+_GLUED_LABEL_RE = re.compile(
+    r"^(?:e[-\s]?mail|email|mail|mob(?:ile)?|ph(?:one)?|tel|contact|whats?app|"
+    r"name|id|no|alt|res)?"
+    r"[\s.:\-–—#|()+]+",
+    re.I,
+)
+
+#: Widest gap, in points, between a contact label and the value it labels.
+#: Generous, because the guards that matter here are structural rather than
+#: metric: the label has to be the NEAREST word to the left (so everything
+#: between it and the value is whitespace) and it has to sit in the same text
+#: block (so a two-column layout cannot donate its left column to the right).
+#: The old 12pt assumed a label typed up against its value; on real resumes
+#: the contact block is tab-aligned, and both reported labels sat outside it
+#: -- "Email" 20.5pt from its address on JA-26708, "Name :" 38.8pt from its
+#: value on JA-26631 -- so both stayed on the masked page.
+_LABEL_MAX_GAP = 150.0
+
+
+def _rect_block(rect: fitz.Rect, words: list) -> int | None:
+    """The text block `rect` mostly sits in, or None if it touches no word."""
+    best, best_area = None, 0.0
+    for w in words:
+        inter = fitz.Rect(w[:4]) & rect
+        if inter.is_empty:
+            continue
+        area = inter.get_area()
+        if area > best_area:
+            best, best_area = w[5], area
+    return best
+
+
+def _absorb_glued_label(rect: fitz.Rect, words: list) -> fitz.Rect:
+    """Extend `rect` left over a label printed inside the value's own word."""
+    for w in words:
+        if not (w[0] < rect.x0 - 0.5 < w[2] - 0.5):
+            continue                      # rect does not start inside this word
+        if w[3] <= rect.y0 or w[1] >= rect.y1:
+            continue                      # not on this row
+        if _GLUED_LABEL_RE.match(w[4]):
+            return fitz.Rect(w[0], rect.y0, rect.x1, rect.y1)
+    return rect
 
 
 def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
@@ -426,8 +476,9 @@ def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
     when it sits immediately to the left on the same line and the whole word is
     a label, so prose is never eaten.
     """
-    grown = rect
-    line_key = None
+    block = _rect_block(rect, words)
+    grown = _absorb_glued_label(rect, words)
+    absorbed = grown != rect
     # Labels come in runs: "Mob No.- 98765...", "Contact No :", "E-Mail ID:".
     # Taking only the nearest word left "Mob" standing on a real resume, so
     # this walks leftwards while each next word is still a label. Five steps,
@@ -436,21 +487,27 @@ def _absorb_label(rect: fitz.Rect, words: list) -> fitz.Rect:
     for _ in range(5):
         candidates = [w for w in words
                       if w[2] <= grown.x0 + 1.0
-                      and w[3] > grown.y0 and w[1] < grown.y1]
+                      and w[3] > grown.y0 and w[1] < grown.y1
+                      # Same text block. A label and its value can sit on
+                      # different PDF text LINES while looking like one row
+                      # ("Name" and ":" are line 0, the value line 1, on
+                      # JA-26631), so the line is too strict a test -- but
+                      # the block still separates two columns.
+                      and (block is None or w[5] == block)]
         if not candidates:
             break
         nearest = max(candidates, key=lambda w: w[2])
-        if grown.x0 - nearest[2] > 12.0:
+        if grown.x0 - nearest[2] > _LABEL_MAX_GAP:
             break                        # too far away to be this value's label
         if not _CONTACT_LABEL_RE.match(nearest[4].strip()):
             break
-        grown = fitz.Rect(nearest[0], min(grown.y0, nearest[1]),
-                          grown.x1, max(grown.y1, nearest[3]))
-        line_key = (nearest[5], nearest[6])
-    if line_key is None:
-        return rect
-    # Absorbing labels must not drag the rect onto another line.
-    return _clip_to_line(grown, line_key, words)
+        # Sideways only. Taking the label's vertical extent as well is how a
+        # tall label box reached the line underneath, and it buys nothing:
+        # apply_redactions() deletes every glyph whose box merely INTERSECTS
+        # the annotation, so covering the label's row is enough to remove it.
+        grown = fitz.Rect(nearest[0], grown.y0, grown.x1, grown.y1)
+        absorbed = True
+    return grown if absorbed else rect
 
 
 def _rects_for(page: fitz.Page, s: str, words: list) -> list[fitz.Rect]:

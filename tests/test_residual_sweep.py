@@ -476,6 +476,70 @@ def test_email_id_label_is_removed_with_the_value():
     assert "2019-2023" in stripped
 
 
+def test_tab_aligned_label_is_absorbed():
+    """A contact block is tab-aligned, so the label is not next to its value.
+
+    Measured on the reported resumes: "Email" sat 20.5pt from its address on
+    JA-26708 and "Name :" 38.8pt from its value on JA-26631. _absorb_label
+    allowed 12pt, so both labels stayed on the masked page over white space --
+    which is the reported "the emailid tag is also not removed".
+    """
+    text, _ = _masked_text(
+        ["Name  :          Rahul Sharma",
+         "Email id :       rahul.sharma@gmail.com",
+         "Mobile No :      9876543210",
+         "Profession :     Surveyor",
+         "Acme Corp   2019 - 2023"],
+        ["Rahul Sharma", "9876543210", "rahul.sharma@gmail.com"])
+    stripped = _norm(text)
+    for label in ("Name:", "Emailid:", "MobileNo:"):
+        assert label not in stripped, f"label left standing: {label!r}"
+    # The labels of things that are NOT contact details stay, with their values.
+    assert "Profession:" in stripped and "Surveyor" in stripped
+    assert "2019-2023" in stripped
+
+
+def test_label_glued_into_the_value_word_is_absorbed():
+    """"Email id:-someone@example.com" extracts as ONE word box.
+
+    search_for() matches only the address, so the redaction starts partway
+    through the word and prints "id:-" on the masked page. Seen on JA-26708.
+    """
+    text, _ = _masked_text(
+        ["Email id:-rahul.sharma@gmail.com",
+         "Mob:-9876543210",
+         "Acme Corp   2019 - 2023"],
+        ["rahul.sharma@gmail.com", "9876543210"])
+    stripped = _norm(text)
+    assert "rahul.sharma" not in stripped and "9876543210" not in stripped
+    assert "id:-" not in stripped and "Mob:-" not in stripped, \
+        f"glued label fragment left behind: {text!r}"
+    assert "2019-2023" in stripped
+
+
+def test_label_absorption_does_not_cross_a_column_gutter():
+    """A label-shaped word far to the left is not this value's label.
+
+    The gap cap is what stops a two-column layout from donating the left
+    column's last word to a redaction in the right column.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((56, 80), "Reported to the site Contact", fontsize=10)
+    page.insert_text((400, 80), "9876543210", fontsize=10)
+    page.insert_text((56, 100), "Acme Corp   2019 - 2023", fontsize=10)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, ["9876543210"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    assert "9876543210" not in _norm(text)
+    assert "Reported to the site Contact" in text, \
+        f"absorbed across the gutter: {text!r}"
+
+
 def test_email_split_across_word_boxes_is_masked():
     """An address the PDF kerned apart cannot be found by search_for().
 
