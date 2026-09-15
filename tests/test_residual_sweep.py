@@ -643,33 +643,38 @@ def test_profile_link_spelling_out_the_name_is_redacted():
     assert "example.com/projects/safety-audit" in stripped
 
 
-def test_tab_aligned_label_past_the_gap_is_absorbed_when_a_colon_ties_it():
-    """A two-column table tab-aligns the label 170pt from its value.
+def test_two_column_table_label_is_absorbed_across_the_tab_stop():
+    """A two-column table tab-aligns the label 170-180pt from its value.
 
-    Found by sweeping the org: JA-26566 and JA-26563 masked the value and left
-    "Name" standing on the row, because absorption gave up at the gap. What
-    licenses the extra reach is the separator between them -- the ":" that
-    binds a field label to its value.
+    Found by sweeping the org. The label reaches its value across a tab stop
+    that the 150pt limit did not cover, with or without a colon to point the
+    way: JA-26566 left "Name" standing, JA-26355 left "NAME" at the head of a
+    colon-less table whose other rows read "GENDER", "DOB", "ADDRESS".
     """
     doc = fitz.open()
     page = doc.new_page()
-    for y, label, value in ((100, "Name", "PRAHLAD KUMAR"),
-                            (130, "Profession", "Surveyor")):
-        page.insert_text((33, y), label, fontsize=10)
-        page.insert_text((231, y), ":", fontsize=10)
-        page.insert_text((295, y), value, fontsize=10)
+    # colon-separated, and the bare two-column form beneath it
+    page.insert_text((33, 100), "Name", fontsize=10)
+    page.insert_text((231, 100), ":", fontsize=10)
+    page.insert_text((295, 100), "PRAHLAD KUMAR", fontsize=10)
+    page.insert_text((33, 130), "MOBILE", fontsize=10)
+    page.insert_text((215, 130), "9876543210", fontsize=10)
+    page.insert_text((33, 160), "GENDER", fontsize=10)
+    page.insert_text((215, 160), "Male", fontsize=10)
     pdf = doc.tobytes()
     doc.close()
 
-    masked, _ = mask.mask_pdf_bytes(pdf, ["Prahlad Kumar"], watermark_text="")
+    masked, _ = mask.mask_pdf_bytes(pdf, ["Prahlad Kumar", "9876543210"],
+                                    watermark_text="")
     doc = fitz.open(stream=masked, filetype="pdf")
     text = doc[0].get_text()
     doc.close()
     stripped = _norm(text)
-    assert "PRAHLAD" not in stripped and "KUMAR" not in stripped
+    assert "PRAHLAD" not in stripped and "9876543210" not in stripped
     assert "Name" not in stripped, f"table label left standing: {text!r}"
+    assert "MOBILE" not in stripped, f"table label left standing: {text!r}"
     # The row below is not a contact detail: it keeps its label and its value.
-    assert "Profession" in text and "Surveyor" in text
+    assert "GENDER" in text and "Male" in text
 
 
 def test_a_label_in_another_block_needs_a_separator_to_reach_the_value():
