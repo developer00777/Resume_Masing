@@ -266,3 +266,97 @@ def test_sf_domain_names_the_host_not_the_org():
         assert sf_client._domain(spelling) == "test", spelling
     # A real My Domain host is passed through untouched.
     assert sf_client._domain("acme--uat.sandbox.my") == "acme--uat.sandbox.my"
+
+
+# =========================================================================
+# riding out a Salesforce blip, without riding out a real answer
+# =========================================================================
+
+TRANSIENT = [
+    "Authentication failed (code: 503): We are down for maintenance",
+    "Authentication failed (code: unknown_error): retry your request",
+    "Authentication failed (code: 504): upstream request timeout",
+    "Server is busy, try again later",
+    "REQUEST_LIMIT_EXCEEDED: TotalRequests Limit exceeded",
+]
+
+FINAL = [
+    "INVALID_LOGIN: Invalid username, password, security token; or user locked out",
+    "invalid_grant: authentication failure",
+    "Error Code 500. Response content: [{'message': 'invalid parameter value'}]",
+    "MALFORMED_ID: Job Applicant ID: id value of incorrect type",
+    "FIELD_CUSTOM_VALIDATION_EXCEPTION: masked file already attached",
+]
+
+
+@pytest.mark.parametrize("message", TRANSIENT)
+def test_a_salesforce_blip_is_recognised_as_worth_retrying(message):
+    """These three were seen in a week of live running, all at the login step
+    and all with the org perfectly healthy either side."""
+    assert sf_client.is_transient(RuntimeError(message)), message
+
+
+@pytest.mark.parametrize("message", FINAL)
+def test_a_real_answer_is_never_retried(message):
+    """The half that matters more. A wrong password retried three times is
+    still a wrong password, and a Job Applicant with no resume will not grow
+    one -- retrying either only spends API calls to arrive back here."""
+    assert not sf_client.is_transient(RuntimeError(message)), message
+
+
+def test_a_missing_resume_is_final_whatever_it_says():
+    """Matched on the exception type, not on its text, because the message is
+    a filename and could contain anything at all."""
+    assert not sf_client.is_transient(
+        sf_client.ResumeNotFoundError("no resume: retry your request.pdf"))
+
+
+def test_with_session_retries_a_blip_and_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(sf):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("Authentication failed (code: 503): "
+                               "We are down for maintenance")
+        return "masked"
+
+    monkeypatch.setattr(sf_client, "connect",
+                        lambda client_key=None, force_refresh=False: object())
+    monkeypatch.setattr(sf_client.time, "sleep", lambda s: None)
+    assert sf_client.with_session(flaky) == "masked"
+    assert calls["n"] == 3
+
+
+def test_with_session_gives_up_after_the_configured_attempts(monkeypatch):
+    calls = {"n": 0}
+
+    def always_down(sf):
+        calls["n"] += 1
+        raise RuntimeError("Authentication failed (code: 504): "
+                           "upstream request timeout")
+
+    monkeypatch.setattr(sf_client, "connect",
+                        lambda client_key=None, force_refresh=False: object())
+    monkeypatch.setattr(sf_client.time, "sleep", lambda s: None)
+    with pytest.raises(RuntimeError):
+        sf_client.with_session(always_down)
+    assert calls["n"] == sf_client.RETRY_ATTEMPTS, \
+        "a blip that never clears must still stop"
+
+
+def test_with_session_does_not_retry_a_wrong_password(monkeypatch):
+    calls = {"n": 0}
+
+    def rejected(sf):
+        calls["n"] += 1
+        raise RuntimeError("INVALID_LOGIN: Invalid username, password, "
+                           "security token; or user locked out")
+
+    monkeypatch.setattr(sf_client, "connect",
+                        lambda client_key=None, force_refresh=False: object())
+    monkeypatch.setattr(sf_client.time, "sleep",
+                        lambda s: pytest.fail("slept before a final failure"))
+    with pytest.raises(RuntimeError):
+        sf_client.with_session(rejected)
+    assert calls["n"] == 1, "a rejected password was tried more than once"

@@ -416,9 +416,56 @@ class SessionExpiredError(RuntimeError):
 SESSION_EXPIRED_ERRORS = (SalesforceExpiredSession, SessionExpiredError)
 
 
-def with_session(fn: Callable[[Salesforce], T], client_key: str | None = None) -> T:
+#: What a Salesforce failure looks like when the right response is to try
+#: again in a moment. Measured, not imagined -- these are the three seen in a
+#: week of live runs, all of them at the login step and all of them with the
+#: org perfectly healthy either side:
+#:
+#:     Authentication failed (code: 503): We are down for maintenance
+#:     Authentication failed (code: unknown_error): retry your request
+#:     Authentication failed (code: 504): upstream request timeout
+#:
+#: Matched on these signatures rather than on the exception type, because
+#: simple-salesforce reports a maintenance window and a wrong password as the
+#: same class. That distinction is the whole point: a wrong password retried
+#: three times is still a wrong password, and INVALID_LOGIN deliberately
+#: matches nothing here.
+_TRANSIENT_SIGNS = (
+    "code: 502", "code: 503", "code: 504",
+    "down for maintenance", "retry your request", "upstream request time",
+    "server is busy", "temporarily unavailable", "request_limit_exceeded",
+)
+
+#: How many times a transient failure is tried in total, and how long the
+#: wait grows between attempts. Small: this is for riding out a blip of a few
+#: seconds, not for waiting out an outage -- one item in twenty failed this
+#: way on a live 20-resume run, which at 100 resumes is five lost to nothing
+#: but bad luck.
+RETRY_ATTEMPTS = int(os.environ.get("SF_RETRY_ATTEMPTS", "3"))
+RETRY_BACKOFF = float(os.environ.get("SF_RETRY_BACKOFF", "1.5"))
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Is `exc` a Salesforce blip rather than a real answer?
+
+    Conservative by design. Anything not recognised here is treated as final,
+    because retrying a permanent failure -- a Job Applicant with no resume, a
+    document that will not convert, a rejected password -- only spends
+    Salesforce API calls to arrive at the same place.
+    """
+    if isinstance(exc, (ResumeNotFoundError, MissingCredentialsError,
+                        UnknownClientError)):
+        return False
+    text = f"{exc}".lower()
+    if "invalid_login" in text or "invalid_grant" in text:
+        return False                      # a real credential problem
+    return any(sign in text for sign in _TRANSIENT_SIGNS)
+
+
+def with_session(fn: Callable[[Salesforce], T], client_key: str | None = None,
+                 attempts: int | None = None) -> T:
     """Run fn(sf) against a fresh/cached Salesforce session, retrying once on a
-    dead session.
+    dead session and a few times on a transient failure.
 
     The client-credentials token cache uses a conservative fixed TTL (Salesforce
     doesn't reliably return expires_in for that grant), so a cached token can go
@@ -428,15 +475,29 @@ def with_session(fn: Callable[[Salesforce], T], client_key: str | None = None) -
     point of failure -- true here since every sf_client operation either reads
     or does a single atomic Salesforce write.
 
-    Raises whatever fn/connect raise; the retry only fires for a session that
-    Salesforce itself has rejected as expired/invalid.
+    The same idempotence is what makes the transient retry safe. Salesforce
+    goes briefly unavailable often enough to matter in bulk -- one item in
+    twenty on a live 20-resume run -- and at that rate a hundred resumes lose
+    five to nothing but timing, with nobody watching to re-run them. Only
+    failures is_transient() recognises are retried; everything else is
+    returned as the answer it is, immediately.
     """
-    sf = connect(client_key=client_key)
-    try:
-        return fn(sf)
-    except SESSION_EXPIRED_ERRORS:
-        sf = connect(client_key=client_key, force_refresh=True)
-        return fn(sf)
+    total = RETRY_ATTEMPTS if attempts is None else attempts
+    for attempt in range(1, max(1, total) + 1):
+        try:
+            sf = connect(client_key=client_key)
+            try:
+                return fn(sf)
+            except SESSION_EXPIRED_ERRORS:
+                sf = connect(client_key=client_key, force_refresh=True)
+                return fn(sf)
+        except Exception as e:
+            if attempt >= total or not is_transient(e):
+                raise
+            # A blip at the login step leaves a cached token that may itself
+            # be the problem, so the next attempt reconnects from scratch.
+            time.sleep(RETRY_BACKOFF * attempt)
+    raise AssertionError("unreachable")        # pragma: no cover
 
 
 def creds_configured(client_key: str | None = None) -> bool:
