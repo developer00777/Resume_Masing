@@ -1008,6 +1008,12 @@ def _ids_from_any_param(request: Request) -> str:
 
 
 @app.get("/candidate/MaskProfileIndex", response_class=HTMLResponse)
+# The org's own consoles disagree about this path: two of the three Aura
+# controllers that launch masking open /candidate/MaskMultipleProfileIndex
+# instead, which was never a route here, so those buttons 404 even once their
+# host is corrected. The page serves one selection or twenty identically, so
+# answering both spellings costs nothing and removes a way to be broken.
+@app.get("/candidate/MaskMultipleProfileIndex", response_class=HTMLResponse)
 def candidate_mask_profile_index(request: Request, sfjobapplicantid: str = "", uname: str = "",
                                  sfURL: str = "", ids: str = "", orgUrl: str = "") -> HTMLResponse:
     """The Salesforce-embedded masking UI -- Jinja2 templates under

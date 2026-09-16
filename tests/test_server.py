@@ -1247,3 +1247,22 @@ def test_the_page_names_what_it_was_opened_with_when_it_finds_no_ids():
     quiet = client.get("/candidate/MaskProfileIndex").text
     assert "none of which" not in quiet, \
         "a page opened with nothing at all should not explain itself"
+
+
+def test_both_spellings_of_the_masking_page_are_served():
+    """The org's consoles disagree about the path.
+
+    Two of the three Aura controllers that launch masking open
+    /candidate/MaskMultipleProfileIndex; the third and the LWC open
+    /candidate/MaskProfileIndex. The page serves one selection or twenty
+    identically, so both answer -- otherwise those buttons 404 even after
+    their dead host is corrected.
+    """
+    client = TestClient(server.app)
+    ids = ["a0Ce200005Lj6AlEAJ", "a0Ce200005RrtfoEAB"]
+    for path in ("/candidate/MaskProfileIndex",
+                 "/candidate/MaskMultipleProfileIndex"):
+        resp = client.get(f"{path}?sfjobapplicantid=" + ";".join(ids))
+        assert resp.status_code == 200, f"{path} -> {resp.status_code}"
+        for one in ids:
+            assert one in resp.text, f"{path} lost {one}"
