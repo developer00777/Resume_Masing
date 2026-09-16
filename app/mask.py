@@ -942,7 +942,11 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     hits = 0
-    watermark = prepare_watermark(watermark_png) if watermark_png else None
+    # One prepared pixmap per opacity the document turns out to need.
+    # prepare_watermark() walks every pixel of the logo, so a resume whose
+    # pages are all the same colour -- which is nearly all of them -- still
+    # pays for that exactly once.
+    watermarks: dict[float, fitz.Pixmap | None] = {}
     # expand() splits a Contact field holding several phone numbers into one
     # entry per number. Left whole, such a value is too long to classify as a
     # phone and gets searched as a single literal that appears in no resume --
@@ -986,8 +990,16 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         # Watermark only when the client actually has one. No stand-in text:
         # a "CONFIDENTIAL" default was being stamped on every masked resume
         # for clients who had never configured a watermark at all.
-        if watermark is not None:
-            _watermark_image(page, watermark)
+        #
+        # Measured here rather than once for the document, because the page
+        # this reads is the page as delivered -- redactions applied, so the
+        # tone is what the recruiter will actually see behind the stamp.
+        if watermark_png:
+            opacity = round(watermark_opacity_for(page), 2)
+            if opacity not in watermarks:
+                watermarks[opacity] = prepare_watermark(watermark_png, opacity)
+            if watermarks[opacity] is not None:
+                _watermark_image(page, watermarks[opacity])
         elif watermark_text:
             _watermark_text(page, watermark_text)
 
@@ -1006,9 +1018,23 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
 #: the resume.
 WATERMARK_WIDTH_RATIO = 0.28
 
-#: How much of the watermark's own opacity survives. A logo has to read as a
-#: stamp behind the content, not as a panel over it.
+#: How much of the watermark's own opacity survives on an ordinary white
+#: page. A logo has to read as a stamp over the content, not as a panel.
 WATERMARK_OPACITY = 0.16
+
+#: The most ink the stamp may use, however dark the page under it. A fade
+#: tuned for white disappears on a dark template, and one heavy enough for a
+#: dark template is a blotch on white -- measured across page colours, the
+#: same logo changed the rendered page nearly four times as much on white as
+#: on dark navy. This is the ceiling on correcting for that.
+WATERMARK_MAX_OPACITY = 0.34
+
+#: A page at least this light needs no correction at all.
+WATERMARK_LIGHT_TONE = 0.85
+
+#: And below this a page counts as fully dark, so the correction cannot divide
+#: by something near zero and ask for an opaque stamp.
+WATERMARK_DARK_TONE = 0.30
 
 #: A pixel at least this bright in every channel counts as background and is
 #: knocked out completely -- but only for a source with no alpha channel of its
@@ -1018,7 +1044,49 @@ WATERMARK_OPACITY = 0.16
 WATERMARK_WHITE_CUTOFF = 240
 
 
-def prepare_watermark(image_bytes: bytes) -> fitz.Pixmap | None:
+def _page_tone(page: fitz.Page) -> float:
+    """Mean lightness of the middle of `page`, 0 (black) to 1 (white).
+
+    Sampled where the stamp is about to go, at a tiny scale -- the answer is
+    an average, so a handful of pixels is as good as a million and costs
+    nothing. Never fatal: a page that will not render is treated as white,
+    which is the no-correction case.
+    """
+    r = page.rect
+    box = fitz.Rect(r.width * 0.35, r.height * 0.40,
+                    r.width * 0.65, r.height * 0.60)
+    try:
+        pix = page.get_pixmap(clip=box, matrix=fitz.Matrix(0.08, 0.08),
+                              colorspace=fitz.csGRAY)
+    except Exception:
+        return 1.0
+    samples = pix.samples
+    if not samples:
+        return 1.0
+    return sum(samples) / (len(samples) * 255.0)
+
+
+def watermark_opacity_for(page: fitz.Page) -> float:
+    """How much ink this page's stamp needs to read as a stamp.
+
+    A watermark is a fixed fraction of ink laid over whatever the resume is
+    printed on, so how much of it you can see depends on that background. The
+    client's blue logo changes a white page by four times as much as it
+    changes a dark one, which is the other half of "the watermark shows on
+    some resumes and not others" -- the first half being that it used to be
+    painted underneath the page's own background and buried outright.
+
+    Light pages are left exactly as they were.
+    """
+    tone = _page_tone(page)
+    if tone >= WATERMARK_LIGHT_TONE:
+        return WATERMARK_OPACITY
+    return min(WATERMARK_MAX_OPACITY,
+               WATERMARK_OPACITY / max(WATERMARK_DARK_TONE, tone))
+
+
+def prepare_watermark(image_bytes: bytes,
+                      opacity: float = WATERMARK_OPACITY) -> fitz.Pixmap | None:
     """Turn an uploaded logo into something safe to stamp over a resume.
 
     Two corrections, both driven by what clients actually upload:
@@ -1047,7 +1115,6 @@ def prepare_watermark(image_bytes: bytes) -> fitz.Pixmap | None:
         if len(data) != pix.width * pix.height * 4:
             return pix                              # unexpected layout; leave it alone
         cutoff = WATERMARK_WHITE_CUTOFF
-        opacity = WATERMARK_OPACITY
         for i in range(0, len(data), 4):
             if not had_alpha and (data[i] >= cutoff and data[i + 1] >= cutoff
                                   and data[i + 2] >= cutoff):
@@ -1091,11 +1158,22 @@ def _watermark_image(page: fitz.Page, pixmap: fitz.Pixmap) -> None:
     page.insert_image(
         fitz.Rect(cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2),
         pixmap=pixmap,
-        # BEHIND the text, not over it: overlay=False puts the image at the
-        # start of the content stream so every glyph is painted on top of it.
-        # Faded and underneath is the only combination that reads as a
-        # watermark rather than as something spilled on the page.
-        overlay=False,
+        # ON TOP. This used to be overlay=False -- the image first in the
+        # content stream, every glyph painted over it -- which reads better
+        # right up until the resume paints a background of its own. A template
+        # that lays down a full-page rectangle buries the watermark entirely,
+        # and measured across sampled resumes two in eight did exactly that:
+        # the stamp was applied, reported in watermark_used, and changed not a
+        # single pixel of the rendered page. That is the "some resumes have
+        # the watermark and some don't" report, and no amount of tuning the
+        # fade could fix it, because the watermark was underneath an opaque
+        # rectangle.
+        #
+        # Painting last is the only placement that does not depend on what the
+        # resume itself draws. What keeps it a watermark rather than something
+        # spilled on the page is WATERMARK_OPACITY, which prepare_watermark()
+        # has already baked into the alpha channel.
+        overlay=True,
         keep_proportion=True,
     )
 

@@ -688,6 +688,72 @@ def _logo_png(width=64, height=64, opaque=True):
     return png
 
 
+def _page_with_background(fill, lines=("RAHUL SHARMA", "Acme Corp 2019 - 2023")):
+    """A resume that paints its own full-page background, as templates do."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.draw_rect(page.rect, color=None, fill=fill)
+    y = 80.0
+    ink = (0, 0, 0) if sum(fill) > 1.5 else (1, 1, 1)
+    for line in lines:
+        page.insert_text((56, y), line, fontsize=11, color=ink)
+        y += 18
+    out = doc.tobytes()
+    doc.close()
+    return out
+
+
+def _rendered(pdf: bytes) -> bytes:
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    samples = doc[0].get_pixmap().samples
+    doc.close()
+    return samples
+
+
+def test_watermark_survives_a_page_that_paints_its_own_background():
+    """The stamp has to be visible on a template that has a background.
+
+    It used to be inserted at the START of the content stream -- underneath
+    everything, so the glyphs painted over it -- which reads beautifully right
+    up until the resume paints a rectangle of its own. Then the watermark is
+    buried: applied, reported in watermark_used, and changing not one pixel of
+    the rendered page. Two of eight sampled live resumes did exactly that, and
+    it is the "some resumes have the watermark and some don't" report.
+    """
+    for fill in ((1.0, 1.0, 1.0), (0.85, 0.80, 0.55)):
+        pdf = _page_with_background(fill)
+        plain, _ = mask.mask_pdf_bytes(pdf, [], watermark_text="")
+        stamped, _ = mask.mask_pdf_bytes(pdf, [], watermark_png=_logo_png(256, 256))
+        assert _rendered(plain) != _rendered(stamped), \
+            f"the watermark was buried by a {fill} background"
+
+
+def test_a_dark_page_gets_more_ink_than_a_white_one():
+    """How much of a watermark you can see depends on what it lies on.
+
+    The same logo changes a white page by roughly four times as much as it
+    changes a dark one, which is the other half of the report -- the colour
+    the resume is printed in deciding whether the stamp reads at all. Light
+    pages are left exactly as they were; only a dark one is corrected, and
+    only up to a ceiling, because a stamp heavy enough to read on black would
+    be a blotch on white.
+    """
+    def opacity_for(fill):
+        doc = fitz.open(stream=_page_with_background(fill), filetype="pdf")
+        value = mask.watermark_opacity_for(doc[0])
+        doc.close()
+        return value
+
+    white = opacity_for((1.0, 1.0, 1.0))
+    cream = opacity_for((0.98, 0.96, 0.88))
+    dark = opacity_for((0.12, 0.16, 0.30))
+
+    assert white == mask.WATERMARK_OPACITY, "a white page was corrected"
+    assert cream == mask.WATERMARK_OPACITY, "a light page was corrected"
+    assert dark > white, "a dark page was left as faint as a white one"
+    assert dark <= mask.WATERMARK_MAX_OPACITY, "the correction has no ceiling"
+
+
 def test_opaque_logo_background_is_knocked_out_and_faded():
     """An uploaded logo must not arrive as a filled rectangle over the text.
 
