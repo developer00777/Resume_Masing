@@ -360,3 +360,45 @@ def test_with_session_does_not_retry_a_wrong_password(monkeypatch):
     with pytest.raises(RuntimeError):
         sf_client.with_session(rejected)
     assert calls["n"] == 1, "a rejected password was tried more than once"
+
+
+def test_a_client_key_with_no_registry_uses_the_default_credentials(monkeypatch):
+    """A client_key only means something once a registry exists.
+
+    The Apex sends UserInfo.getOrganizationId() as the client_key on every
+    call. On a single-tenant deployment -- no SF_CLIENTS_JSON, no rows in
+    Postgres -- that used to be refused outright with "Unknown client_key ...
+    Configured: none", so every batch failed while the org's own credentials
+    sat working in the environment. Worse, the refusal came back as an empty
+    results array rather than an error the caller recognised, so it read as
+    "nothing to do".
+    """
+    monkeypatch.delenv("SF_CLIENTS_JSON", raising=False)
+    monkeypatch.setenv("SF_USERNAME", "u@example.com")
+    monkeypatch.setenv("SF_PASSWORD", "pw")
+    monkeypatch.setenv("SF_SECURITY_TOKEN", "tok")
+
+    built = {}
+
+    def fake_salesforce(**kwargs):
+        built.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(sf_client, "Salesforce", fake_salesforce)
+    sf_client.connect(client_key="00D5j00000Di0AfEAJ")
+    assert built.get("username") == "u@example.com", \
+        "the default credentials were not used"
+
+    # And it reports itself configured rather than raising.
+    sf_client.connect_kwargs_present(client_key="00D5j00000Di0AfEAJ")
+    assert sf_client.creds_configured(client_key="00D5j00000Di0AfEAJ") is True
+
+
+def test_an_unknown_client_key_is_still_refused_when_a_registry_exists(monkeypatch):
+    """The other half: once a registry is configured, a key that is not in it
+    is a real mistake and must not silently fall back to some other org's
+    credentials."""
+    monkeypatch.setenv("SF_CLIENTS_JSON", json.dumps({"acme": ACME_ENTRY}))
+    with pytest.raises(sf_client.UnknownClientError):
+        sf_client.connect(client_key="not-a-registered-org")
+    assert sf_client.creds_configured(client_key="not-a-registered-org") is False

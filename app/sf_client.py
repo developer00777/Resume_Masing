@@ -345,7 +345,22 @@ def _domain(value: str | None) -> str:
 
 def connect(client_key: str | None = None, force_refresh: bool = False) -> Salesforce:
     if client_key:
-        return _connect_with_client_credentials(client_key, force_refresh=force_refresh)
+        # A client_key only means something when a multi-client registry has
+        # been set up. With none configured there is exactly one org this
+        # service can talk to -- the one in the environment -- so a key names
+        # it rather than contradicting it.
+        #
+        # Rejecting it instead cost a long hunt: the Apex sends
+        # UserInfo.getOrganizationId() as the client_key on every call, so a
+        # single-tenant deployment had every batch refused with "Unknown
+        # client_key ... Configured: none" while its own credentials sat
+        # working in the environment.
+        if not _load_client_registry():
+            logger.info("client_key %r ignored: no client registry is "
+                        "configured, using the default credentials", client_key)
+        else:
+            return _connect_with_client_credentials(
+                client_key, force_refresh=force_refresh)
 
     override = _load_default_override(force=force_refresh)
     try:
@@ -509,9 +524,11 @@ def creds_configured(client_key: str | None = None) -> bool:
 
 
 def connect_kwargs_present(client_key: str | None = None) -> None:
-    if client_key:
+    if client_key and _load_client_registry():
         _get_client_entry(client_key)  # raises UnknownClientError if absent
         return
+    # A client_key with no registry behind it falls through to the default
+    # credentials, exactly as connect() does -- see the note there.
     if _load_client_registry():
         return  # at least one multi-client entry configured, no client_key required to report "configured"
     if _load_default_override() is not None and os.environ.get("SF_USERNAME", "").strip():
