@@ -34,6 +34,19 @@
         <div id="manualEntry" class="d-none">
             <h5 class="section-title">Enter Job Applicant IDs</h5>
             <p class="text-muted small">Separate multiple IDs by comma, space, or new line.</p>
+            {% if ctx.received_params %}
+            <!-- Opened WITH parameters but none of them held Job Applicant Ids.
+                 Naming them here is the difference between "nothing was
+                 selected" and "the selection arrived under a name this page
+                 does not read" -- the two look identical otherwise, and the
+                 server's access log records no query strings to tell them
+                 apart. -->
+            <p class="text-muted small">
+                Opened with <code>{{ ctx.received_params }}</code>, none of which
+                carried Job Applicant Ids. If records were selected in
+                Salesforce, send them as <code>sfjobapplicantid</code>.
+            </p>
+            {% endif %}
         </div>
 
         <!-- Always present; hidden visually when records were passed in from Salesforce -->

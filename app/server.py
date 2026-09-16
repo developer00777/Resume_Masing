@@ -968,6 +968,45 @@ async def watermark_upload(
         return WatermarkUploadResponse(status="error", detail=str(e)[:200])
 
 
+#: A Salesforce record Id: 15 characters, or 18 with the case-safety suffix.
+_SF_ID_RE = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
+
+#: Parameters that carry something else entirely. sfURL matters most: it ends
+#: in the Organization Id, which is a perfectly well-formed record Id and is
+#: not a Job Applicant.
+_NOT_ID_PARAMS = frozenset({"uname", "sfurl", "orgurl", "username", "user"})
+
+
+def _ids_from_any_param(request: Request) -> str:
+    """Job Applicant Ids out of whatever the caller called them.
+
+    The documented parameter is sfjobapplicantid, and when the page is opened
+    with it everything works. When the page is opened WITHOUT it -- a changed
+    Lightning component, a differently-built URL -- the page gets an empty
+    selection, the button has nothing to send, and no request reaches the
+    server at all. That failure is invisible from this end: the logs show the
+    page being fetched and then nothing, which reads like the button being
+    broken rather than like the selection never arriving.
+
+    So rather than insist on one spelling, take the ids from any parameter
+    whose NAME suggests it holds some, and ignore the ones known to hold
+    something else. Names only -- scanning every value would harvest the
+    Organization Id out of sfURL.
+    """
+    found: list[str] = []
+    for name, value in request.query_params.multi_items():
+        lowered = name.lower()
+        if lowered in _NOT_ID_PARAMS:
+            continue
+        if not any(hint in lowered for hint in ("id", "applicant", "record", "profile")):
+            continue
+        for token in re.split(r"[\s,;]+", value or ""):
+            token = token.strip()
+            if token and _SF_ID_RE.match(token) and token not in found:
+                found.append(token)
+    return ";".join(found)
+
+
 @app.get("/candidate/MaskProfileIndex", response_class=HTMLResponse)
 def candidate_mask_profile_index(request: Request, sfjobapplicantid: str = "", uname: str = "",
                                  sfURL: str = "", ids: str = "", orgUrl: str = "") -> HTMLResponse:
@@ -1000,9 +1039,15 @@ def candidate_mask_profile_index(request: Request, sfjobapplicantid: str = "", u
     # configured, and which host) is real, useful state the page should
     # show on load instead of a blank form implying nothing is set.
     settings_status = sf_client.default_credentials_status()
+    prefill = (sfjobapplicantid or ids or "").strip() or _ids_from_any_param(request)
     ctx = {
         "uname": uname.strip() or os.environ.get("SF_USERNAME", "").strip(),
-        "prefill_ids": sfjobapplicantid or ids,
+        "prefill_ids": prefill,
+        # What the page was actually opened with. Shown only when no ids were
+        # found, so "nothing is selected" can be told apart from "the
+        # selection arrived under a name nobody here expected" without
+        # needing the server's logs, which do not record query strings.
+        "received_params": ",".join(sorted(request.query_params.keys())),
         "org_url": sfURL or orgUrl,
         "api_key": os.environ.get("MASK_API_KEY", "").strip(),
         "settings_configured": settings_status["configured"],

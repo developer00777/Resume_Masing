@@ -1197,3 +1197,53 @@ def test_mask_batch_never_exceeds_the_configured_width(monkeypatch):
                json={"items": [{"job_applicant_id": f"a0C{i:03d}"}
                                for i in range(12)]})
     assert live["peak"] <= 3, f"ran {live['peak']} at once, cap was 3"
+
+
+def test_the_page_takes_ids_from_whatever_the_caller_calls_them():
+    """The selection has to survive being spelled differently.
+
+    Opened without the documented parameter the page gets nothing, the button
+    has nothing to send, and NO request reaches the server -- which in the
+    access log looks like the page being fetched and then silence. That reads
+    as a broken button rather than as a selection that never arrived.
+    """
+    client = TestClient(server.app)
+    ids = ["a0Ce200005Lj6AlEAJ", "a0Ce200005RrtfoEAB"]
+    for param in ("sfjobapplicantid", "ids", "recordIds", "jobApplicantIds",
+                  "selected_ids", "profileIds"):
+        page = client.get(f"/candidate/MaskProfileIndex?{param}=" + ";".join(ids)).text
+        for one in ids:
+            assert one in page, f"{param}: {one} never reached the page"
+
+
+def test_the_page_does_not_mistake_an_org_id_for_a_selection():
+    """sfURL ends in the Organization Id, which is a well-formed record Id and
+    is emphatically not a Job Applicant. Scanning every value would harvest
+    it and offer to mask it."""
+    import re
+
+    client = TestClient(server.app)
+    org = "00De20000012345AAA"
+    page = client.get(
+        "/candidate/MaskProfileIndex"
+        f"?sfURL=https://x.my.salesforce.com/services/Soap/c/59.0/{org}"
+        "&uname=someone@example.com").text
+    # sfURL is echoed into the page as context in its own right, so the Id
+    # appears in the HTML either way. What must not happen is it arriving in
+    # the box the Mask button reads from.
+    box = re.search(r'id="jaIds"[^>]*>(.*?)</textarea>', page, re.S)
+    assert box, "the id textarea is gone"
+    assert org not in box.group(1), "the Organization Id was read as a selection"
+    assert not box.group(1).strip(), "something was offered up to be masked"
+
+
+def test_the_page_names_what_it_was_opened_with_when_it_finds_no_ids():
+    """So the two ways of having nothing to mask can be told apart without
+    the server's logs, which do not record query strings."""
+    client = TestClient(server.app)
+    page = client.get("/candidate/MaskProfileIndex?mystery=abc&uname=a@b.c").text
+    assert "mystery" in page, "the page did not say what it received"
+
+    quiet = client.get("/candidate/MaskProfileIndex").text
+    assert "none of which" not in quiet, \
+        "a page opened with nothing at all should not explain itself"
