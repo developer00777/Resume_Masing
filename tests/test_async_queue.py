@@ -398,3 +398,23 @@ def test_an_idle_pool_holds_no_slots(q):
             await r.aclose()
 
     asyncio.run(scenario())
+
+
+def test_health_says_whether_this_service_drains_the_queue(q, monkeypatch):
+    """"Is the worker actually live?" has to be answerable from outside.
+
+    The queue counters look identical whether the API or a worker container is
+    clearing the backlog, so a draining queue proves only that something is
+    draining it. With drained_here false and the depth still falling, the
+    answer is yes and nothing else could be doing it.
+    """
+    async def report():
+        return await q.stats()
+
+    monkeypatch.setenv("MASK_RUN_WORKERS", "1")
+    assert asyncio.run(report())["drained_here"] is True
+
+    monkeypatch.setenv("MASK_RUN_WORKERS", "0")
+    stats = asyncio.run(report())
+    assert stats["drained_here"] is False
+    assert stats["max_concurrent"] == q.MAX_CONCURRENT

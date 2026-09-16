@@ -231,16 +231,25 @@ async def stats() -> dict:
     """Queue depth and current width, for /health."""
     r = client()
     if r is None:
-        return {"backend": "disabled", "max_concurrent": MAX_CONCURRENT}
+        return {"backend": "disabled", "max_concurrent": MAX_CONCURRENT,
+                "drained_here": False}
     try:
         queued = await r.llen(QUEUE_KEY)
         await r.zremrangebyscore(INFLIGHT_KEY, 0, time.time() - LEASE_TTL)
         inflight = await r.zcard(INFLIGHT_KEY)
+        # Whether THIS service is one of the things draining the queue.
+        # Without it there is no way to tell from outside whether a backlog is
+        # being cleared by the API or by a worker container -- the queue
+        # counters look identical either way, which makes "is the worker
+        # actually live?" unanswerable. With drained_here false and the queue
+        # still emptying, the answer is yes and nothing else could be doing it.
         return {"backend": "redis", "queued": queued, "in_flight": inflight,
-                "max_concurrent": MAX_CONCURRENT}
+                "max_concurrent": MAX_CONCURRENT,
+                "drained_here": run_workers_here()}
     except Exception as e:
         return {"backend": "redis", "error": type(e).__name__,
-                "max_concurrent": MAX_CONCURRENT}
+                "max_concurrent": MAX_CONCURRENT,
+                "drained_here": run_workers_here()}
 
 
 # --- draining the queue ---------------------------------------------------
