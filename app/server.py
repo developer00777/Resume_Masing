@@ -56,6 +56,7 @@ mid-rollout; /health stays open for Railway's healthcheck.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 from contextlib import asynccontextmanager
@@ -539,35 +540,55 @@ async def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
     if handoff is not None:
         return handoff
 
-    def run_batch(sf) -> BatchMaskResponse:
-        results: list[BatchMaskResult] = []
-        for item in req.items:
-            item_req = _batch_item_to_mask_request(item, req)
-            try:
-                result = _mask_one(item_req, sf)
-            except sf_client.SESSION_EXPIRED_ERRORS:
-                # Let with_session()'s retry handle this at the batch level --
-                # re-raising here (instead of turning it into a per-item error)
-                # is what makes the whole batch retry against a fresh session.
-                raise
-            except Exception as e:
-                # Any other per-item failure (e.g. a Salesforce validation rule
-                # rejecting the upload) must not take down the rest of the batch.
-                result = MaskResponse(status="error", detail=str(e)[:300])
-            results.append(BatchMaskResult(job_applicant_id=item.job_applicant_id, result=result))
-        succeeded = sum(1 for r in results if r.result.status == "ok")
-        return BatchMaskResponse(
-            status="ok",
-            results=results,
-            succeeded=succeeded,
-            failed=len(results) - succeeded,
-        )
-
+    # Credentials are a property of the batch, not of an item: if the org
+    # cannot be reached at all, saying so once is the honest answer, and
+    # reporting it as N identical per-item failures would bury it. Checked up
+    # front, against a cached token, so it costs nothing per batch.
     try:
-        return sf_client.with_session(run_batch, client_key=req.client_key)
+        await asyncio.to_thread(
+            lambda: sf_client.with_session(lambda sf: None,
+                                           client_key=req.client_key))
     except (sf_client.MissingCredentialsError, sf_client.UnknownClientError,
             sf_client.SalesforceAuthenticationError) as e:
         return BatchMaskResponse(status="error", detail=str(e))
+
+    # One slot per item, never more than MASK_MAX_CONCURRENT at once. The
+    # items do not touch each other: each opens its own Salesforce session,
+    # masks its own PDF in its own thread, and writes its result into its own
+    # slot in a list sized up front. Nothing is appended and nothing is
+    # shared, so the order of the results is the order of the request however
+    # the timings fall out.
+    gate = asyncio.Semaphore(max(1, jobs.MAX_CONCURRENT))
+    results: list[BatchMaskResult | None] = [None] * len(req.items)
+
+    async def run_one(index: int, item: BatchMaskItem) -> None:
+        item_req = _batch_item_to_mask_request(item, req)
+        async with gate:
+            try:
+                # Its own session, like the queue worker's: a session expiring
+                # mid-batch then fails that one item instead of forcing every
+                # item to be re-run, and no two threads share one HTTP session.
+                result = await asyncio.to_thread(
+                    lambda: sf_client.with_session(
+                        lambda sf: _mask_one(item_req, sf),
+                        client_key=req.client_key))
+            except (sf_client.MissingCredentialsError,
+                    sf_client.UnknownClientError,
+                    sf_client.SalesforceAuthenticationError) as e:
+                result = MaskResponse(status="error", detail=str(e)[:300])
+            except Exception as e:
+                # A per-item failure (a validation rule rejecting the upload,
+                # a resume that will not convert) must not take down the rest.
+                result = MaskResponse(status="error", detail=str(e)[:300])
+        results[index] = BatchMaskResult(
+            job_applicant_id=item.job_applicant_id, result=result)
+
+    await asyncio.gather(*(run_one(i, item) for i, item in enumerate(req.items)))
+
+    done = [r for r in results if r is not None]
+    succeeded = sum(1 for r in done if r.result.status == "ok")
+    return BatchMaskResponse(status="ok", results=done, succeeded=succeeded,
+                             failed=len(done) - succeeded)
 
 
 class AsyncSubmitResponse(BaseModel):

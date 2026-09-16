@@ -55,6 +55,9 @@ def _install_mocks(monkeypatch):
         captured["pdf_bytes"] = pdf_bytes
         captured["filename"] = filename
         captured["job_applicant_id"] = job_applicant_id
+        # Counted as well as captured: a batch masks its items concurrently,
+        # so "the last one" is a race, but "how many" is not.
+        captured["uploads"] = captured.get("uploads", 0) + 1
         return "068000000000001AAA"
 
     def fake_watermark(account_id=None, sf=None):
@@ -827,7 +830,12 @@ def test_mask_batch_all_succeed(monkeypatch):
     assert body["failed"] == 0
     assert [r["job_applicant_id"] for r in body["results"]] == ["a0X000000000010", "a0X000000000011"]
     assert all(r["result"]["status"] == "ok" for r in body["results"])
-    assert captured["job_applicant_id"] == "a0X000000000011", "last item's upload should be the one captured"
+    # Both items were uploaded. Which of them finished LAST is no longer a
+    # fact about the batch: the items are masked concurrently now, so the
+    # winner of that race is timing, not order, and asserting it would be
+    # asserting that they run one at a time.
+    assert captured["job_applicant_id"] in ("a0X000000000010", "a0X000000000011")
+    assert captured["uploads"] == 2, "every item should have been uploaded"
 
 
 def test_mask_batch_partial_failure_does_not_abort_batch(monkeypatch):
@@ -1114,3 +1122,78 @@ def test_health_includes_registry_backend(monkeypatch):
     client = TestClient(server.app)
     resp = client.get("/health")
     assert resp.json()["registry_backend"] == "db+env"
+
+
+def test_mask_batch_runs_items_concurrently_and_keeps_their_order(monkeypatch):
+    """A batch used to mask its items one after another.
+
+    At a few seconds each that made a hundred resumes a hundred serial waits,
+    held open on one HTTP request, which is the "more than ten are not being
+    processed" report. They now run up to MASK_MAX_CONCURRENT at a time.
+
+    Order is the thing concurrency most easily breaks, so it is asserted: the
+    results must come back in the order they were asked for, whatever order
+    they finish in. Here the LAST item is the slowest.
+    """
+    import time
+
+    from app import jobs
+    monkeypatch.setattr(jobs, "MAX_CONCURRENT", 8)
+    monkeypatch.setattr(server.sf_client, "with_session",
+                        lambda fn, client_key=None: fn(object()))
+
+    live = {"now": 0, "peak": 0}
+
+    def slow_mask(req, sf):
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        # The last id sleeps longest, so a serial run would return it last
+        # anyway -- only a concurrent one finishes the others first and still
+        # has to put this back in position.
+        time.sleep(0.25 if req.job_applicant_id.endswith("07") else 0.05)
+        live["now"] -= 1
+        return server.MaskResponse(status="ok", redacted_regions=1,
+                                   detail=req.job_applicant_id)
+
+    monkeypatch.setattr(server, "_mask_one", slow_mask)
+
+    ids = [f"a0Citem{i:02d}" for i in range(8)]
+    started = time.perf_counter()
+    with TestClient(server.app) as c:
+        body = c.post("/mask/batch",
+                      json={"items": [{"job_applicant_id": i} for i in ids]}).json()
+    elapsed = time.perf_counter() - started
+
+    assert body["status"] == "ok" and body["succeeded"] == 8
+    assert [r["job_applicant_id"] for r in body["results"]] == ids, \
+        "the results came back out of order"
+    assert live["peak"] > 1, "the items were masked one at a time"
+    # Serial would be 7*0.05 + 0.25 = 0.6s; concurrent is bounded by the
+    # slowest single item.
+    assert elapsed < 0.55, f"no faster than serial: {elapsed:.2f}s"
+
+
+def test_mask_batch_never_exceeds_the_configured_width(monkeypatch):
+    """Concurrency has to stay inside the same cap everything else obeys."""
+    import time
+
+    from app import jobs
+    monkeypatch.setattr(jobs, "MAX_CONCURRENT", 3)
+    monkeypatch.setattr(server.sf_client, "with_session",
+                        lambda fn, client_key=None: fn(object()))
+
+    live = {"now": 0, "peak": 0}
+
+    def counted(req, sf):
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        time.sleep(0.05)
+        live["now"] -= 1
+        return server.MaskResponse(status="ok")
+
+    monkeypatch.setattr(server, "_mask_one", counted)
+    with TestClient(server.app) as c:
+        c.post("/mask/batch",
+               json={"items": [{"job_applicant_id": f"a0C{i:03d}"}
+                               for i in range(12)]})
+    assert live["peak"] <= 3, f"ran {live['peak']} at once, cap was 3"

@@ -1012,6 +1012,49 @@ def _rects_for(page: fitz.Page, s: str, layout: _Layout) -> list[fitz.Rect]:
     return [_absorb_labels(r, layout) for r in found]
 
 
+#: The corner a resume's own branding sits in. Measured across the corpus:
+#: eight of twenty carry an image in the top-right quadrant of page one -- a
+#: consultancy's watermark, or the candidate's photograph.
+_CORNER_MARK_FRACTION = 0.5
+
+#: And how big such an image may be before it is content rather than
+#: decoration. A scanned resume is one page-sized image and must survive; a
+#: logo or a passport photo is a small fraction of the page.
+_CORNER_MARK_MAX_AREA = 0.2
+
+
+def _corner_image_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """Images sitting in the top-right corner of the page.
+
+    A resume that arrives with an agency's watermark stamped over its top
+    corner carries that branding into the masked copy, where it is both wrong
+    -- it is not this client's mark -- and identifying, since the same corner
+    is where photographs go. Neither belongs in an anonymised resume.
+
+    Only the first page, only the top-right quadrant, and only images small
+    enough to be decoration: a scanned resume is a single page-sized image and
+    has to survive untouched.
+    """
+    rect = page.rect
+    if rect.is_empty:
+        return []
+    cx = rect.x0 + rect.width * _CORNER_MARK_FRACTION
+    cy = rect.y0 + rect.height * _CORNER_MARK_FRACTION
+    limit = rect.get_area() * _CORNER_MARK_MAX_AREA
+    out: list[fitz.Rect] = []
+    try:
+        infos = page.get_image_info()
+    except Exception:
+        return []
+    for info in infos:
+        box = fitz.Rect(info["bbox"])
+        if box.is_empty or box.get_area() > limit:
+            continue
+        if box.x0 >= cx and box.y1 <= cy:
+            out.append(box)
+    return out
+
+
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
                    watermark_png: bytes | None = None,
                    watermark_text: str = "",
@@ -1059,6 +1102,9 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         page_rects: list[fitz.Rect] = []
         for s in wanted:
             page_rects.extend(_rects_for(page, s, layout))
+        # Whatever branding or photograph the resume already carries in its
+        # top corner goes too -- see _corner_image_rects.
+        page_rects.extend(_corner_image_rects(page))
 
         for rect in _bridge_separators(_dedupe_rects(page_rects), layout):
             page.add_redact_annot(rect, fill=REDACT_FILL)

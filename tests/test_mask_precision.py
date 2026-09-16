@@ -754,6 +754,52 @@ def test_a_dark_page_gets_more_ink_than_a_white_one():
     assert dark <= mask.WATERMARK_MAX_OPACITY, "the correction has no ceiling"
 
 
+def test_branding_in_the_top_corner_is_removed():
+    """A resume that arrives with someone's mark stamped on its top corner.
+
+    Eight of twenty sampled live resumes carry an image in the top-right
+    quadrant of page one: an agency's watermark, or the candidate's
+    photograph. Neither belongs in an anonymised copy -- one is not this
+    client's branding, the other identifies the candidate more reliably than
+    their name does.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_image(fitz.Rect(450, 40, 550, 140), stream=_logo_png(100, 100))
+    page.insert_text((56, 300), "Acme Corp 2019 - 2023", fontsize=11)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, [], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    page = doc[0]
+    corner = [i for i in page.get_image_info()
+              if fitz.Rect(i["bbox"]).x0 > page.rect.width / 2
+              and fitz.Rect(i["bbox"]).y1 < page.rect.height / 2]
+    text = page.get_text()
+    doc.close()
+    assert not corner, "the corner branding survived"
+    assert "Acme Corp" in text, "the page content was damaged"
+
+
+def test_a_scanned_resume_is_not_blanked_as_branding():
+    """The guard: a scan is one page-sized image and is the whole resume.
+
+    Removing it because it is an image would deliver an empty page.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_image(page.rect, stream=_logo_png(600, 800))
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, [], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    survived = len(doc[0].get_image_info())
+    doc.close()
+    assert survived == 1, "the scanned page was blanked"
+
+
 def test_opaque_logo_background_is_knocked_out_and_faded():
     """An uploaded logo must not arrive as a filled rectangle over the text.
 

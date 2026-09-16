@@ -101,7 +101,14 @@
   // Chunking keeps each request's wall-clock time bounded, gives visible
   // incremental progress, and means a failure partway through doesn't
   // lose the results already completed.
-  var MASK_CHUNK_SIZE = 5;
+  // The server now masks a chunk's items CONCURRENTLY, up to
+  // MASK_MAX_CONCURRENT at a time, instead of one after another. A chunk of
+  // ten therefore costs about what one resume costs, not ten -- so the old
+  // size of five was leaving the pool nine-tenths idle and making a hundred
+  // resumes twenty sequential round-trips. Matching the server's width keeps
+  // every slot busy while still bounding each request and still showing
+  // progress a chunk at a time.
+  var MASK_CHUNK_SIZE = 10;
 
   function chunk(arr, size) {
     var out = [];
