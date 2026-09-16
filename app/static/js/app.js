@@ -144,6 +144,23 @@
           headers: Object.assign({ "Content-Type": "application/json" }, authHeaders),
           body: JSON.stringify({ items: chunks[c].map(function (id) { return { job_applicant_id: id }; }) }),
         });
+        // A rejected key is not a masking failure, and reporting it as one
+        // per profile is how it hid: the API key is rendered into this page
+        // when it loads, so a tab left open across a deploy -- or a Salesforce
+        // iframe kept alive -- goes on sending a key that is no longer the
+        // one in force. The request then dies in milliseconds, before any
+        // resume is touched, and every profile in the chunk was being listed
+        // as "Batch failed" as though it had been tried and could not be done.
+        // Say what actually happened and what fixes it, and stop: every
+        // remaining chunk would fail the same way.
+        if (resp.status === 401 || resp.status === 403) {
+          maskSummary.classList.add("summary-error");
+          maskSummary.textContent =
+            "This page's session is out of date, so masking was not attempted. "
+            + "Reload the page (Ctrl+Shift+R) and try again.";
+          setMaskBusy(false);
+          return;
+        }
         var data = await resp.json();
         if (data.status === "ok") {
           succeeded += data.succeeded;
