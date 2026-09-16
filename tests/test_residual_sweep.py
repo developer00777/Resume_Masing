@@ -36,7 +36,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import mask, pii, residual  # noqa: E402
+from app import mask, pii, residual
+from app.mask import _CONTACT_LABEL_RE  # noqa: E402
 from app.server import detect_pii  # noqa: E402
 
 #: Compliance bar: a leak is never acceptable, at any accuracy.
@@ -798,6 +799,107 @@ def test_punctuation_glued_after_the_value_goes_with_it():
     assert "rahul" not in stripped and "E-Mail:" not in stripped
     assert "." not in stripped, f"stranded punctuation left: {text!r}"
     assert "2019-2023" in stripped
+
+
+def test_a_label_is_matched_as_parts_not_as_a_phrase():
+    """The wordings are not a list anybody could finish writing.
+
+    Mined from the resumes themselves -- every word sitting next to a masked
+    value across the corpus -- rather than imagined. What they have in common
+    is not a phrase but a handful of parts in any order, joined by anything or
+    nothing: "Email ID:", "ContactNumber", "Mob-No.", "E_mail Id :-", "Ph. No.".
+    So the pattern composes parts, and these come along for free.
+    """
+    for label in ("Email:", "Email ID:", "E_mail Id :-", "EmailID", "E-Mail:",
+                  "Mobile No. :", "Mobile No.", "Ph. No.", "ContactNumber",
+                  "Contact No.", "MobileNo", "Mob-No.", "Cell#", "Tel:",
+                  "Alternate Email ID", "Personal Mob No.", "WhatsApp No",
+                  "Name:", "Candidate Name", "Applicant's Name",
+                  # whose name it is -- these label a name as much as "Name" does
+                  "FATHER'S", "Father’s", "S/o", "D/O", "C/O:", "W/o",
+                  # and the honorific that sits between a label and its value
+                  "Mr.", "Mrs.", "Shri", "Late.",
+                  # a separator left on its own, and the bracketed annotation
+                  "+", ":", "-", "(Mobile)", "(R)", "E"):
+        assert _CONTACT_LABEL_RE.match(label), f"not recognised as a label: {label!r}"
+
+
+def test_ordinary_resume_words_are_not_labels():
+    """The other half of composing parts: it must not compose nonsense.
+
+    "Reside" is res + id + e, which is exactly the kind of accident that makes
+    a clever pattern worse than a list. A lone "E" is matched only as a whole
+    word for that reason.
+    """
+    for word in ("Surveyor", "Indian", "Male", "please", "Objective", "Reside",
+                 "Passport", "Experience", "Nomination", "Network", "Company",
+                 "Designation", "Duration", "Project", "Skills", "CURRICULAM",
+                 "VITAE", "Engineering", "Nationality", "Declaration"):
+        assert not _CONTACT_LABEL_RE.match(word), f"read as a label: {word!r}"
+
+
+def test_a_label_written_above_its_value_is_absorbed():
+    """A sidebar stacks its contact block instead of tabulating it.
+
+        E-mail:
+        someone@example.com
+        Mobile:
+        +91 98765 43210
+
+    Nothing horizontal reaches that, so JA-26736 masked both values and kept
+    both labels. About one label position in six across the corpus is written
+    this way.
+
+    Built with insert_textbox because that is what puts the label and the
+    value in ONE text block, as the real resume does -- separate insert_text
+    calls land in a block each, and the same-block rule below would then
+    (rightly) refuse to reach between them.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(40, 90, 200, 180),
+                        "E-mail:\nrahul@example.com\nMobile:\n+91 98765 43210",
+                        fontsize=9)
+    page.insert_textbox(fitz.Rect(40, 200, 300, 240),
+                        "Acme Corp 2019 - 2023", fontsize=9)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, ["rahul@example.com", "+919876543210"],
+                                    watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    stripped = _norm(text)
+    assert "rahul" not in stripped and "98765" not in stripped
+    assert "E-mail:" not in text, f"stacked label left standing: {text!r}"
+    assert "Mobile:" not in text, f"stacked label left standing: {text!r}"
+    assert "2019-2023" in stripped
+
+
+def test_a_heading_above_a_value_is_not_absorbed():
+    """The guards on reaching upwards, each doing its own job.
+
+    A heading in a block of its own, or further than one line up, or bound to
+    nothing by a separator, heads content that is still on the page -- taking
+    it would strip the title off whatever survived underneath.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    # Its own block, and no separator binding it to anything.
+    page.insert_textbox(fitz.Rect(40, 90, 300, 110), "PERSONAL INFO", fontsize=9)
+    page.insert_textbox(fitz.Rect(40, 120, 300, 160),
+                        "rahul@example.com\nNationality: Indian", fontsize=9)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, ["rahul@example.com"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    assert "rahul" not in _norm(text)
+    assert "PERSONAL INFO" in text, f"a section heading was absorbed: {text!r}"
+    assert "Nationality: Indian" in text, f"the line below was eaten: {text!r}"
 
 
 def test_email_split_across_word_boxes_is_masked():

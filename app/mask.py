@@ -612,30 +612,58 @@ def _matches_case(rect: fitz.Rect, layout: _Layout, needle: str) -> bool:
 #: is left of one.
 _LABEL_SEPS = r"\s.:\-–—#|/+()\[\]"
 
-#: The words a contact label is built from. A real one is several of them
-#: ("Alternate E-Mail ID :", "Personal Mob No."), and the walk takes them one
-#: at a time, so every kind has to be listed or it stops early and strands
-#: what it did not reach.
+#: The PARTS a contact label is built from -- not the labels themselves.
+#:
+#: Enumerating whole labels is how a list ends up missing "Contact No." because
+#: nobody thought of it. Mining the resumes for what actually sits next to a
+#: masked value turned up, among others: "Email ID:", "Mobile No. :", "Ph. No.",
+#: "E_mail Id :-", "EmailID", "FATHER'S NAME", "S/o Shree ...", "C/O: Late.",
+#: "Name: Mr. ...". What those have in common is not a phrase, it is a handful
+#: of parts in any order, joined by anything or nothing at all.
+#:
+#: So a label is matched as a SEQUENCE of these (see _LABEL_PART below), which
+#: gets "Contact Number", "ContactNo", "Mobile-No.", "E_mail Id" and every
+#: other arrangement without any of them being written down.
 _LABEL_WORDS = (
     # the contact channel
-    r"e[-\s]?mail|email|mail|e|phone|mobile|mob|cell(?:ular)?|"
-    r"tel(?:ephone)?|contact|whats?[\s-]?app|ph|landline|fax|skype|"
-    r"linked[\s-]?in|"
+    r"e[-_\s]?mail|email|mail|phone|mobile|mob|cell(?:ular)?|"
+    r"tel(?:ephone)?|contact|cont|whats?[\s-]?app|ph|landline|fax|skype|"
+    r"linked[\s-]?in|telegram|"
     # the qualifier in front of it
     r"alt(?:\.|ernat(?:e|ive))?|second(?:ary)?|primary|personal|official|"
-    r"office|work|home|res(?:idence|idential)?|permanent|current|"
-    r"name|candidate|applicant|"
+    r"office|work|home|res(?:idence|idential)?|permanent|current|present|"
+    r"name|candidate|applicant|self|"
+    # whose name it is. "FATHER'S NAME" and "S/o" label a name just as much as
+    # "Name" does, and both were being left on the page with the name gone.
+    r"father|mother|husband|wife|spouse|guardian|parent|son|daughter|"
+    r"[sdwc]\s*/\s*o|care\s*of|"
+    # the honorific between the label and the value -- "Name: Mr. <name>" left
+    # "Name: Mr." standing, because the walk stopped at a word it did not know.
+    r"mr|mrs|ms|miss|shri|sri|smt|late|dr|prof|"
     # the trailing noun
-    r"id|ids|i\.?d\.?|address|addr|detail(?:s)?|info|no|nos|num(?:ber)?"
+    r"id|ids|i\.?d\.?|address|addr|detail(?:s)?|info(?:rmation)?|"
+    r"no|nos|num(?:ber)?"
 )
 
+#: One part, optionally possessive. The curly apostrophe matters: real resumes
+#: write "Father’s Name:" with U+2019, and matching only "'" left the label.
+_LABEL_PART = rf"(?:{_LABEL_WORDS})(?:['’]s)?"
+
+#: A label is up to five parts run together with anything or nothing between
+#: them. Bounded rather than open-ended so the nesting cannot backtrack badly.
+_LABEL_RUN = rf"{_LABEL_PART}(?:[\s._'’-]*{_LABEL_PART}){{0,4}}"
+
 _CONTACT_LABEL_RE = re.compile(
-    rf"^[{_LABEL_SEPS}]*(?:{_LABEL_WORDS})[{_LABEL_SEPS}]*$"
+    rf"^[{_LABEL_SEPS}]*(?:{_LABEL_RUN})[{_LABEL_SEPS}]*$"
     # A separator stranded on its own, either between two label words
     # ("E - Mail ID") or left behind by the value itself: a "+" typed as its
     # own word survived redaction of "+ 91-98765 43210" on JA-26631 and sat
     # alone on the masked page.
     rf"|^[{_LABEL_SEPS}]+$"
+    # A lone "E", which is how "E - Mail ID :" breaks into word boxes. Only as
+    # a whole word: as a PART it also completed "Res" + "id" + "e", and
+    # "Reside" is not a label.
+    rf"|^[{_LABEL_SEPS}]*e[{_LABEL_SEPS}]*$"
     # The bracketed annotation a contact block puts AFTER the number to say
     # which line it is: "(Mobile)", "(R)", "(O)". JA-26753 shipped with
     # "(Mobile)" alone on the row, which is the reported "mobile number tag".
@@ -861,6 +889,71 @@ def _absorb_marks(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     return fitz.Rect(x0, rect.y0, x1, rect.y1)
 
 
+#: How far above a value its label may sit, as a multiple of the value's own
+#: height. One line, near enough: a label written above its value is the line
+#: before it, and anything further up is a heading for the section.
+_LABEL_ABOVE_LINES = 1.4
+
+
+def _absorb_label_above(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
+    """Grow `rect` upwards over a label written ABOVE the value, not beside it.
+
+    A sidebar stacks its contact block rather than tabulating it:
+
+        E-mail:                     <- the label, its own line
+        someone@example.com         <- the value, the line below
+        Mobile:
+        +91 98765 43210
+
+    Nothing horizontal reaches that, so JA-26736 masked both values and kept
+    both labels. Roughly one label position in six across the sampled resumes
+    is written this way.
+
+    Three things have to hold before a line above counts as this value's
+    label, and together they are what separates it from a section heading:
+
+      * the same text block, so a margin heading in its own block -- the
+        "CONTACT" of JA-26576 -- is never a candidate;
+      * one line up, not several, so "PERSONAL DETAILS:" further above a
+        contact block is out of reach;
+      * and it ends in a separator. "Mobile:" is bound to what follows it;
+        "PERSONAL INFO" is not bound to anything, and stays.
+    """
+    block = layout.block_for(rect)
+    if block is None:
+        return rect
+    height = max(1.0, rect.y1 - rect.y0)
+    above = [w for w in layout.words
+             if w[5] == block and w[3] <= rect.y0 + 0.5
+             and rect.y0 - w[3] < height * _LABEL_ABOVE_LINES]
+    if not above:
+        return rect
+
+    # The nearest line above, and only the run of labels it starts with: a
+    # trailing word that is not a label ("Mobile: INDIA") is not ours to take.
+    baseline = max(w[3] for w in above)
+    line = sorted((w for w in above if w[3] > baseline - 2.0), key=lambda w: w[0])
+    run: list = []
+    for w in line:
+        if not _CONTACT_LABEL_RE.match(w[4].strip()):
+            break
+        run.append(w)
+    if not run:
+        return rect
+
+    # Bound to the value below it, and standing over it rather than off to one
+    # side. Overlap rather than a shared left edge: the two are set as a pair
+    # but not to the same pixel -- JA-26736 indents its address 4pt left of
+    # the "E-mail:" above it, and requiring alignment left the label behind.
+    tail = run[-1][4].strip()
+    if not tail or tail[-1].isalnum():
+        return rect
+    if run[-1][2] < rect.x0 - 1.0 or run[0][0] > rect.x1 + 1.0:
+        return rect
+    return fitz.Rect(min(rect.x0, run[0][0]), min(w[1] for w in run),
+                     max(rect.x1, run[-1][2]), rect.y1)
+
+
 def _absorb_labels(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
     """Grow `rect` over the label that introduces the value and the annotation
     that trails it, so the masked row says nothing about what was removed.
@@ -879,6 +972,11 @@ def _absorb_labels(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
         if x0 is not None or x1 is not None:
             grown = fitz.Rect(grown.x0 if x0 is None else x0, grown.y0,
                               grown.x1 if x1 is None else x1, grown.y1)
+    # Only when nothing was found beside it. A value with its label already on
+    # the row is not also labelled by the line above, and reaching for one
+    # would start taking the row before a tabulated contact block.
+    if grown == rect:
+        grown = _absorb_label_above(grown, layout)
     # Last, so a mark is measured against the whole of what is being removed:
     # the label's own paint box is part of the field's, and covering only the
     # value leaves the rest of it behind.
