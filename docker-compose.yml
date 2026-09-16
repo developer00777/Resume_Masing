@@ -21,13 +21,41 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       # How many resumes are masked at once, across every replica.
-      MASK_MAX_CONCURRENT: "20"
+      MASK_MAX_CONCURRENT: "10"
+      # The worker below drains the queue, so the API does not: it keeps its
+      # CPU for serving requests. Drop this line and the API drains too --
+      # the Redis gate still caps the two of them together.
+      MASK_RUN_WORKERS: "0"
+      # Batches longer than the pool go to the queue instead of being masked
+      # inside the request. Unset (0) they are masked inline, as before.
+      MASK_BATCH_ASYNC_THRESHOLD: "10"
       SF_USERNAME: ${SF_USERNAME:-}
       SF_PASSWORD: ${SF_PASSWORD:-}
       SF_SECURITY_TOKEN: ${SF_SECURITY_TOKEN:-}
       SF_DOMAIN: ${SF_DOMAIN:-login}
       MASK_API_KEY: ${MASK_API_KEY:-}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      CLIENT_SECRET_ENCRYPTION_KEY: ${CLIENT_SECRET_ENCRYPTION_KEY:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # The same image, running the drain loop instead of the API. `docker compose
+  # up --scale worker=3` adds capacity without touching the web service, and
+  # the Redis gate still holds all of them together to MASK_MAX_CONCURRENT.
+  # On Railway this is a second service from this repo with its start command
+  # set to `python -m app.worker`.
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MASK_MAX_CONCURRENT: "10"
+      SF_USERNAME: ${SF_USERNAME:-}
+      SF_PASSWORD: ${SF_PASSWORD:-}
+      SF_SECURITY_TOKEN: ${SF_SECURITY_TOKEN:-}
+      SF_DOMAIN: ${SF_DOMAIN:-login}
       CLIENT_SECRET_ENCRYPTION_KEY: ${CLIENT_SECRET_ENCRYPTION_KEY:-}
       DATABASE_URL: ${DATABASE_URL:-}
     depends_on:

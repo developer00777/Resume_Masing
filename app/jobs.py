@@ -30,6 +30,13 @@ returns its slot on its own.
 
 Optional: with no REDIS_URL configured the async endpoints report that they
 are disabled and the existing synchronous /mask/batch is unaffected.
+
+Who drains it is a deployment decision, not a code one. The web service does
+by default; app/worker.py is the same pool as a container of its own, so the
+API can hand the backlog over (MASK_RUN_WORKERS=0) and the drain rate can be
+scaled by adding replicas. Because the gate is a lease in Redis rather than a
+semaphore in a process, every container shares the one MAX_CONCURRENT and
+none of them needs to know how many others there are.
 """
 from __future__ import annotations
 
@@ -45,8 +52,30 @@ INFLIGHT_KEY = "mask:inflight"
 JOB_KEY = "mask:job:{}"
 RESULTS_KEY = "mask:job:{}:results"
 
-#: How many resumes may be masked at once, across every replica.
-MAX_CONCURRENT = int(os.environ.get("MASK_MAX_CONCURRENT", "20"))
+#: How many resumes may be masked at once, across every replica. Work beyond
+#: this waits in the queue -- it is never refused and never dropped. Ten is
+#: what one Railway container comfortably holds: each concurrent item can be
+#: a PyMuPDF rasterise plus a LibreOffice process plus two Salesforce
+#: round-trips, and the memory for that is what runs out first.
+MAX_CONCURRENT = int(os.environ.get("MASK_MAX_CONCURRENT", "10"))
+
+#: Above this many items, POST /mask/batch stops masking inline and hands the
+#: batch to the queue instead, returning a job id. 0 disables the hand-off, so
+#: a caller that expects its results in the response keeps getting them until
+#: this is deliberately set -- the sensible value once the caller can poll is
+#: MAX_CONCURRENT, i.e. "more than one full pass of the pool".
+BATCH_ASYNC_THRESHOLD = int(os.environ.get("MASK_BATCH_ASYNC_THRESHOLD", "0"))
+
+def run_workers_here() -> bool:
+    """Does this process drain the queue itself?
+
+    The web service does by default, so a deployment with no worker container
+    behaves as it always has. Set MASK_RUN_WORKERS=0 there once a worker
+    container is running (see app/worker.py) and the API stops competing with
+    masking for its own CPU.
+    """
+    return os.environ.get("MASK_RUN_WORKERS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
 
 #: A lease older than this is assumed to belong to a dead worker and is
 #: reclaimed. Must comfortably exceed the slowest single resume -- a .doc
@@ -59,8 +88,10 @@ LEASE_TTL = int(os.environ.get("MASK_LEASE_TTL", "900"))
 #: itself already lives in Salesforce. Expired so Redis does not grow forever.
 JOB_TTL = int(os.environ.get("MASK_JOB_TTL", str(7 * 24 * 3600)))
 
-#: Seconds a worker waits on the queue before looping, so shutdown is prompt.
-_POP_TIMEOUT = 5
+#: How long an idle worker waits before looking at the queue again. Short
+#: enough that work starts promptly, long enough that an idle pool is a
+#: handful of LLENs a second against Redis.
+_IDLE_POLL = 0.25
 
 #: Admission control, as one atomic step. Purge expired leases, then take a
 #: slot only if that leaves room -- checking ZCARD and then ZADD from Python
@@ -215,23 +246,37 @@ async def stats() -> dict:
 # --- draining the queue ---------------------------------------------------
 
 async def _worker(process: Callable[[dict], dict], stop: asyncio.Event) -> None:
-    """One consumer: take a slot, take an item, mask it, give the slot back.
+    """One consumer: find work, take a slot, take the item, give the slot back.
 
-    The slot is taken BEFORE the item. Popping first would pull work out of
-    Redis and then sit on it waiting for the gate, which hides the backlog
-    from /health and loses those items if the process dies.
+    The slot is still taken BEFORE the item is popped, because popping first
+    would pull work out of Redis and then sit on it waiting for the gate,
+    which hides the backlog from /health and loses those items if the process
+    dies. But the queue is CHECKED before either, and that ordering matters
+    once more than one container drains.
+
+    This used to block on the queue while holding a slot. An idle pool then
+    held every slot in the gate: /health reported in_flight = MAX_CONCURRENT
+    with an empty queue, which is not a number anyone can act on, and a second
+    container's workers could only ever get a slot in the gap between another
+    worker releasing one and re-taking it. Checking first costs an LLEN per
+    idle poll and means a held lease always represents a resume being masked.
     """
     r = client()
     while not stop.is_set():
+        if not await r.llen(QUEUE_KEY):
+            await asyncio.sleep(_IDLE_POLL)   # nothing to do; hold nothing
+            continue
         token = await _acquire_slot(r)
         if token is None:
-            await asyncio.sleep(0.25)     # gate full; let a slot free up
+            await asyncio.sleep(_IDLE_POLL)   # gate full; let a slot free up
             continue
         try:
-            popped = await r.blpop(QUEUE_KEY, timeout=_POP_TIMEOUT)
+            # Non-blocking: the queue had something a moment ago, and if
+            # another worker took it first there is nothing to wait for.
+            popped = await r.lpop(QUEUE_KEY)
             if not popped:
-                continue                  # idle queue, not an error
-            payload = json.loads(popped[1])
+                continue                  # lost the race, not an error
+            payload = json.loads(popped)
             item = payload["item"]
             try:
                 # Masking is blocking (PyMuPDF, LibreOffice, Salesforce HTTP),

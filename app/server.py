@@ -80,8 +80,15 @@ async def _lifespan(_app: FastAPI):
     service keeps working exactly as before on the synchronous endpoints.
     _queued_item_worker is defined further down the module; by the time this
     runs at startup the module is fully imported.
+
+    Nothing starts with MASK_RUN_WORKERS=0 either, which is how the API hands
+    the backlog over to a dedicated worker container (see app/worker.py) and
+    stops competing with masking for its own CPU. Left unset it drains as it
+    always has, so adding a worker container changes nothing here until this
+    service is told to stop.
     """
-    handle = await jobs.start_workers(_queued_item_worker)
+    handle = ({} if not jobs.run_workers_here()
+              else await jobs.start_workers(_queued_item_worker))
     try:
         yield
     finally:
@@ -222,7 +229,7 @@ class BatchMaskItem(BaseModel):
 
 
 class BatchMaskRequest(BaseModel):
-    items: list[BatchMaskItem] = Field(..., min_length=1, max_length=200,
+    items: list[BatchMaskItem] = Field(..., min_length=1, max_length=500,
                                        description="Job Applicants to mask in this batch.")
     client_key: str | None = Field(
         default=None,
@@ -245,6 +252,13 @@ class BatchMaskResponse(BaseModel):
     succeeded: int = 0
     failed: int = 0
     detail: str | None = None
+    job_id: str | None = Field(
+        default=None,
+        description="Set only when the batch was too large to mask inline and "
+                    "was handed to the queue instead (status is then 'queued'). "
+                    "Poll GET /mask/jobs/{job_id} for progress and results.")
+    queued: int = Field(
+        default=0, description="How many items were queued, when status is 'queued'.")
 
 
 class InlineMaskRequest(BaseModel):
@@ -472,8 +486,33 @@ def _batch_item_to_mask_request(item: BatchMaskItem, batch: BatchMaskRequest) ->
     )
 
 
+async def _queue_if_too_large(req: BatchMaskRequest) -> BatchMaskResponse | None:
+    """Hand an oversized batch to the queue, or None to mask it inline.
+
+    Only when there is somewhere to hand it to: with no Redis, or with Redis
+    unreachable, the inline path is still the best available answer and is far
+    better than refusing the work. Falling back that way is deliberate -- the
+    point of the threshold is to stop long batches timing out, not to add a
+    new way for them to fail.
+    """
+    threshold = jobs.BATCH_ASYNC_THRESHOLD
+    if threshold <= 0 or len(req.items) <= threshold:
+        return None
+    if not jobs.configured() or not await jobs.ping():
+        return None
+    job_id = await jobs.submit(
+        [item.model_dump() for item in req.items],
+        client_key=req.client_key,
+        watermark_text=req.watermark_text,
+        watermark_base64=req.watermark_base64)
+    return BatchMaskResponse(
+        status="queued", job_id=job_id, queued=len(req.items),
+        detail=f"{len(req.items)} items queued, {jobs.MAX_CONCURRENT} masked at "
+               f"a time. Poll GET /mask/jobs/{job_id} for progress.")
+
+
 @app.post("/mask/batch", response_model=BatchMaskResponse, dependencies=[Depends(require_api_key)])
-def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
+async def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
     """Mask many Job Applicants in one call, one shared Salesforce session/org.
 
     Each item is independent: one item's Salesforce/PDF error is captured in its
@@ -483,7 +522,23 @@ def mask_batch_endpoint(req: BatchMaskRequest) -> BatchMaskResponse:
     retry re-runs the whole batch once against a fresh session -- items already
     completed before the expiry just produce a second masked copy, not a
     duplicate-charge or inconsistent-state problem.
+
+    Items are masked one after another inside this request, so the caller waits
+    for all of them. That is fine for a handful and hopeless for a hundred: at a
+    few seconds each, a large batch outlives any HTTP timeout between here and
+    Salesforce, and every item already finished is lost with the connection.
+
+    So above MASK_BATCH_ASYNC_THRESHOLD items this hands the whole batch to the
+    queue instead and returns a job_id immediately -- the same queue, the same
+    workers, the same MASK_MAX_CONCURRENT cap, nothing refused and nothing
+    dropped. The threshold is 0 (never hand off) unless it is set, so callers
+    that expect results inline keep getting them until this is deliberately
+    turned on.
     """
+    handoff = await _queue_if_too_large(req)
+    if handoff is not None:
+        return handoff
+
     def run_batch(sf) -> BatchMaskResponse:
         results: list[BatchMaskResult] = []
         for item in req.items:
