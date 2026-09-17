@@ -782,6 +782,60 @@ def test_branding_in_the_top_corner_is_removed():
     assert "Acme Corp" in text, "the page content was damaged"
 
 
+def test_the_education_table_is_not_branding():
+    """The reported regression: "now its masking dates also for no reason".
+
+    JA-26703 whites out stale table values with small images and prints the
+    corrected ones over them. The bound used to be half the page on both axes
+    -- the top-right QUARTER, which is exactly where a resume's education
+    table sits -- so those patches were taken for branding, and redacting one
+    deleted every year and percentage that touched it.
+
+    Both halves of that have to hold: the patch is below the corner, and it
+    has text over it. Either alone keeps it.
+    """
+    doc = fitz.open()
+    page = doc.new_page()                                   # 612 x 792
+    # y1/height = 0.36, x0/width = 0.69: inside the old quadrant, below the
+    # corner. Measured off the real resume.
+    page.insert_image(fitz.Rect(420, 257, 523, 286), stream=_logo_png(100, 28))
+    page.insert_text((424, 268), "2022", fontsize=11)
+    page.insert_text((424, 282), "65.30%", fontsize=11)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, [], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    patch = [i for i in doc[0].get_image_info()
+             if i["width"] > 1 and i["height"] > 1]
+    doc.close()
+    assert "2022" in text and "65.30%" in text, "the table lost its values"
+    assert patch, "the patch was removed, revealing whatever it covered"
+
+
+def test_a_corner_image_with_text_over_it_is_left_alone():
+    """A tinted header band is not standalone branding.
+
+    apply_redactions() deletes every glyph that merely TOUCHES the
+    annotation, so redacting a box that sits BEHIND text takes the text with
+    it. A band in the corner with the candidate's dates printed over it must
+    keep the dates -- the band staying is the lesser fault by far.
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_image(fitz.Rect(400, 30, 590, 120), stream=_logo_png(190, 90))
+    page.insert_text((410, 70), "Mar 2019 - Aug 2021", fontsize=11)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, [], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+    assert "Mar 2019 - Aug 2021" in text, "the dates went with the band"
+
+
 def test_a_scanned_resume_is_not_blanked_as_branding():
     """The guard: a scan is one page-sized image and is the whole resume.
 

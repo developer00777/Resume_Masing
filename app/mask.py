@@ -1012,10 +1012,22 @@ def _rects_for(page: fitz.Page, s: str, layout: _Layout) -> list[fitz.Rect]:
     return [_absorb_labels(r, layout) for r in found]
 
 
-#: The corner a resume's own branding sits in. Measured across the corpus:
-#: eight of twenty carry an image in the top-right quadrant of page one -- a
-#: consultancy's watermark, or the candidate's photograph.
-_CORNER_MARK_FRACTION = 0.5
+#: The corner a resume's own branding sits in -- a consultancy's watermark or
+#: the candidate's photograph. Measured, not guessed: across the corpus every
+#: such image starts at or right of 0.65 of the page width and ends by 0.26 of
+#: its height, so these bounds clear the furthest of them with a little room.
+#:
+#: This used to be one 0.5 fraction on both axes, which is not a corner but a
+#: QUARTER OF THE PAGE -- and the top-right quarter of a resume is where the
+#: education table goes. JA-26703 covers stale table values with small white
+#: images and prints the corrected ones over them; the old bound called those
+#: branding, and redacting one took every year and percentage touching it. The
+#: reported "masking dates for no reason" was this.
+_CORNER_MARK_LEFT = 0.6
+
+#: How far down the page such an image may reach. The bound that matters: it
+#: is what separates the header from the first section's content.
+_CORNER_MARK_BOTTOM = 0.3
 
 #: And how big such an image may be before it is content rather than
 #: decoration. A scanned resume is one page-sized image and must survive; a
@@ -1023,35 +1035,53 @@ _CORNER_MARK_FRACTION = 0.5
 _CORNER_MARK_MAX_AREA = 0.2
 
 
-def _corner_image_rects(page: fitz.Page) -> list[fitz.Rect]:
-    """Images sitting in the top-right corner of the page.
+def _words_over(box: fitz.Rect, layout: _Layout) -> bool:
+    """Is anything written on top of `box`?"""
+    return any(fitz.Rect(w[:4]).intersects(box) for w in layout.words)
+
+
+def _corner_image_rects(page: fitz.Page,
+                        layout: _Layout | None = None) -> list[fitz.Rect]:
+    """Branding sitting in the page's top-right corner.
 
     A resume that arrives with an agency's watermark stamped over its top
     corner carries that branding into the masked copy, where it is both wrong
     -- it is not this client's mark -- and identifying, since the same corner
     is where photographs go. Neither belongs in an anonymised resume.
 
-    Only the first page, only the top-right quadrant, and only images small
-    enough to be decoration: a scanned resume is a single page-sized image and
-    has to survive untouched.
+    Every page, not only the first: an agency that stamps its mark on a resume
+    stamps it on all of them, and the copy the client reads must not carry
+    somebody else's branding on page three either.
+
+    Three things keep this off content. The corner bounds above, which is the
+    main one. Size, so a scanned resume -- one page-sized image, and the whole
+    document -- survives untouched. And clear space: an image with words
+    printed over it is not standalone branding, and cannot be redacted anyway,
+    because apply_redactions() deletes every glyph that merely TOUCHES the
+    annotation. Such an image is left exactly as it is; deleting the image
+    instead is worse, not better, since a resume that whites out a stale value
+    with one would have the old text underneath revealed.
     """
     rect = page.rect
     if rect.is_empty:
         return []
-    cx = rect.x0 + rect.width * _CORNER_MARK_FRACTION
-    cy = rect.y0 + rect.height * _CORNER_MARK_FRACTION
+    cx = rect.x0 + rect.width * _CORNER_MARK_LEFT
+    cy = rect.y0 + rect.height * _CORNER_MARK_BOTTOM
     limit = rect.get_area() * _CORNER_MARK_MAX_AREA
-    out: list[fitz.Rect] = []
     try:
         infos = page.get_image_info()
     except Exception:
         return []
+    out: list[fitz.Rect] = []
     for info in infos:
         box = fitz.Rect(info["bbox"])
         if box.is_empty or box.get_area() > limit:
             continue
-        if box.x0 >= cx and box.y1 <= cy:
-            out.append(box)
+        if box.x0 < cx or box.y1 > cy:
+            continue
+        if layout is not None and _words_over(box, layout):
+            continue
+        out.append(box)
     return out
 
 
@@ -1104,7 +1134,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
             page_rects.extend(_rects_for(page, s, layout))
         # Whatever branding or photograph the resume already carries in its
         # top corner goes too -- see _corner_image_rects.
-        page_rects.extend(_corner_image_rects(page))
+        page_rects.extend(_corner_image_rects(page, layout))
 
         for rect in _bridge_separators(_dedupe_rects(page_rects), layout):
             page.add_redact_annot(rect, fill=REDACT_FILL)
