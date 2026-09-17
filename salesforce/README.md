@@ -101,10 +101,16 @@ sf project deploy start -d salesforce/lwc -o <sandbox-alias>
 sf project deploy start -d salesforce/lwc -o <prod-alias>
 ```
 
-Unlike Apex, an LWC can be edited in production (Setup → Lightning Components,
-or the Developer Console), so `massMasking.js` can also be pasted in directly.
-`BASE_URL` at the top of the file is the only thing to change if the service
-moves.
+There is no way to paste this one in. An LWC cannot be edited in the
+Salesforce UI the way Apex can be edited in a sandbox: the Developer Console
+does not open Lightning Web Components at all, and Setup → Lightning
+Components is a read-only list. A change set from a sandbox, the CLI above, or
+VS Code with the Salesforce extensions are the ways in. (Aura components *are*
+editable in the Developer Console — the three `JobConsole_*` consoles in this
+org are Aura, which is why those can be pasted.)
+
+Nothing is baked into the bundle except `BASE_URL` at the top of
+`massMasking.js`, which is the only line to change if the service moves.
 
 ## 5. Known gap in the test class
 
