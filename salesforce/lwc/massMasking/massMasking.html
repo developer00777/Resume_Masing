@@ -1,0 +1,30 @@
+<template>
+    <lightning-card title="Mass Resume Masking" icon-name="standard:document">
+        <div class="slds-var-m-around_medium">
+
+            <template if:true={isLoading}>
+                <lightning-spinner alternative-text="Loading"></lightning-spinner>
+            </template>
+
+            <lightning-datatable
+                key-field="Id"
+                data={jobApplicants}
+                columns={columns}
+                onrowselection={handleRowSelection}>
+            </lightning-datatable>
+
+            <div class="slds-var-m-top_medium">
+                <lightning-button
+                    variant="brand"
+                    label="Mask Selected Resumes"
+                    onclick={handleMassMasking}
+                    disabled={isButtonDisabled}>
+                </lightning-button>
+                <span class="slds-var-m-left_small slds-text-body_small">
+                    {selectedCount} selected
+                </span>
+            </div>
+
+        </div>
+    </lightning-card>
+</template>

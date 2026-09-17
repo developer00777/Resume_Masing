@@ -1,4 +1,8 @@
-# Salesforce side — deploying `MassMaskingController`
+# Salesforce side — the masking button
+
+The two halves of the org-side integration: `apex/` holds
+`MassMaskingController`, and `lwc/massMasking/` holds the button that
+calls it.
 
 Apex for the masking integration. `MassMaskingController` reads the
 candidate's Name / Phone / Email off the related Contact and sends them to
@@ -55,10 +59,10 @@ sandbox.
 
 | Method | Use |
 |---|---|
-| `maskSelected(List<String> ids)` | Synchronous, returns a `MaskOutcome` per record. Capped at 10 records. |
-| `enqueueMasking(List<String> ids)` | Background (Queueable, chained). No per-record return. |
+| `generatemassmasking(List<String> ids)` | What the button actually calls. Returns the ids, org URL and username the page needs. |
 | `getJobApplicants(String jobId)` | Unchanged. |
-| `generatemassmasking(List<String> ids)` | Unchanged. |
+| `maskSelected(List<String> ids)` | Synchronous, returns a `MaskOutcome` per record. Capped at 10 records. No longer called by the LWC. |
+| `enqueueMasking(List<String> ids)` | Background (Queueable, chained). No per-record return. No longer called by the LWC — see below. |
 
 The 10-record cap on `maskSelected` is Salesforce's **120 seconds of
 cumulative callout time per transaction**, not the service's batch limit (which
@@ -72,7 +76,37 @@ success the service uploads the masked PDF back onto the Job Applicant as a new
 `ContentVersion`, so the outcome is visible on the record. Failures are logged
 at `ERROR`.
 
-## 4. Known gap in the test class
+## 4. The button always opens the page
+
+`massMasking.js` used to branch on the size of the selection: ten or fewer
+opened the masking page, more than ten called `enqueueMasking` instead. That
+branch was the reported fault — over ten applicants the resumes came back
+masked, but the browser stayed on Salesforce, and the copies carried the
+watermark settings compiled into the Apex class rather than the ones chosen on
+the page.
+
+`handleMassMasking()` now calls `launchDirectMasking()` for any count. The page
+sends the selection to `POST /mask/batch` in chunks of ten, and the service
+queues anything past `MASK_MAX_CONCURRENT` rather than dropping it, so a
+selection of 200 is the page's business and the queue's — not the button's.
+
+`enqueueMasking` and `maskSelected` are left in place. Nothing calls them now,
+but they are a working Apex path to the same service, and removing them would
+mean a production deploy to get them back.
+
+### Deploying the bundle
+
+```bash
+sf project deploy start -d salesforce/lwc -o <sandbox-alias>
+sf project deploy start -d salesforce/lwc -o <prod-alias>
+```
+
+Unlike Apex, an LWC can be edited in production (Setup → Lightning Components,
+or the Developer Console), so `massMasking.js` can also be pasted in directly.
+`BASE_URL` at the top of the file is the only thing to change if the service
+moves.
+
+## 5. Known gap in the test class
 
 `MassMaskingControllerTest` does no DML, because `SCSCHAMPS__Job_Applicant__c`
 is a managed-package object whose required fields cannot be known from outside
