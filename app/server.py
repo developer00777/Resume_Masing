@@ -69,7 +69,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from app import crypto_util, docx_convert, jobs, mask, pii, sf_client
+from app import crypto_util, docx_convert, jobs, mask, pii, sf_client, template_resume
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -211,6 +211,10 @@ class MaskResponse(BaseModel):
                     "it in Salesforce directly. Links to the ContentDocument rather than the "
                     "ContentVersion so it survives a later version being added. Null if the "
                     "link could not be resolved -- cosmetic only, the file itself is uploaded.")
+    generated_from_template: bool = Field(
+        default=False,
+        description="True when the applicant had no resume on file and the masked copy was "
+                    "built from their Contact record in the house template instead.")
 
 
 class WatermarkUploadResponse(BaseModel):
@@ -362,9 +366,28 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     # 1) Fetch resume file -- pdf, docx, or doc (real candidate resumes on
     #    this org are legacy .docx Attachments; see sf_client.fetch_resume_pdf's
     #    docstring for the full lookup order).
+    #    No file at all: build one from the Contact record in the house
+    #    template (app/template_resume.py) and mask that instead. It carries
+    #    no name/email/phone to begin with; the masking pass below still runs
+    #    over it, for anything typed into its free-text fields.
+    generated = False
     try:
         resume_bytes, ext = sf_client.fetch_resume_pdf(req.job_applicant_id, sf=sf)
-    except (sf_client.ResumeNotFoundError, sf_client.InvalidIdError) as e:
+    except sf_client.ResumeNotFoundError as e:
+        # Only when there is genuinely no resume. Files that exist but can't
+        # be read (a scanned image) are the candidate's real resume, and a
+        # template must never stand in for it.
+        if getattr(e, "files_present", False):
+            return MaskResponse(status="error", detail=f"{e} Files are attached, but none "
+                                "is a PDF or Word document.", job_applicant_name=ja_name)
+        profile = sf_client.fetch_contact_profile(
+            req.job_applicant_id, template_resume.PROFILE_FIELDS, sf=sf)
+        if not template_resume.has_enough(profile):
+            return MaskResponse(
+                status="error", job_applicant_name=ja_name,
+                detail=f"{e} The Contact record has too little detail to build one from the template.")
+        resume_bytes, ext, generated = template_resume.render(profile), "pdf", True
+    except sf_client.InvalidIdError as e:
         return MaskResponse(status="error", detail=str(e), job_applicant_name=ja_name)
 
     if ext == "pdf":
@@ -413,7 +436,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         if s and s not in seen:
             seen.add(s)
             mask_strings.append(s)
-    if not mask_strings:
+    if not mask_strings and not generated:
         return MaskResponse(status="error", detail="No PII strings to mask.", job_applicant_name=ja_name)
 
     # 3) Resolve the client watermark image, in priority order:
@@ -457,6 +480,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         watermark_used=watermark_used,
         job_applicant_name=ja_name,
         masked_file_url=sf_client.masked_file_url(new_id, sf=sf),
+        generated_from_template=generated,
     )
 
 

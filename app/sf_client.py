@@ -49,7 +49,13 @@ class MissingCredentialsError(RuntimeError):
 
 
 class ResumeNotFoundError(RuntimeError):
-    pass
+    """No usable resume. `files_present` says whether the record had files that
+    just weren't usable (a scanned .jpg, say) -- that candidate HAS a resume,
+    so it must not be replaced by one built from the template."""
+
+    def __init__(self, message: str, files_present: bool = False):
+        super().__init__(message)
+        self.files_present = files_present
 
 
 class WatermarkNotFoundError(RuntimeError):
@@ -862,16 +868,47 @@ def fetch_contact_pii_strings(contact_id: str, sf: Salesforce | None = None) -> 
         return []
 
 
-def _pick_by_extension(records: list[dict], ext_of) -> tuple[dict, str] | None:
+def fetch_contact_profile(job_applicant_id: str, fields: tuple[str, ...],
+                          sf: Salesforce | None = None) -> dict:
+    """The candidate Contact's `fields`, for building a resume when there is
+    none on file (app/template_resume.py). Fields this org's Contact does not
+    have are skipped rather than failing the query -- the list covers custom
+    fields that not every org carries. Returns {} (never raises) if the
+    Contact can't be resolved or read."""
+    sf = sf or connect()
+    contact_id = resolve_contact_id(job_applicant_id, sf=sf)
+    if not contact_id:
+        return {}
+    try:
+        available = {f["name"] for f in sf.Contact.describe()["fields"]}
+        wanted = [f for f in fields if f in available]
+        if not wanted:
+            return {}
+        res = sf.query(f"SELECT {', '.join(wanted)} FROM Contact WHERE Id = '{contact_id}' LIMIT 1")
+        recs = res.get("records", [])
+        if not recs:
+            return {}
+        return {f: recs[0].get(f) for f in wanted}
+    except Exception as e:
+        logger.warning("fetch_contact_profile(%r) failed: %s: %s",
+                       job_applicant_id, type(e).__name__, e)
+        return {}
+
+
+def _pick_by_extension(records: list[dict], ext_of,
+                       seen: list | None = None) -> tuple[dict, str] | None:
     """From a list of file-like records, pick the best one by
     _RESUME_EXT_PRIORITY (pdf first, then docx, then doc); anything else
     (jpg, png, etc.) is ignored -- not a resume format this service
-    understands. Returns (record, extension) or None if nothing usable."""
+    understands. Returns (record, extension) or None if nothing usable.
+    Every file that is not this service's own output is appended to `seen`."""
     ranked = []
     for r in records:
         # Never accept this service's own output as a source resume.
         if _is_masked_output(r.get("Title") or r.get("Name")):
             continue
+        if seen is not None:
+            seen.append(r)
         ext = ext_of(r)
         if ext in _RESUME_EXT_PRIORITY:
             ranked.append((_RESUME_EXT_PRIORITY.index(ext), r, ext))
@@ -882,7 +919,8 @@ def _pick_by_extension(records: list[dict], ext_of) -> tuple[dict, str] | None:
     return record, ext
 
 
-def _fetch_content_version(sf: Salesforce, parent_id: str) -> tuple[bytes, str] | None:
+def _fetch_content_version(sf: Salesforce, parent_id: str,
+                           seen: list | None = None) -> tuple[bytes, str] | None:
     """Modern Files: latest ContentVersion linked to parent_id, if any usable one exists."""
     links = sf.query(
         "SELECT ContentDocumentId FROM ContentDocumentLink "
@@ -896,14 +934,15 @@ def _fetch_content_version(sf: Salesforce, parent_id: str) -> tuple[bytes, str] 
         f"FROM ContentVersion WHERE ContentDocumentId IN ({in_list}) AND IsLatest = true "
         "ORDER BY CreatedDate DESC")
     records = versions.get("records", [])
-    picked = _pick_by_extension(records, lambda r: (r.get("FileExtension") or "").lower())
+    picked = _pick_by_extension(records, lambda r: (r.get("FileExtension") or "").lower(), seen)
     if picked is None:
         return None
     record, ext = picked
     return _download_version_data(sf, record["VersionData"]), ext
 
 
-def _fetch_attachment(sf: Salesforce, parent_id: str) -> tuple[bytes, str] | None:
+def _fetch_attachment(sf: Salesforce, parent_id: str,
+                      seen: list | None = None) -> tuple[bytes, str] | None:
     """Legacy Files: latest Attachment parented to parent_id, if any usable
     one exists. Confirmed against live data as where real resumes actually
     are on this org -- .Body downloads exactly like ContentVersion.VersionData
@@ -917,7 +956,7 @@ def _fetch_attachment(sf: Salesforce, parent_id: str) -> tuple[bytes, str] | Non
         name = r.get("Name") or ""
         return name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
-    picked = _pick_by_extension(records, ext_of)
+    picked = _pick_by_extension(records, ext_of, seen)
     if picked is None:
         return None
     record, ext = picked
@@ -947,18 +986,20 @@ def fetch_resume_pdf(job_applicant_id: str, sf: Salesforce | None = None) -> tup
     job_applicant_id = _safe_id(job_applicant_id, "job_applicant_id")
     sf = sf or connect()
 
-    found = _fetch_content_version(sf, job_applicant_id)
+    seen: list = []
+    found = _fetch_content_version(sf, job_applicant_id, seen)
     if found is None:
         contact_id = resolve_contact_id(job_applicant_id, sf=sf)
         if contact_id:
-            found = _fetch_content_version(sf, contact_id)
+            found = _fetch_content_version(sf, contact_id, seen)
         if found is None:
-            found = _fetch_attachment(sf, job_applicant_id)
+            found = _fetch_attachment(sf, job_applicant_id, seen)
         if found is None and contact_id:
-            found = _fetch_attachment(sf, contact_id)
+            found = _fetch_attachment(sf, contact_id, seen)
     if found is not None:
         return found
-    raise ResumeNotFoundError(f"No resume found for Job Applicant '{job_applicant_id}'.")
+    raise ResumeNotFoundError(f"No resume found for Job Applicant '{job_applicant_id}'.",
+                              files_present=bool(seen))
 
 
 # ── Watermark Image ─────────────────────────────────────────────────────────
