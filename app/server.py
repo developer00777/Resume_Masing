@@ -69,7 +69,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from app import crypto_util, docx_convert, jobs, mask, pii, sf_client, template_resume
+from app import crypto_util, docx_convert, jobs, mask, ocr, pii, sf_client, template_resume
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -215,6 +215,9 @@ class MaskResponse(BaseModel):
         default=False,
         description="True when the applicant had no resume on file and the masked copy was "
                     "built from their Contact record in the house template instead.")
+    ocr_pages: int = Field(
+        default=0,
+        description="How many pages were scanned images, read with OCR before masking.")
 
 
 class WatermarkUploadResponse(BaseModel):
@@ -353,6 +356,26 @@ async def health() -> dict:
     }
 
 
+#: A scanned resume that OCR ran on but where nothing was found to redact. A
+#: resume always prints the candidate's name, so this is OCR failing to read
+#: the page, and "ok" here is exactly how JA-9703 went out fully unmasked.
+_UNREAD_SCAN = ("This resume is a scanned image and the candidate's details could not be "
+                "read from it reliably, so it was not masked. Please mask it manually.")
+
+
+def _ocr_if_scanned(pdf_bytes: bytes, known: list[str]) -> tuple[bytes, int, str | None]:
+    """Give image-only pages a text layer. Returns (pdf_bytes, pages_ocrd,
+    error). An error means a page is a picture this service cannot read, and
+    the resume must not be reported as masked."""
+    pdf_bytes, needed, done = ocr.ensure_text_layer(pdf_bytes, known)
+    if needed and not ocr.available():
+        return pdf_bytes, done, ("This resume is a scanned image and OCR is not installed on "
+                                 "this server, so it could not be masked.")
+    if needed and done < needed:
+        return pdf_bytes, done, _UNREAD_SCAN
+    return pdf_bytes, done, None
+
+
 def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     """Run the full mask pipeline for one Job Applicant against an already-connected
     Salesforce session. Shared by /mask and /mask/batch so both retry and batch
@@ -430,6 +453,14 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         contact_id = sf_client.resolve_contact_id(req.job_applicant_id, sf=sf)
         if contact_id:
             contact_strings = sf_client.fetch_contact_pii_strings(contact_id, sf=sf)
+
+    #    A resume that is a picture has no text for any of the above to find.
+    #    Give it one first (app/ocr.py), told the known values so a reading a
+    #    character off still lands on them.
+    pdf_bytes, ocr_pages, ocr_error = _ocr_if_scanned(pdf_bytes, contact_strings)
+    if ocr_error:
+        return MaskResponse(status="error", detail=ocr_error, job_applicant_name=ja_name)
+
     seen: set[str] = set()
     mask_strings = []
     for s in contact_strings + detect_pii(pdf_bytes):
@@ -468,6 +499,8 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         watermark_png=watermark_png,
         watermark_text=req.watermark_text,
     )
+    if ocr_pages and not hits:
+        return MaskResponse(status="error", detail=_UNREAD_SCAN, job_applicant_name=ja_name)
 
     # 5) Upload masked PDF back to Salesforce
     filename = f"masked_{req.job_applicant_id}.pdf"
@@ -481,6 +514,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         job_applicant_name=ja_name,
         masked_file_url=sf_client.masked_file_url(new_id, sf=sf),
         generated_from_template=generated,
+        ocr_pages=ocr_pages,
     )
 
 
@@ -741,6 +775,13 @@ def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
     except (binascii.Error, ValueError):
         return InlineMaskResponse(status="error", detail="resume_base64 is not valid base64.")
 
+    try:
+        pdf_bytes, ocr_pages, ocr_error = _ocr_if_scanned(pdf_bytes, req.mask_strings or [])
+    except Exception as e:
+        return InlineMaskResponse(status="error", detail=f"Masking failed: {e}"[:300])
+    if ocr_error:
+        return InlineMaskResponse(status="error", detail=ocr_error)
+
     mask_strings = req.mask_strings if req.mask_strings else detect_pii(pdf_bytes)
     if not mask_strings:
         return InlineMaskResponse(status="error", detail="No PII strings to mask.")
@@ -762,6 +803,8 @@ def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
         )
     except Exception as e:
         return InlineMaskResponse(status="error", detail=f"Masking failed: {e}"[:300])
+    if ocr_pages and not hits:
+        return InlineMaskResponse(status="error", detail=_UNREAD_SCAN)
 
     return InlineMaskResponse(
         status="ok",

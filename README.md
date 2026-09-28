@@ -49,6 +49,7 @@ under that client.
 | `app/pii.py` | PII detection & classification. Strict, precision-first phone detection (a digit run must carry positive evidence of being a phone), so employment date ranges, credential ids, ISO/IEEE/RFC numbers, versions, percentages and PIN codes are never reported as PII. Also holds the **second-pass scanners** (`scan_phones`/`scan_emails`), which decide from the Indian numbering plan rather than from evidence: ten national digits starting 6-9 is a mobile, so `91 9812345678` and `09812345678` are caught without a label, while Aadhaar/UAN/account numbers and ten-digit magnitudes are not. |
 | `app/residual.py` | **Second pass.** Runs on each page *after* the first pass has applied its redactions, and removes the phone numbers and addresses still on it — the alternate mobile that exists only in the resume body, and the address whose PDF word boxes `search_for()` could never match. Also strips `mailto:`/`tel:` link annotations (whose URI survives redaction) and the `/Title` + `/Author` metadata Word fills from the original filename. |
 | `app/mask.py` | Masking core — PyMuPDF true-redact (white fill) + centered watermark. Per-kind matching: email exact, phone by digit-equivalence, name whole-word only. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
+| `app/ocr.py` | OCR for **image-only resumes**. Pages that are pictures get an invisible text layer from Tesseract (two passes — layout mode on the page, sparse mode on a cleaned copy with dark panels inverted and the background flattened by morphological closing — merged by confidence), with readings a character off the Contact's values snapped to them. The page's own typed text always wins over an OCR copy of it. Needs `tesseract-ocr` (in the Dockerfile). |
 | `app/template_resume.py` | For a Job Applicant with **no resume file at all**: builds one from the Contact record in the house template (the `Arvind_EMS-SME.pdf` layout), which `/mask` then watermarks and uploads exactly like a real one. Never reads name/email/phone; invents nothing (experience is only the current company, designation and years on record). Not used when files exist but are unreadable (e.g. a scanned image) — that is the candidate's real resume. |
 | `app/docx_convert.py` | `.docx`/`.doc` → PDF via headless LibreOffice (`soffice`, installed in the Dockerfile) — real candidate resumes on this org are legacy Word attachments, not PDFs, so this runs before `app/mask.py` whenever the fetched resume isn't already a PDF. |
 | `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)` (checks modern Files + legacy Attachments, on the Job Applicant and its related Contact — returns `(bytes, extension)`), `upload_masked_pdf(id, bytes, filename)`. Creds from ENV or the Postgres-backed override (`register_default_credentials`). |
@@ -276,8 +277,15 @@ regex-on-text alone can silently miss real PII — confirmed on real candidate d
 Microsoft's built-in "Contoso" template render the phone/email via a Word content control that extracts
 as blank or garbled text after DOCX→PDF conversion, even though the correct value sits right there,
 structured and correct, on the Contact. `/mask/inline` has no Salesforce session, so it's regex-only —
-pass `mask_strings` explicitly there for full accuracy. Scanned image-only PDFs have no text layer →
-`/mask` returns a clear "needs OCR / route to manual" error.
+pass `mask_strings` explicitly there for full accuracy.
+
+**Scanned / image-only resumes** (a PDF whose pages are pictures — about 1% of recent applicants) are
+read with Tesseract first (`app/ocr.py`): the words go back onto the page as an invisible text layer,
+so everything below works on them unchanged, and redaction blanks the image pixels themselves. If a
+scan can't be read, or OCR runs but nothing is found to redact, `/mask` returns an error asking for a
+manual mask instead of uploading it — which is how such resumes used to go out unmasked with `"ok"`.
+The response's `ocr_pages` says how many pages were read this way. Benchmark:
+`tests/ocr_benchmark.py` (run in the service image).
 
 Whatever that produces, masking then runs a **second pass** over the redacted page (`app/residual.py`).
 The first pass can only remove values something upstream already knew about; the second reads the page

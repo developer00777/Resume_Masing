@@ -64,6 +64,22 @@ def load_dotenv() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def _ocr(pdf: bytes, known: list[str]) -> tuple[bytes, bool]:
+    """OCR image-only pages as /mask does. A scan this cannot read is
+    UNVERIFIED, not clean: with no text layer every check below finds
+    nothing, which is how JA-9635 and JA-9703 once reported "clean" while
+    carrying the candidate's full contact details."""
+    from app import ocr
+    pdf, needed, done = ocr.ensure_text_layer(pdf, known)
+    if needed and done < needed:
+        print(f"  ! UNVERIFIED: {needed} scanned-image page(s), {done} read "
+              f"(OCR available: {ocr.available()}; run this in the service image)")
+        return pdf, False
+    if needed:
+        print(f"  scanned image: {done} page(s) read with OCR")
+    return pdf, True
+
+
 def shape(value: str) -> str:
     """Collapse every character class, so nothing identifying survives."""
     out = re.sub(r"[A-Z]", "A", str(value))
@@ -141,6 +157,9 @@ def verify(ref: str, sf) -> bool:
     contact_id = sf_client.resolve_contact_id(ja_id, sf=sf)
     if contact_id:
         contact_strings = sf_client.fetch_contact_pii_strings(contact_id, sf=sf)
+    resume_bytes, ok = _ocr(resume_bytes, contact_strings)
+    if not ok:
+        return False
     seen: set[str] = set()
     mask_strings: list[str] = []
     for s in contact_strings + detect_pii(resume_bytes):
@@ -186,6 +205,9 @@ def verify_file(path: Path) -> bool:
             print(f"  ! {ext} -> pdf conversion failed (needs LibreOffice): {e}")
             return False
 
+    data, ok = _ocr(data, [])
+    if not ok:
+        return False
     # No Contact record off disk, so this is the resume-text-only path.
     mask_strings = detect_pii(data)
     print(f"  mask_strings: {len(mask_strings)} (resume text only, no Contact record)")

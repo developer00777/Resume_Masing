@@ -13,8 +13,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+#
+# tesseract-ocr: some resumes are a PDF whose pages are pictures (a Canva
+# export saved as JPEG, a scan) with no text layer at all -- app/ocr.py reads
+# those so they can be masked. Without it they would go out unmasked.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
+    tesseract-ocr tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
