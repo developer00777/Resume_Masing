@@ -5,7 +5,7 @@ The two halves of the org-side integration: `apex/` holds
 calls it.
 
 Apex for the masking integration. `MassMaskingController` reads the
-candidate's Name / Phone / Email off the related Contact and sends them to
+candidate's Phone / Email off the related Contact and sends them to
 `POST /mask/batch` alongside each Job Applicant Id, so the service does not
 have to infer them.
 

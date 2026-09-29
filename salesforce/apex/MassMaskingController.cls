@@ -5,8 +5,9 @@ public class MassMaskingController {
     private static final Integer SYNC_MAX_ITEMS = 10;
     private static final Integer CALLOUT_TIMEOUT_MS = 120000;
 
+    // Phone and email only. The candidate's name is no longer masked.
+    @TestVisible
     private static final List<String> CONTACT_PII_FIELDS = new List<String>{
-        'Name',
         'Phone', 'MobilePhone', 'HomePhone', 'OtherPhone',
         'PhoneNumber__c', 'SCSCHAMPS__PhoneNumber__c', 'SCSCHAMPS__AlternatePhoneNumber__c',
         'Email', 'SCSCHAMPS__AlternateEmail__c'

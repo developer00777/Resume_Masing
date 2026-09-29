@@ -39,16 +39,9 @@ EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}", re.I)
 
 
 def _items(values):
-    emails, phones, names = ocr._known(values)
-    out = [("email", e) for e in emails] + [("phone", p) for p in phones]
-    for v in values:
-        v = str(v)
-        if "@" not in v and len(re.sub(r"\D", "", v)) < 10:
-            toks = [t.lower() for t in re.findall(r"[A-Za-z]+", v) if len(t) >= 3]
-            if toks:
-                out.append(("name", " ".join(toks)))
-                break
-    return out
+    """The phones and emails to look for. Names are no longer masked."""
+    emails, phones = ocr._known(values)
+    return [("email", e) for e in emails] + [("phone", p) for p in phones]
 
 
 def _lines_text(words):
@@ -65,19 +58,12 @@ def _legible(kind, target, lines, fuzzy):
             if fuzzy and ocr._lev(ln.lower().replace(" ", ""), target) <= 2:
                 return True
         return False
-    if kind == "phone":
-        for ln in lines:
-            d = re.sub(r"\D", "", ln)
-            for s in range(0, len(d) - 9):
-                if sum(a != b for a, b in zip(d[s:s + 10], target)) <= (1 if fuzzy else 0):
-                    return True
-        return False
-    words = [re.sub(r"[^a-z]", "", w) for ln in lines for w in ln.lower().split()]
-    for tok in target.split():
-        if not any(tok in w and len(w) <= len(tok) + 4 or
-                   (fuzzy and len(tok) >= 5 and ocr._lev(w, tok, 1) <= 1) for w in words):
-            return False
-    return True
+    for ln in lines:                               # phone
+        d = re.sub(r"\D", "", ln)
+        for s in range(0, len(d) - 9):
+            if sum(a != b for a, b in zip(d[s:s + 10], target)) <= (1 if fuzzy else 0):
+                return True
+    return False
 
 
 def _raw_read(page):
@@ -116,7 +102,7 @@ def run(path, out_dir):
 
     mask_strings = list(dict.fromkeys(known + detect_pii(pdf)))
     masked, hits = mask.mask_pdf_bytes(pdf, mask_strings, watermark_text="")
-    status = "refused" if (needed and done < needed) or (done and not hits) else "ok"
+    status = "refused" if needed and done < needed else "ok"
 
     post = fitz.open(stream=masked, filetype="pdf")
     post_lines, blanked = [], []

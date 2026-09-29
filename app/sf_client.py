@@ -834,7 +834,8 @@ _CONTACT_PII_FIELDS = (
 
 
 def fetch_contact_pii_strings(contact_id: str, sf: Salesforce | None = None) -> list[str]:
-    """Structured PII (name, phone, email) from the candidate's Contact
+    """Structured PII (phone, email) from the candidate's Contact -- the
+    name is no longer masked, so it is not read. Contact values come from the
     record -- far more reliable than regex-scanning the resume's extracted
     text (detect_pii() in server.py). Confirmed against real candidates: a
     resume using a template with the phone/email in a text box or Word
@@ -850,7 +851,7 @@ def fetch_contact_pii_strings(contact_id: str, sf: Salesforce | None = None) -> 
     contact_id = _safe_id(contact_id, "contact_id")
     sf = sf or connect()
     try:
-        fields = ", ".join(("Name",) + _CONTACT_PII_FIELDS)
+        fields = ", ".join(_CONTACT_PII_FIELDS)
         res = sf.query(f"SELECT {fields} FROM Contact WHERE Id = '{contact_id}' LIMIT 1")
         recs = res.get("records", [])
         if not recs:
@@ -858,7 +859,7 @@ def fetch_contact_pii_strings(contact_id: str, sf: Salesforce | None = None) -> 
         rec = recs[0]
         out: list[str] = []
         seen: set[str] = set()
-        for field in ("Name",) + _CONTACT_PII_FIELDS:
+        for field in _CONTACT_PII_FIELDS:
             value = rec.get(field)
             if value and value not in seen:
                 seen.add(value)

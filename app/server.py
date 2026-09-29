@@ -151,9 +151,7 @@ def _build_revision() -> str:
 def detect_pii(pdf_bytes: bytes) -> list[str]:
     """Emails and phone numbers found in the resume's own text.
 
-    Names are never detected here -- there is no reliable way to tell a
-    candidate's name from any other capitalised words on the page, so the name
-    only ever comes from the Salesforce Contact record.
+    Names are not masked, so they are not looked for.
     """
     import fitz
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -356,10 +354,9 @@ async def health() -> dict:
     }
 
 
-#: A scanned resume that OCR ran on but where nothing was found to redact. A
-#: resume always prints the candidate's name, so this is OCR failing to read
-#: the page, and "ok" here is exactly how JA-9703 went out fully unmasked.
-_UNREAD_SCAN = ("This resume is a scanned image and the candidate's details could not be "
+#: A scanned resume OCR could not read. Uploading it as "ok" is exactly how
+#: JA-9703 went out fully unmasked.
+_UNREAD_SCAN =("This resume is a scanned image and the candidate's details could not be "
                 "read from it reliably, so it was not masked. Please mask it manually.")
 
 
@@ -391,7 +388,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     #    docstring for the full lookup order).
     #    No file at all: build one from the Contact record in the house
     #    template (app/template_resume.py) and mask that instead. It carries
-    #    no name/email/phone to begin with; the masking pass below still runs
+    #    no email/phone to begin with; the masking pass below still runs
     #    over it, for anything typed into its free-text fields.
     generated = False
     try:
@@ -427,7 +424,7 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
     # 2) Determine PII to mask, from two sources that are always MERGED, never
     #    either/or:
     #
-    #    a) structured values -- the candidate's Name/Phone/Email. Either the
+    #    a) structured values -- the candidate's Phone/Email. Either the
     #       caller sent them (MassMaskingController reads the Contact in Apex
     #       and puts them in mask_strings, which is authoritative, so we skip
     #       our own lookup and save the SOQL round-trip), or we resolve the
@@ -493,14 +490,12 @@ def _mask_one(req: MaskRequest, sf) -> MaskResponse:
         except Exception:
             watermark_png = None
 
-    # 4) True-redact the PII strings (name/phone/email only), then overlay watermark
+    # 4) True-redact the PII strings (phone/email only), then overlay watermark
     masked_bytes, hits = mask.mask_pdf_bytes(
         pdf_bytes, mask_strings,
         watermark_png=watermark_png,
         watermark_text=req.watermark_text,
     )
-    if ocr_pages and not hits:
-        return MaskResponse(status="error", detail=_UNREAD_SCAN, job_applicant_name=ja_name)
 
     # 5) Upload masked PDF back to Salesforce
     filename = f"masked_{req.job_applicant_id}.pdf"
@@ -776,7 +771,7 @@ def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
         return InlineMaskResponse(status="error", detail="resume_base64 is not valid base64.")
 
     try:
-        pdf_bytes, ocr_pages, ocr_error = _ocr_if_scanned(pdf_bytes, req.mask_strings or [])
+        pdf_bytes, _, ocr_error = _ocr_if_scanned(pdf_bytes, req.mask_strings or [])
     except Exception as e:
         return InlineMaskResponse(status="error", detail=f"Masking failed: {e}"[:300])
     if ocr_error:
@@ -803,8 +798,6 @@ def mask_inline_endpoint(req: InlineMaskRequest) -> InlineMaskResponse:
         )
     except Exception as e:
         return InlineMaskResponse(status="error", detail=f"Masking failed: {e}"[:300])
-    if ocr_pages and not hits:
-        return InlineMaskResponse(status="error", detail=_UNREAD_SCAN)
 
     return InlineMaskResponse(
         status="ok",

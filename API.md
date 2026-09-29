@@ -165,7 +165,7 @@ transform.
 | Field | Required | Notes |
 |---|---|---|
 | `resume_base64` | yes | Source PDF, base64-encoded |
-| `mask_strings` | no | Exact PII strings to redact. Falls back to a regex email/phone scan of the PDF text if omitted — less precise, no name detection |
+| `mask_strings` | no | Phone numbers and emails to redact (anything else, e.g. a name, is ignored). Falls back to a regex email/phone scan of the PDF text if omitted |
 | `watermark_text` | no | Fallback text watermark. Default `"CONFIDENTIAL"` |
 | `watermark_base64` | no | Client logo image, base64 |
 
@@ -174,11 +174,11 @@ transform.
 { "status": "ok", "masked_pdf_base64": "<base64 masked PDF>", "redacted_regions": 3, "watermark_used": "image:inline_base64", "detail": null }
 ```
 
-Verified live: PII (name/phone/email) is true-redacted (glyphs removed, not
+Verified live: PII (phone/email) is true-redacted (glyphs removed, not
 covered, filled white), non-PII content (experience, marks/%) is preserved,
 and the watermark is stamped.
 
-Only name, phone and email are ever redacted. Numbers that a resume is full of
+Only phone numbers and email addresses are ever redacted — the candidate's name is not masked. Numbers that a resume is full of
 -- date ranges, graduation years, CGPA, credential/certificate ids, ISO/IEEE/RFC
 numbers, library versions, percentages, salary figures, PIN/ZIP codes -- are
 left alone; see `tests/test_mask_precision.py`, which scores both directions

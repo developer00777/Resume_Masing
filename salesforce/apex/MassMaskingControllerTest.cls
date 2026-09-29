@@ -14,8 +14,8 @@
  *
  * WORTH ADDING once you have confirmed the required fields on
  * SCSCHAMPS__Job_Applicant__c in this org: a test that inserts a Contact with
- * a name/phone/email plus a Job Applicant pointing at it, then asserts
- * collectPii() returns those three values in maskStrings. That is the one
+ * a phone/email plus a Job Applicant pointing at it, then asserts
+ * collectPii() returns those two values in maskStrings. That is the one
  * branch synthetic Ids cannot reach, because it needs a row to come back from
  * the query.
  */
@@ -82,13 +82,13 @@ private class MassMaskingControllerTest {
     // --- payload -----------------------------------------------------------
 
     @IsTest
-    static void payloadCarriesNamePhoneAndEmail() {
+    static void payloadCarriesPhoneAndEmail() {
         String jaId = fakeId(SCSCHAMPS__Job_Applicant__c.SObjectType);
         String acctId = fakeId(Account.SObjectType);
 
         String body = MassMaskingController.batchBody(new List<MassMaskingController.CandidatePii>{
             candidate(jaId, acctId,
-                      new List<String>{ 'Rahul Sharma', '+919876543210', 'rahul@example.com' })
+                      new List<String>{ '+919876543210', 'rahul@example.com' })
         });
 
         Map<String, Object> parsed = (Map<String, Object>) JSON.deserializeUntyped(body);
@@ -103,10 +103,15 @@ private class MassMaskingControllerTest {
             'account_id lets the service pick the client watermark without calling back');
 
         List<Object> maskStrings = (List<Object>) item.get('mask_strings');
-        System.assertEquals(3, maskStrings.size(), 'name, phone and email must all be sent');
-        System.assertEquals('Rahul Sharma', maskStrings[0]);
-        System.assertEquals('+919876543210', maskStrings[1]);
-        System.assertEquals('rahul@example.com', maskStrings[2]);
+        System.assertEquals(2, maskStrings.size(), 'phone and email must both be sent');
+        System.assertEquals('+919876543210', maskStrings[0]);
+        System.assertEquals('rahul@example.com', maskStrings[1]);
+    }
+
+    @IsTest
+    static void contactNameIsNotCollected() {
+        System.assert(!MassMaskingController.CONTACT_PII_FIELDS.contains('Name'),
+            'the candidate name is no longer masked, so it must not be sent');
     }
 
     @IsTest
@@ -127,18 +132,18 @@ private class MassMaskingControllerTest {
 
     @IsTest
     static void payloadEscapesQuotesInPii() {
-        // A name like O'Brien, or any value with a quote, must not be able to
-        // break the JSON body -- this is why batchBody uses JSONGenerator
-        // rather than string concatenation.
+        // Any value with a quote or backslash (a hand-typed email field can
+        // hold anything) must not be able to break the JSON body -- this is
+        // why batchBody uses JSONGenerator rather than string concatenation.
         String body = MassMaskingController.batchBody(new List<MassMaskingController.CandidatePii>{
             candidate(fakeId(SCSCHAMPS__Job_Applicant__c.SObjectType), null,
-                      new List<String>{ 'Sean O"Brien \\ Jr' })
+                      new List<String>{ 'o"brien\\jr@example.com' })
         });
 
         Map<String, Object> item = (Map<String, Object>)
             ((List<Object>) ((Map<String, Object>) JSON.deserializeUntyped(body)).get('items'))[0];
         List<Object> maskStrings = (List<Object>) item.get('mask_strings');
-        System.assertEquals('Sean O"Brien \\ Jr', maskStrings[0], 'value must round-trip intact');
+        System.assertEquals('o"brien\\jr@example.com', maskStrings[0], 'value must round-trip intact');
     }
 
 

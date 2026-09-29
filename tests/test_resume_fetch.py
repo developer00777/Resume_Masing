@@ -230,7 +230,9 @@ def test_fetch_contact_pii_strings_returns_populated_fields_only():
         }]}),
     ])
     result = sf_client.fetch_contact_pii_strings(CONTACT_ID, sf=sf)
-    assert result == ["Jane Candidate", "5550100001", "jane.candidate@example.com"]
+    # The name is no longer masked, so it is neither queried nor returned.
+    assert result == ["5550100001", "jane.candidate@example.com"]
+    assert "Name" not in sf_client._CONTACT_PII_FIELDS
 
 
 def test_fetch_contact_pii_strings_empty_when_contact_not_found():

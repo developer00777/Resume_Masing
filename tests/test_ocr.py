@@ -65,22 +65,20 @@ def test_invisible_layer_sits_on_the_word_pixels():
 
 
 def test_snap_rewrites_near_misses_to_known_values():
-    emails, phones, names = ocr._known([NAME, EMAIL, PHONE])
+    emails, phones = ocr._known([NAME, EMAIL, PHONE])
     line = [("rahul.sharma@exarnple.com", 0, 0, 100, 10, 60.0)]
-    assert ocr._snap(line, emails, phones, names)[0][0] == EMAIL
+    assert ocr._snap(line, emails, phones)[0][0] == EMAIL
     line = [("98765", 0, 0, 50, 10, 60.0), ("43218", 55, 0, 100, 10, 60.0)]   # one digit off
-    snapped = ocr._snap(line, emails, phones, names)
+    snapped = ocr._snap(line, emails, phones)
     assert len(snapped) == 1 and snapped[0][0] == "9876543210"
-    line = [("SHARNA", 0, 0, 50, 10, 60.0)]
-    assert ocr._snap(line, emails, phones, names)[0][0] == "SHARMA"
 
 
 def test_snap_leaves_unrelated_words_alone():
-    emails, phones, names = ocr._known([NAME, EMAIL, PHONE])
+    emails, phones = ocr._known([NAME, EMAIL, PHONE])
     line = [("Experience", 0, 0, 50, 10, 90.0), ("2019-2024", 55, 0, 100, 10, 90.0)]
-    assert ocr._snap(line, emails, phones, names) == line
+    assert ocr._snap(line, emails, phones) == line
     line = [("98765", 0, 0, 50, 10, 60.0), ("43718", 55, 0, 100, 10, 60.0)]   # two off: a different number
-    assert ocr._snap(line, emails, phones, names) == line
+    assert ocr._snap(line, emails, phones) == line
 
 
 def test_dark_panel_is_inverted():
@@ -103,7 +101,21 @@ def test_mask_refuses_a_scan_it_cannot_read(monkeypatch):
     assert body["status"] == "error" and "scanned image" in body["detail"]
 
 
-def test_mask_refuses_when_ocr_finds_nothing_to_redact(monkeypatch):
+def test_mask_refuses_a_scan_ocr_could_not_read(monkeypatch):
+    captured = _install_mocks(monkeypatch)
+    scan = _as_image_pdf(_text_pdf())
+    monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", lambda jaid, sf=None: (scan, "pdf"))
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ensure_text_layer", lambda pdf, known=(): (pdf, 1, 0))
+    body = TestClient(server.app).post("/mask", json={"job_applicant_id": "a0X000000000001",
+                                                      "mask_strings": [EMAIL]}).json()
+    assert body["status"] == "error" and "manually" in body["detail"]
+    assert "pdf_bytes" not in captured             # nothing uploaded
+
+
+def test_a_read_scan_with_no_contact_details_is_still_uploaded(monkeypatch):
+    """With names no longer masked, a scan printing no phone or email has
+    nothing to redact -- that is a finished mask, not a failure."""
     captured = _install_mocks(monkeypatch)
     scan = _as_image_pdf(_text_pdf())
     monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", lambda jaid, sf=None: (scan, "pdf"))
@@ -111,8 +123,8 @@ def test_mask_refuses_when_ocr_finds_nothing_to_redact(monkeypatch):
     monkeypatch.setattr(ocr, "ensure_text_layer", lambda pdf, known=(): (pdf, 1, 1))
     body = TestClient(server.app).post("/mask", json={"job_applicant_id": "a0X000000000001",
                                                       "mask_strings": [NAME]}).json()
-    assert body["status"] == "error" and "manually" in body["detail"]
-    assert "pdf_bytes" not in captured             # nothing uploaded
+    assert body["status"] == "ok" and body["ocr_pages"] == 1
+    assert "pdf_bytes" in captured
 
 
 needs_tesseract = pytest.mark.skipif(not ocr.available(), reason="tesseract not installed")
@@ -126,12 +138,13 @@ def test_scan_is_masked_end_to_end():
     text = fitz.open(stream=pdf, filetype="pdf")[0].get_text()
     assert EMAIL in text and "Sharma" in text
     masked, hits = mask.mask_pdf_bytes(pdf, [NAME, EMAIL, PHONE], watermark_text="")
-    assert hits >= 3
+    assert hits >= 2
     # Read the masked PICTURE again from scratch: the pixels must be gone.
     page = fitz.open(stream=masked, filetype="pdf")[0]
     reread = " ".join(w[0] for w in ocr._read(ocr._render(page)[0]))
-    assert "Sharma" not in reread and "example.com" not in reread and "43210" not in reread
-    assert "Engineer" in reread                    # and the rest of the resume is still there
+    assert "example.com" not in reread and "43210" not in reread
+    # The name is no longer masked, and the rest of the resume is still there.
+    assert "Sharma" in reread and "Engineer" in reread
 
 
 @needs_tesseract
@@ -146,7 +159,7 @@ def test_text_typed_over_a_scan_is_still_masked():
     out = fitz.open(stream=masked, filetype="pdf")[0]
     assert "example.com" not in out.get_text()
     reread = " ".join(w[0] for w in ocr._read(ocr._render(out)[0]))
-    assert "example.com" not in reread and "Sharma" not in reread
+    assert "example.com" not in reread
 
 
 @needs_tesseract
@@ -154,4 +167,4 @@ def test_inline_masks_a_scan():
     scan = _as_image_pdf(_text_pdf())
     body = TestClient(server.app).post("/mask/inline", json={
         "resume_base64": base64.b64encode(scan).decode(), "mask_strings": [NAME, EMAIL, PHONE]}).json()
-    assert body["status"] == "ok" and body["redacted_regions"] >= 3
+    assert body["status"] == "ok" and body["redacted_regions"] >= 2

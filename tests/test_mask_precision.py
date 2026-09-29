@@ -70,8 +70,8 @@ def _make_pdf(lines: list[str]) -> bytes:
 class Fixture:
     """One resume plus what masking it is supposed to do.
 
-    `contact` is what the Salesforce Contact record holds (name, phone, email
-    — the trusted structured source). `must_mask` and `must_survive` are the
+    `contact` is what the Salesforce Contact record holds (a caller may still
+    send the name alongside phone and email -- it must be ignored). `must_mask` and `must_survive` are the
     scored expectations.
     """
 
@@ -111,9 +111,8 @@ class Fixture:
 
 FIXTURES = [
     Fixture(
-        # JA-26753: the number is labelled on BOTH sides, the Contact record
-        # abbreviates the surname to an initial, and the profile link spells
-        # the whole name out.
+        # JA-26753: the number is labelled on BOTH sides. The name -- in the
+        # heading and spelled out in the profile link -- is no longer masked.
         "label-on-both-sides-and-a-profile-link",
         [
             "Karthik Velayuthan",
@@ -127,9 +126,9 @@ FIXTURES = [
             "  - Ran permit-to-work for 3 offshore platforms",
         ],
         contact=["Karthik V", "+919876543210", "velayuthan.k@example.com"],
-        must_mask=["Karthik", "Velayuthan", "98765 43210",
-                   "velayuthan.k@example.com", "(Mobile)", "karthikvelayuthan"],
+        must_mask=["98765 43210", "velayuthan.k@example.com", "(Mobile)"],
         must_survive=[
+            "Karthik Velayuthan", "karthikvelayuthan",   # names are no longer masked
             "Nationality:", "Indian", "Gender:", "Male",
             "U4531302", "2019 - 2029", "2019 - 2024",
             "Pacific High Technology Services", "permit-to-work",
@@ -159,9 +158,9 @@ FIXTURES = [
             "Address: 221-B, Sector 45, Gurugram 122003",
         ],
         contact=["Rahul Sharma", "+919876543210", "rahul.sharma@example.com"],
-        must_mask=["Rahul Sharma", "rahul.sharma@example.com", "98765 43210"],
+        must_mask=["rahul.sharma@example.com", "98765 43210"],
         must_survive=[
-            "2019 - 2023", "06/2016 - 05/2019", "2012 - 2016",
+            "RAHUL SHARMA", "2019 - 2023", "06/2016 - 05/2019", "2012 - 2016",
             "45%", "1200", "2,500,000", "8.94/10.0",
             "4821-9930-1177", "00219384", "802.11ac", "2616",
             "3.10", "14.2", "122003", "221-B",
@@ -190,17 +189,17 @@ FIXTURES = [
             "Mailing: 1600 Amphitheatre Parkway, Mountain View, CA 94043",
         ],
         contact=["Jordan A. Whitfield", "(415) 555-0132", "jordan.whitfield@example.org"],
-        must_mask=["Jordan A. Whitfield", "jordan.whitfield@example.org", "555-0132"],
+        must_mask=["jordan.whitfield@example.org", "555-0132"],
         must_survive=[
-            "2018 - Present", "2014 - 2018", "50000", "1200000",
+            "JORDAN A. WHITFIELD", "2018 - Present", "2014 - 2018", "50000", "1200000",
             "480000", "310000", "20120847713",
             "978-3-16-148410-0", "10.1000/182", "9876543", "94043",
             "1600 Amphitheatre Parkway",
         ],
     ),
     Fixture(
-        # The name is a prefix of an unrelated word on the page. search_for()
-        # has no word-boundary option, so a naive hit blanks the city name too.
+        # The name is a prefix of unrelated words on the page; none of it,
+        # the name included, may be touched.
         "name-is-a-prefix-of-another-word",
         [
             "Sunny",
@@ -211,7 +210,7 @@ FIXTURES = [
         ],
         contact=["Sunny", "9876501234", "sunny@example.net"],
         must_mask=["sunny@example.net", "9876501234"],
-        must_survive=["Sunnyvale", "Sunnyside", "Sunnybrook", "2017 - 2019", "2021"],
+        must_survive=["Sunny", "Sunnyvale", "Sunnyside", "Sunnybrook", "2017 - 2019", "2021"],
     ),
     Fixture(
         # Salesforce stores E.164; the resume renders a spaced national number.
@@ -230,12 +229,12 @@ FIXTURES = [
             "Batch 2019 - 2021",
         ],
         contact=["Priya Venkatesan", "+91 98765 43210", "priya.v@example.com"],
-        must_mask=["Priya Venkatesan", "priya.v@example.com", "98765 43210"],
+        must_mask=["priya.v@example.com", "98765 43210"],
         # An id that *ends* in the phone's own ten digits is a separate case,
         # covered precisely by test_id_labelled_run_is_not_masked_as_phone --
         # it cannot be scored here because a surviving id containing those
         # digits is indistinguishable from a leak by substring search.
-        must_survive=["98765432", "4312233445566", "987654321",
+        must_survive=["PRIYA VENKATESAN", "98765432", "4312233445566", "987654321",
                       "1234 5678 9012", "2019 - 2021"],
     ),
     Fixture(
@@ -252,14 +251,13 @@ FIXTURES = [
             "Version 2.7.1 release owner. Rank 14 of 3200.",
         ],
         contact=["Anil Kumar", "022-2345-6789", "anil.kumar@example.com"],
-        must_mask=["Anil Kumar", "anil.kumar@example.com",
+        must_mask=["anil.kumar@example.com",
                    "anil.k.personal@example.co.in", "022-2345-6789"],
-        must_survive=["3400000", "9100000", "2020", "2023", "2.7.1", "3200"],
+        must_survive=["ANIL KUMAR", "3400000", "9100000", "2020", "2023", "2.7.1", "3200"],
     ),
     Fixture(
         # No Contact record at all (resolve_contact_id returned nothing), so
-        # only the regex fallback runs. The name is expected to survive here —
-        # detect_pii has no name detection, by design.
+        # only the regex fallback runs.
         "regex-fallback-only",
         [
             "MEERA IYER",
@@ -283,8 +281,8 @@ FIXTURES = [
         + [f"Project {i}: delivered in 2021, saved 45000 USD, {i}00 users" for i in range(40)]
         + ["deepak.rao@example.com  |  9900112233"],
         contact=["Deepak Rao", "9900112233", "deepak.rao@example.com"],
-        must_mask=["Deepak Rao", "deepak.rao@example.com", "9900112233"],
-        must_survive=["2021", "45000", "Project 39"],
+        must_mask=["deepak.rao@example.com", "9900112233"],
+        must_survive=["DEEPAK RAO", "2021", "45000", "Project 39"],
     ),
 ]
 
@@ -446,7 +444,7 @@ def test_multi_number_field_masks_every_number_and_nothing_else():
 
     assert "9876543210" not in text, "first number leaked"
     assert "9123456789" not in text, "second number leaked"
-    assert "PriyaVenkatesan" not in text.replace("PRIYA", "Priya")
+    assert "PRIYAVENKATESAN" in text, "the name is no longer masked"
     for survivor in ("2019-2023", "2012-2016", "8.94/10.0", "4821-9930-1177"):
         assert survivor in text, f"over-masked {survivor}"
 
@@ -466,105 +464,18 @@ def _mask_text(lines, mask_strings):
     return text, hits
 
 
-# Both directions of the mismatch, taken from live records: the Contact holds a
-# middle name the resume omits, or the resume prints one the Contact lacks.
-NAME_MISMATCHES = [
-    ("contact has the middle name", "Sitendra Kumar Chakra",
-     "SITENDRA CHAKRA", ["SITENDRA", "CHAKRA"]),
-    ("resume has the middle name", "Samar Wadyalkar",
-     "SAMAR SHIVAJI WADYALKAR", ["SAMAR", "SHIVAJI", "WADYALKAR"]),
-    ("both have it, different case", "rahul kumar sharma",
-     "Rahul Kumar Sharma", ["Rahul", "Kumar", "Sharma"]),
-]
-
-
-@pytest.mark.parametrize("label,contact_name,heading,gone",
-                         NAME_MISMATCHES, ids=[m[0] for m in NAME_MISMATCHES])
-def test_name_masked_despite_middle_name_mismatch(label, contact_name, heading, gone):
-    """The name must be redacted even when it is not present verbatim.
-
-    This was a live PII leak: search_for() needs the whole string, so on a
-    third of sampled records the candidate's name was left sitting in the page
-    heading of the masked copy while phone and email were blacked out."""
+def test_a_name_passed_in_is_ignored():
+    """The candidate's name is no longer masked. Callers (the Salesforce
+    button) may still send it; in every form it takes on a page -- verbatim,
+    with a middle name either side lacks, as a lone surname, in a large-font
+    heading -- it must be left exactly where it is."""
     text, hits = _mask_text(
-        [heading, "Civil Engineer", "EXPERIENCE", "Acme Corp   2019 - 2023"],
-        [contact_name])
-    assert hits >= 1, f"{label}: nothing was redacted"
-    for token in gone:
-        assert token not in text, f"{label}: {token!r} leaked"
-    assert "2019 - 2023" in text, f"{label}: over-masked the date range"
-    assert "Civil Engineer" in text
-
-
-def test_single_token_name_is_not_loosely_matched():
-    """One token is not enough evidence to match on.
-
-    A candidate named Will, Rose or Mark would otherwise have every ordinary
-    occurrence of that word redacted out of their own resume."""
-    text, _ = _mask_text(
-        ["Will", "I will manage delivery and will own the roadmap."],
-        ["Will"])
-    assert "will manage" in text
-    assert "will own" in text
-
-
-def test_lone_name_token_is_redacted():
-    """A surname on its own is still the candidate's name.
-
-    These were the bulk of what still leaked once full-name matching worked --
-    22 across 40 live resumes, typically a surname in a footer or a first name
-    above a signature."""
-    text, _ = _mask_text(
-        ["RAHUL SHARMA", "Prepared by Sharma, Acme Corp", "2019 - 2023"],
-        ["Rahul Sharma"])
-    assert "Sharma" not in text, "lone surname leaked"
-    assert "Acme Corp" in text, "over-masked the employer"
-    assert "2019 - 2023" in text, "over-masked the date range"
-
-
-def test_lone_token_shorter_than_four_chars_is_left_alone():
-    """Below four characters a lone token is too easily an acronym."""
-    text, _ = _mask_text(
-        ["RAJ MEHRA", "Built ETL and SQL pipelines; RAJ certified"],
-        ["Raj Mehra"])
-    assert "SQL" in text and "ETL" in text
-    assert "RAJ certified" in text, "a 3-char lone token should not be acted on"
-
-
-def test_name_match_does_not_span_across_a_long_gap():
-    """Tokens far apart on a line are not one name."""
-    text, _ = _mask_text(
-        ["Rahul reviewed the account held by Mr Sharma at Acme Corp"],
-        ["Rahul Sharma"])
-    assert "account held by" in text, "redacted the words between two tokens"
-
-
-def test_tall_heading_redaction_does_not_wipe_the_line_below():
-    """A big-font name must not take the tagline underneath it with it.
-
-    get_text("words") reports a word box far taller than its glyphs for a
-    heading font -- 37pt for two words on one live resume -- and
-    apply_redactions() deletes every character whose box merely INTERSECTS the
-    annotation. The tall rect therefore erased the tagline, leaving "Elec" and
-    "nce" stranded either side of a white gap. Reported as a white box
-    covering information for no reason."""
-    doc = fitz.open()
-    page = doc.new_page()
-    page.insert_text((56, 70), "AASIM SOHAIL", fontsize=26)
-    page.insert_text((56, 88), "Electrical Safety Engineer | 5 Years Experience",
-                     fontsize=9)
-    pdf = doc.tobytes()
-    doc.close()
-
-    masked, hits = mask.mask_pdf_bytes(pdf, ["Aasim Sohail"], watermark_text="")
-    doc = fitz.open(stream=masked, filetype="pdf")
-    text = doc[0].get_text()
-    doc.close()
-
-    assert hits >= 1
-    assert "AASIM" not in text and "SOHAIL" not in text, "the name leaked"
-    assert _norm("Electrical Safety Engineer | 5 Years Experience") in _norm(text), \
-        f"the tagline below the heading was destroyed: {text!r}"
+        ["SITENDRA KUMAR CHAKRA", "Prepared by Chakra, Acme Corp", "2019 - 2023",
+         "Samar Wadyalkar"],
+        ["Sitendra Chakra", "Samar Shivaji Wadyalkar", "Chakra"])
+    assert hits == 0
+    for kept in ("SITENDRA KUMAR CHAKRA", "Prepared by Chakra", "Samar Wadyalkar"):
+        assert kept in text, f"{kept!r} was masked"
 
 
 def test_separator_between_two_redactions_is_absorbed():
@@ -588,17 +499,6 @@ def test_bridging_never_joins_across_real_content():
         ["9876543210 reported to Acme and 9123456789 covered nights"],
         ["9876543210    9123456789"])
     assert "reported to Acme and" in text, "bridged across real content"
-
-
-def test_name_shorter_than_three_chars_is_never_matched():
-    """A 1-2 character name would hit half the page; refuse rather than guess."""
-    pdf = _make_pdf(["Li Wei", "An analysis of an anomaly in Anaheim."])
-    masked, hits = mask.mask_pdf_bytes(pdf, ["An"], watermark_text="")
-    doc = fitz.open(stream=masked, filetype="pdf")
-    text = doc[0].get_text()
-    doc.close()
-    assert hits == 0
-    assert "analysis" in text and "anomaly" in text and "Anaheim" in text
 
 
 def test_redaction_fill_is_white():

@@ -92,7 +92,7 @@ def test_mask_with_explicit_strings(monkeypatch):
     body = resp.json()
     assert body["status"] == "ok", body
     assert body["masked_content_version_id"] == "068000000000001AAA"
-    assert body["redacted_regions"] >= 3
+    assert body["redacted_regions"] >= 2
     assert body["job_applicant_name"] == "JA-00001"
 
     # Inspect the masked bytes that were handed to "upload".
@@ -100,8 +100,9 @@ def test_mask_with_explicit_strings(monkeypatch):
     text = "".join(p.get_text() for p in masked)
     masked.close()
 
-    for pii in ["John Doe", "98765", "john.doe@example.com"]:
+    for pii in ["98765", "john.doe@example.com"]:
         assert pii not in text, f"PII leaked: {pii!r}"
+    assert "John Doe" in text, "the name is no longer masked"
     assert "Experience" in text and "85%" in text, "over-masked experience/marks"
     assert captured["filename"] == "masked_a0X000000000001.pdf"
 
@@ -129,17 +130,16 @@ def test_mask_merges_structured_contact_pii_with_regex_fallback(monkeypatch):
     approach finds nothing -- even though the candidate's real contact info
     sits right there, correct, on the Contact record. When mask_strings
     isn't supplied (the real Salesforce flow never sends it), the
-    candidate's structured Name/Phone/Email must be pulled from the
+    candidate's structured Phone/Email must be pulled from the
     related Contact and merged in, not left to regex alone.
 
-    "John Doe" is present in the sample PDF's text but detect_pii() alone
-    NEVER catches it (it only regex-matches email/phone, never names) --
-    proving this specific redaction only happened because the structured
-    Contact lookup fed it in, not as a side effect of the existing regex path."""
+    The text scan is switched off here, so the phone can only have been
+    redacted because the structured Contact lookup fed it in."""
     captured = _install_mocks(monkeypatch)
     monkeypatch.setattr(server.sf_client, "resolve_contact_id", lambda jaid, sf=None: "003RESOLVEDCONTACT01")
     monkeypatch.setattr(server.sf_client, "fetch_contact_pii_strings",
-                        lambda cid, sf=None: ["John Doe"])
+                        lambda cid, sf=None: ["+91 98765 43210"])
+    monkeypatch.setattr(server, "detect_pii", lambda pdf: [])
     client = TestClient(server.app)
 
     resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002"})
@@ -149,16 +149,15 @@ def test_mask_merges_structured_contact_pii_with_regex_fallback(monkeypatch):
     masked = fitz.open(stream=captured["pdf_bytes"], filetype="pdf")
     text = "".join(p.get_text() for p in masked)
     masked.close()
-    assert "John Doe" not in text, "structured Contact name was not merged into mask_strings"
-    assert "john.doe@example.com" not in text, "regex-detected PII still redacted too"
+    assert "98765" not in text, "structured Contact phone was not merged into mask_strings"
 
 
 def test_mask_merges_supplied_mask_strings_with_text_scan(monkeypatch):
     """Caller-supplied mask_strings must ADD to detect_pii(), not replace it.
 
     This is the Apex path: MassMaskingController reads the candidate's
-    Name/Phone/Email off the Contact and sends them, which is authoritative
-    for those three values. It says nothing about PII that exists only in the
+    Phone/Email off the Contact and sends them, which is authoritative
+    for those values. It says nothing about PII that exists only in the
     document -- so the resume text scan has to keep running alongside it.
     Supplied strings used to replace both other sources outright, quietly
     turning the scan off for exactly the callers most likely to care."""
@@ -171,17 +170,17 @@ def test_mask_merges_supplied_mask_strings_with_text_scan(monkeypatch):
     monkeypatch.setattr(server.sf_client, "resolve_contact_id", fail_if_called)
     client = TestClient(server.app)
 
-    # "John Doe" only ever comes from the caller (detect_pii never finds names);
-    # the email only ever comes from the text scan. Both must be gone.
+    # The phone comes from the caller; the email only ever comes from the text
+    # scan. Both must be gone.
     resp = client.post("/mask", json={"job_applicant_id": "a0X000000000002",
-                                      "mask_strings": ["John Doe"]})
+                                      "mask_strings": ["+91 98765 43210"]})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "ok"
 
     masked = fitz.open(stream=captured["pdf_bytes"], filetype="pdf")
     text = "".join(p.get_text() for p in masked)
     masked.close()
-    assert "John Doe" not in text, "supplied mask_string was not applied"
+    assert "98765" not in text, "supplied mask_string was not applied"
     assert "john.doe@example.com" not in text, \
         "supplied mask_strings suppressed the resume text scan"
 
@@ -908,8 +907,8 @@ def test_mask_inline_never_touches_salesforce(monkeypatch):
     doc = fitz.open(stream=masked_bytes, filetype="pdf")
     text = "".join(page.get_text() for page in doc)
     doc.close()
-    assert "John Doe" not in text
     assert "98765" not in text
+    assert "John Doe" in text, "the name is no longer masked"
     assert "Acme Corp" in text, "non-PII content must survive masking"
 
 

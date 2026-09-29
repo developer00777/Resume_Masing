@@ -69,7 +69,7 @@ gated by `X-API-Key` if you've set one, same as every other endpoint).
 
 **What we still need from you**, only if you want us doing the PII detection
 too (recommended — see `mask_strings` below):
-- Nothing else. If you already have the candidate's name/phone/email as
+- Nothing else. If you already have the candidate's phone/email as
   structured fields on the Contact, pass them as `mask_strings` in the
   request for the most accurate redaction — otherwise we fall back to a
   regex scan of the PDF text (email + phone patterns), which is good but not
@@ -233,7 +233,7 @@ join-view "Mask" button (real flow: MassMaskingController -> /candidate/MaskProf
       2. Resolve the client Account (for per-client watermark) — from account_id
          if passed, else auto-resolved from SCSCHAMPS__Job_Applicant__c.SCSCHAMPS__Account__c
       3. Resolve watermark image — inline base64 > Salesforce File lookup > plain text
-      4. True-redact PII text (name/phone/email) + overlay centered watermark
+      4. True-redact PII text (phone/email; names are not masked) + overlay centered watermark
       5. Upload masked PDF — currently back onto the SAME SCSCHAMPS__Job_Applicant__c
          record (not a separate Applicant object)
       6. Return { status, masked_content_version_id, redacted_regions, watermark_used }
@@ -257,7 +257,7 @@ join-view "Mask" button (real flow: MassMaskingController -> /candidate/MaskProf
 |---|---|---|
 | `job_applicant_id` | yes | Salesforce Id of the source record (today: Job Applicant). 15 or 18 chars. |
 | `account_id` | no | Client Account Id, for watermark resolution. Auto-resolved from the Job Applicant if omitted. |
-| `mask_strings` | no | Exact PII strings to redact. If omitted (the real button flow currently never sends it), the service auto-resolves the candidate's Name/Phone/Email from the related Contact record (`SCSCHAMPS__Contact_Talent__c`) and merges that with a regex fallback (email/phone) over the extracted PDF text. The Contact lookup exists because regex-on-text alone can silently miss real PII — confirmed on this org: resumes built from Microsoft's built-in "Contoso" template render the phone/email via a Word content control that can extract as blank or garbled text, even though the correct value sits right there on the Contact. Passing `mask_strings` explicitly (e.g. from your own parsed candidate data) always takes priority over both. |
+| `mask_strings` | no | Exact PII strings to redact. If omitted (the real button flow currently never sends it), the service auto-resolves the candidate's Phone/Email from the related Contact record (`SCSCHAMPS__Contact_Talent__c`) and merges that with a regex fallback (email/phone) over the extracted PDF text. The Contact lookup exists because regex-on-text alone can silently miss real PII — confirmed on this org: resumes built from Microsoft's built-in "Contoso" template render the phone/email via a Word content control that can extract as blank or garbled text, even though the correct value sits right there on the Contact. Passing `mask_strings` explicitly (e.g. from your own parsed candidate data) always takes priority over both. |
 | `watermark_text` | no | Fallback text watermark if no image is found. Default `"CONFIDENTIAL"`. |
 | `watermark_base64` | no | Inline watermark image — skips an extra Salesforce round-trip. See §5. |
 | `client_key` | conditional | Required only if we're using multi-org auth (Option C above) — your org's Organization Id (`UserInfo.getOrganizationId()`). Omit for Option A/B. Must be registered first, see §3a. |
@@ -337,7 +337,7 @@ Apex fetches the resume and writes the result, we only transform bytes.
 | Field | Required | Notes |
 |---|---|---|
 | `resume_base64` | yes | The source PDF, base64-encoded. |
-| `mask_strings` | no | Exact PII strings to redact — pass the candidate's name/phone/email from your Contact fields for the most accurate result. Falls back to a regex email/phone scan if omitted. |
+| `mask_strings` | no | Exact PII strings to redact — pass the candidate's phone/email from your Contact fields (a name is ignored) for the most accurate result. Falls back to a regex email/phone scan if omitted. |
 | `watermark_text` | no | Fallback text watermark. Default `"CONFIDENTIAL"`. |
 | `watermark_base64` | no | Client logo image, base64. |
 

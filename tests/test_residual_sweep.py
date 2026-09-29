@@ -481,7 +481,7 @@ def test_tab_aligned_label_is_absorbed():
     """A contact block is tab-aligned, so the label is not next to its value.
 
     Measured on the reported resumes: "Email" sat 20.5pt from its address on
-    JA-26708 and "Name :" 38.8pt from its value on JA-26631. _absorb_label
+    JA-26708 and "Mobile No :" far from its value on JA-26631. _absorb_label
     allowed 12pt, so both labels stayed on the masked page over white space --
     which is the reported "the emailid tag is also not removed".
     """
@@ -493,9 +493,11 @@ def test_tab_aligned_label_is_absorbed():
          "Acme Corp   2019 - 2023"],
         ["Rahul Sharma", "9876543210", "rahul.sharma@gmail.com"])
     stripped = _norm(text)
-    for label in ("Name:", "Emailid:", "MobileNo:"):
+    for label in ("Emailid:", "MobileNo:"):
         assert label not in stripped, f"label left standing: {label!r}"
-    # The labels of things that are NOT contact details stay, with their values.
+    # The labels of things that are NOT contact details stay, with their values
+    # -- and the name is no longer one of them.
+    assert "Name:" in stripped and "RahulSharma" in stripped
     assert "Profession:" in stripped and "Surveyor" in stripped
     assert "2019-2023" in stripped
 
@@ -583,73 +585,12 @@ def test_label_absorption_does_not_eat_prose():
     assert "with your details" in text
 
 
-def test_label_glued_to_the_name_word_is_taken_with_it():
-    """"Name-Anup Kumar Yadav" extracts with the label inside the first word.
-
-    Comparing the word box as a whole ("nameanup") matched no token, so the
-    surname went and the first name stayed: JA-26708's declaration page
-    shipped reading "Name-Anup" with the rest blanked. Name tokens are matched
-    per letter-run instead, and the whole word box goes, label and all.
-    """
-    text, _ = _masked_text(
-        ["Declaration: the above is true to the best of my knowledge.",
-         "Name-Anup Kumar Yadav",
-         "Date-13-08-2026"],
-        ["Anup Kumar Yadav"])
-    stripped = _norm(text)
-    assert "Anup" not in stripped and "Yadav" not in stripped
-    assert "Name-" not in stripped, f"glued label left behind: {text!r}"
-    assert "Declaration:" in text and "13-08-2026" in stripped
-
-
-def test_contact_initial_matches_the_name_part_it_abbreviates():
-    """The Contact holds "Karthik V"; the resume prints "Karthik Velayuthan".
-
-    Initials used to be dropped outright, which left one usable token, no
-    two-token match, and the candidate's surname in 24pt at the top of the
-    masked copy (JA-26753).
-    """
-    text, _ = _masked_text(
-        ["Karthik Velayuthan",
-         "Vendor management and HSE audits across the Vizag site",
-         "Acme Corp   2019 - 2023"],
-        ["Karthik V"])
-    stripped = _norm(text)
-    assert "Karthik" not in stripped and "Velayuthan" not in stripped
-    # An initial is evidence only where it stands -- directly after a part
-    # that already matched. Other capitalised V-words are ordinary content.
-    assert "Vendor" in text and "Vizag" in text
-    assert "2019-2023" in stripped
-
-
-def test_profile_link_spelling_out_the_name_is_redacted():
-    """A blank contact block under a link that still names the candidate is
-    not anonymised.
-
-    JA-26753 was masked down to white space that still carried
-    "https://www.linkedin.com/in/karthikvelayuthan/", which names the
-    candidate as plainly as the heading did. The slug runs the name together,
-    so it can only be matched as a substring -- which is safe here precisely
-    because it is confined to links.
-    """
-    text, _ = _masked_text(
-        ["Karthik Velayuthan",
-         "LinkedIn: https://www.linkedin.com/in/karthikvelayuthan/",
-         "Portfolio: https://www.example.com/projects/safety-audit"],
-        ["Karthik V"])
-    stripped = _norm(text).casefold()
-    assert "karthikvelayuthan" not in stripped, f"profile link left: {text!r}"
-    assert "linkedin:" not in stripped, "the link's label stayed behind"
-    # A link that does not name the candidate is ordinary resume content.
-    assert "example.com/projects/safety-audit" in stripped
-
-
 def test_two_column_table_label_is_absorbed_across_the_tab_stop():
     """A two-column table tab-aligns the label 170-180pt from its value.
 
     Found by sweeping the org. The label reaches its value across a tab stop
     that the 150pt limit did not cover, with or without a colon to point the
-    way: JA-26566 left "Name" standing, JA-26355 left "NAME" at the head of a
+    way: JA-26566 and JA-26355 left their labels standing at the head of a
     colon-less table whose other rows read "GENDER", "DOB", "ADDRESS".
     """
     doc = fitz.open()
@@ -671,10 +612,11 @@ def test_two_column_table_label_is_absorbed_across_the_tab_stop():
     text = doc[0].get_text()
     doc.close()
     stripped = _norm(text)
-    assert "PRAHLAD" not in stripped and "9876543210" not in stripped
-    assert "Name" not in stripped, f"table label left standing: {text!r}"
+    assert "9876543210" not in stripped
     assert "MOBILE" not in stripped, f"table label left standing: {text!r}"
-    # The row below is not a contact detail: it keeps its label and its value.
+    # The other rows are not contact details: they keep label and value -- the
+    # name row included, since the name is no longer masked.
+    assert "Name" in stripped and "PRAHLADKUMAR" in stripped
     assert "GENDER" in text and "Male" in text
 
 
@@ -685,7 +627,7 @@ def test_a_label_in_another_block_needs_a_separator_to_reach_the_value():
     text blocks (JA-26563). So does a sidebar heading standing level with the
     next column's content -- JA-26576 prints "CONTACT" in the left margin, in
     the same style as "OBJECTIVE" and "EDUCATION" below it, with the
-    candidate's name beside it. Taking that one would strip the heading off
+    candidate's number beside it. Taking that one would strip the heading off
     the address still standing underneath.
 
     Only the separator tells them apart, and PyMuPDF merges same-row
@@ -697,12 +639,12 @@ def test_a_label_in_another_block_needs_a_separator_to_reach_the_value():
     def word(x0, x1, s, block):
         return (x0, y0, x1, y1, s, block, 0, 0)
 
-    # "NAME" : "PRAHLAD KUMAR", each part in a block of its own. The colon
+    # "MOBILE" : "98765 43210", each part in a block of its own. The colon
     # ties the label to the value, so absorption may cross to it.
-    layout = mask._Layout([word(29.5, 63.4, "NAME", 2),
+    layout = mask._Layout([word(29.5, 63.4, "MOBILE", 2),
                            word(206.5, 209.7, ":", 4),
-                           word(211.8, 256.7, "PRAHLAD", 4),
-                           word(260.0, 323.4, "KUMAR", 4)])
+                           word(211.8, 256.7, "98765", 4),
+                           word(260.0, 323.4, "43210", 4)])
     grown = mask._absorb_labels(fitz.Rect(211.8, y0, 323.4, y1), layout)
     assert grown.x0 <= 29.5, f"the tied label was not absorbed: {grown}"
 
@@ -716,9 +658,9 @@ def test_a_label_in_another_block_needs_a_separator_to_reach_the_value():
 
     # The same geometry with nothing between the two: a heading, not a label.
     layout = mask._Layout([word(28.5, 98.3, "CONTACT", 0),
-                           word(171.0, 288.0, "MR.SANJAY", 7),
-                           word(293.3, 366.7, "KUMAR", 7),
-                           word(372.0, 433.2, "PATEL", 7)])
+                           word(171.0, 288.0, "+91", 7),
+                           word(293.3, 366.7, "98765", 7),
+                           word(372.0, 433.2, "43210", 7)])
     grown = mask._absorb_labels(fitz.Rect(171.0, y0, 433.2, y1), layout)
     assert grown.x0 >= 170.5, f"a section heading was absorbed: {grown}"
 
@@ -814,11 +756,8 @@ def test_a_label_is_matched_as_parts_not_as_a_phrase():
                   "Mobile No. :", "Mobile No.", "Ph. No.", "ContactNumber",
                   "Contact No.", "MobileNo", "Mob-No.", "Cell#", "Tel:",
                   "Alternate Email ID", "Personal Mob No.", "WhatsApp No",
-                  "Name:", "Candidate Name", "Applicant's Name",
-                  # whose name it is -- these label a name as much as "Name" does
-                  "FATHER'S", "Father’s", "S/o", "D/O", "C/O:", "W/o",
-                  # and the honorific that sits between a label and its value
-                  "Mr.", "Mrs.", "Shri", "Late.",
+                  # whose number it is
+                  "Father's Mobile No.", "Parent Contact", "Candidate Mobile",
                   # a separator left on its own, and the bracketed annotation
                   "+", ":", "-", "(Mobile)", "(R)", "E"):
         assert _CONTACT_LABEL_RE.match(label), f"not recognised as a label: {label!r}"
@@ -834,7 +773,9 @@ def test_ordinary_resume_words_are_not_labels():
     for word in ("Surveyor", "Indian", "Male", "please", "Objective", "Reside",
                  "Passport", "Experience", "Nomination", "Network", "Company",
                  "Designation", "Duration", "Project", "Skills", "CURRICULAM",
-                 "VITAE", "Engineering", "Nationality", "Declaration"):
+                 "VITAE", "Engineering", "Nationality", "Declaration",
+                 # the name is no longer masked, so its labels are not labels
+                 "Name:", "Candidate Name", "Mr.", "Shri", "S/o"):
         assert not _CONTACT_LABEL_RE.match(word), f"read as a label: {word!r}"
 
 
@@ -959,10 +900,9 @@ def test_mailto_link_is_removed():
 
 
 def test_document_metadata_is_scrubbed():
-    """Word writes the candidate's name into /Title and /Author.
-
-    It is not on any page, so redaction never touches it, and it is the
-    first thing a PDF reader shows in the title bar."""
+    """A phone or email in the metadata is not on any page, so redaction
+    never touches it. The name Word writes into /Title and /Author is no
+    longer masked and stays."""
     doc = fitz.open()
     doc.new_page().insert_text((56, 60), "Acme Corp   2019 - 2023", fontsize=10)
     doc.set_metadata({"title": "Rahul Sharma CV 2024",
@@ -976,8 +916,8 @@ def test_document_metadata_is_scrubbed():
     doc = fitz.open(stream=masked, filetype="pdf")
     meta = doc.metadata
     doc.close()
-    for key in residual._PII_METADATA_KEYS:
-        assert not meta.get(key), f"{key} still holds {meta.get(key)!r}"
+    assert not meta.get("subject") and not meta.get("keywords"), meta
+    assert meta.get("title") == "Rahul Sharma CV 2024" and meta.get("author") == "Rahul Sharma"
 
 
 def test_sweep_leaves_a_clean_page_untouched():

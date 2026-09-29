@@ -1,17 +1,16 @@
 """Resume masking core — TRUE-redact PII text, plus centered watermark
 IMAGE overlay.
 
-Only three things are ever redacted: candidate name, phone number(s), email
-address(es). Which strings those are is decided upstream (server.detect_pii +
-the Salesforce Contact record); this module's job is to find each one on the
-page *without* catching anything else, which needs a per-kind matching
-strategy rather than one blind substring search:
+Only two things are ever redacted: phone number(s) and email address(es). The
+candidate's name is no longer masked -- a name passed in is ignored. Which
+strings those are is decided upstream (server.detect_pii + the Salesforce
+Contact record); this module's job is to find each one on the page *without*
+catching anything else, which needs a per-kind matching strategy rather than
+one blind substring search:
 
     email  exact substring   — the shape is unique enough to trust as-is
     phone  digit-equivalence — formatting differs between Salesforce and the
                                resume, so match on digits, anchored at the end
-    name   whole-word literal — a bare search_for() hit can be a fragment
-                               inside a longer word ("Ana" inside "Analysis")
 
 Removing the value is only half the job. What the reader sees is the *row* it
 sat in, and a row that still says
@@ -23,7 +22,7 @@ over white space has told them exactly what was taken out, which is the defect
 clients keep reporting. So every hit is grown outwards along its row over the
 label that introduces it and the annotation that trails it — see
 _absorb_labels, which is the single place that decision is made, for both
-passes and all three kinds.
+passes and both kinds.
 
 Redaction is a true redaction — `apply_redactions()` deletes the glyphs, so
 the text is gone from the PDF, not merely covered. The fill is white
@@ -44,13 +43,6 @@ from . import pii, residual
 #: Redaction fill. White, not black — the redacted region should read as blank
 #: space on the page rather than a censor bar.
 REDACT_FILL = (1.0, 1.0, 1.0)
-
-#: A search_for() hit is treated as a fragment (and dropped) if it covers less
-#: than this fraction of the width of a word it overlaps. Set high enough that
-#: "Li" inside "Lin" (0.67) is rejected, low enough that a name followed by
-#: punctuation glued into the same word — "Sharma," (~0.93) — is kept.
-_WORD_COVERAGE = 0.85
-
 
 def _digits(s: str) -> str:
     return pii.digits(s)
@@ -334,264 +326,6 @@ def _dedupe_rects(rects: list[fitz.Rect]) -> list[fitz.Rect]:
     return kept
 
 
-def _covers_whole_words(rect: fitz.Rect, layout: _Layout) -> bool:
-    """Does `rect` cover whole words, rather than clipping into one?
-
-    search_for() has no word-boundary option, so a short name matches inside
-    longer words. Comparing the hit's width against the width of each word it
-    touches tells the two cases apart: a whole-word hit spans the word, a
-    fragment hit covers only part of it.
-    """
-    for w in layout.near(rect):
-        wr = fitz.Rect(w[0], w[1], w[2], w[3])
-        if wr.is_empty or wr.width <= 0:
-            continue
-        inter = wr & rect
-        if inter.is_empty or inter.width <= 0:
-            continue
-        # Ignore words that merely brush the rect from the line above/below.
-        if inter.height < min(wr.height, rect.height) * 0.5:
-            continue
-        if inter.width < wr.width * _WORD_COVERAGE:
-            return False
-    return True
-
-
-# --- name -----------------------------------------------------------------
-
-#: Letters only — how a name token is compared, so "Sharma," and "SHARMA"
-#: both reduce to "sharma". Applied per letter-run rather than to the word as
-#: a whole, which is what lets a name be recognised through the label glued to
-#: the front of it: "Name-Anup" is one word box on JA-26708, and matching the
-#: word whole ("nameanup") left the candidate's first name on the page.
-_NAME_TOKEN_RE = re.compile(r"[^\W\d_]+")
-
-#: How many unmatched words may sit between two matched name tokens. One
-#: covers the common case of a middle name printed on the resume but absent
-#: from the Contact record. More than that and we would start joining up
-#: unrelated words that happen to share a surname.
-_NAME_MAX_GAP = 1
-
-#: A match must cover at least this many letters in total. Stops two short
-#: coincidental tokens from being read as a name.
-_NAME_MIN_CHARS = 6
-
-#: Shortest lone name token we will redact on its own. Below this a token is
-#: too easily an acronym or an ordinary short word to act on without the
-#: corroboration of a neighbouring token.
-_NAME_LONE_TOKEN_MIN = 4
-
-
-def _name_sequence(name: str) -> list[tuple[str, bool]]:
-    """The Contact name as ordered (part, is_initial) entries.
-
-    Initials used to be dropped outright, because a single letter matches far
-    too much on its own. Dropping them also threw away the only evidence that
-    the name continues: the Contact holds "Karthik V", the resume heading says
-    "Karthik Velayuthan", and with the initial gone there was one usable token
-    left, no two-token match, and the candidate's surname stayed in 24pt at
-    the top of the masked copy (JA-26753).
-
-    Kept as a weak entry instead — see _name_rects, where an initial only ever
-    matches a capitalised word sitting immediately after a token that already
-    matched.
-    """
-    return [(t.casefold(), len(t) < 3) for t in _NAME_TOKEN_RE.findall(str(name))]
-
-
-def _name_token_list(name: str) -> list[str]:
-    """The full-length tokens of `name`, which are what may match on their own."""
-    return [t for t, initial in _name_sequence(name) if not initial]
-
-
-def _word_groups(text: str) -> list[str]:
-    """The letter runs in one word box ("Name-Anup" -> ["Name", "Anup"])."""
-    return _NAME_TOKEN_RE.findall(text)
-
-
-def _initial_matches(letter: str, text: str) -> bool:
-    """Could word `text` be the name part the Contact abbreviated to `letter`?
-
-    Capitalisation is the guard that makes this safe: a name is written
-    "Velayuthan" or "VELAYUTHAN", never "velayuthan", so ordinary prose cannot
-    satisfy it even when it starts with the right letter.
-    """
-    groups = _word_groups(text)
-    return bool(groups) and groups[0][:1].casefold() == letter \
-        and (groups[0].istitle() or groups[0].isupper())
-
-
-def _lone_token_rects(tokens: list[str], layout: _Layout) -> list[fitz.Rect]:
-    """Redact a single name token standing on its own.
-
-    A surname alone in a page footer, or a first name above a signature, is
-    still the candidate's name -- 22 of these survived across 40 live resumes
-    once the full-name match was working, so they are the bulk of what is left
-    leaking.
-
-    Guarded two ways so ordinary prose is untouched: the token must be at
-    least _NAME_LONE_TOKEN_MIN characters, and it must be capitalised the way
-    a name is. "Kumar" and "KUMAR" match; the "will" in "I will manage
-    delivery" does not, which is what makes this safe for a candidate whose
-    name really is Will.
-    """
-    wanted = {t for t in tokens if len(t) >= _NAME_LONE_TOKEN_MIN}
-    # The tokens run together as one word, which is how a resume heading or a
-    # file-derived title often writes it: "ANILKUMAR" for Contact "Anil
-    # Kumar". Matched only on full equality, never as a substring, so it
-    # cannot behave like the "Ana" inside "Analysis" case.
-    joined = {"".join(tokens[i:j])
-              for i in range(len(tokens))
-              for j in range(i + 2, len(tokens) + 1)}
-    if not wanted and not joined:
-        return []
-    out: list[fitz.Rect] = []
-    for w in layout.words:
-        text = w[4].strip(" .,;:()[]-|/")
-        if not text or "@" in text:
-            continue                      # emails are matched as emails
-        groups = _word_groups(text)
-        if "".join(groups).casefold() in joined:
-            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), layout))
-            continue
-        # Per letter-run, so a label glued to the name ("Name-Anup") is
-        # recognised — and taken with it, since the whole word box goes.
-        if any(g.casefold() in wanted and (g.istitle() or g.isupper())
-               for g in groups):
-            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), layout))
-    return out
-
-
-#: A word that is a link or a handle rather than prose. A name inside one of
-#: these is still the candidate's name: JA-26753 was masked down to a blank
-#: contact block that still carried
-#: "https://www.linkedin.com/in/karthikvelayuthan/", which names the candidate
-#: as plainly as the heading did.
-_URLISH_RE = re.compile(
-    r"https?://|www\.|\b[a-z0-9\-]+\.(?:com|in|org|net|io|me|co|dev|info|us|uk)\b",
-    re.I,
-)
-
-
-def _url_name_rects(tokens: list[str], layout: _Layout) -> list[fitz.Rect]:
-    """Redact a URL or handle that spells out the candidate's name.
-
-    Matched as a substring of the link's letters, which is the only way to
-    find it: a profile slug runs the name together and drops the separators
-    ("karthikvelayuthan"). Confined to links, so the substring rule cannot
-    behave like the "Ana" inside "Analysis" case — that only happens in prose,
-    and prose is not a URL.
-    """
-    wanted = [t for t in tokens if len(t) >= _NAME_LONE_TOKEN_MIN]
-    if not wanted:
-        return []
-    out: list[fitz.Rect] = []
-    for w in layout.words:
-        if not _URLISH_RE.search(w[4]):
-            continue
-        letters = "".join(_word_groups(w[4])).casefold()
-        if any(t in letters for t in wanted):
-            out.append(_clip_to_line(fitz.Rect(w[:4]), (w[5], w[6]), layout))
-    return out
-
-
-def _name_rects(name: str, layout: _Layout) -> list[fitz.Rect]:
-    """Locate a candidate's name even when the resume spells it differently.
-
-    page.search_for() needs the whole string present verbatim, and on real
-    records it very often is not -- the Contact holds a middle name the resume
-    omits, or the resume prints one the Contact lacks:
-
-        Contact "Sitendra Kumar Chakra"   resume "SITENDRA CHAKRA"
-        Contact "Samar Wadyalkar"         resume "SAMAR SHIVAJI WADYALKAR"
-        Contact "Karthik V"               resume "Karthik Velayuthan"
-
-    Confirmed on live data, where roughly a third of sampled records had a
-    Contact name that appears nowhere verbatim in the resume -- so the name was
-    not redacted at all, and sat in the page heading of the masked copy while
-    phone and email were blacked out.
-
-    Matches the entries as an ordered subsequence within a single line, letting
-    either side carry extra words, and redacts the whole span (a middle name
-    on the resume is part of the name, so covering it is correct). Requires at
-    least two entries to match: one alone would mask every occurrence of an
-    ordinary word for a candidate named Will, Rose or Mark.
-    """
-    seq = _name_sequence(name)
-    strong = [t for t, initial in seq if not initial]
-    if not strong:
-        return []
-
-    out: list[fitz.Rect] = _lone_token_rects(strong, layout) \
-        + _url_name_rects(strong, layout)
-    if len(seq) < 2:
-        return out
-
-    for line in layout.lines.values():
-        groups = [[g.casefold() for g in _word_groups(w[4])] for w in line]
-        n = len(line)
-        for start in range(n):
-            if not any(g in strong for g in groups[start]):
-                continue
-            nxt = matched = chars = gaps = 0
-            last = start
-            for j in range(start, n):
-                if not groups[j]:
-                    continue                       # punctuation-only word
-                hit = None
-                for k in range(nxt, len(seq)):
-                    token, initial = seq[k]
-                    if not initial and token in groups[j]:
-                        hit = k
-                        break
-                    # An initial is evidence only where it stands: directly
-                    # after a part that already matched, never on its own and
-                    # never across a gap.
-                    if initial and matched and not gaps \
-                            and _initial_matches(token, line[j][4]):
-                        hit = k
-                        break
-                if hit is not None:
-                    matched += 1
-                    chars += sum(len(g) for g in groups[j])
-                    nxt = hit + 1
-                    last = j
-                    gaps = 0
-                    if nxt >= len(seq):
-                        break
-                elif matched and gaps < _NAME_MAX_GAP:
-                    gaps += 1
-                elif matched:
-                    break
-            if matched >= 2 and chars >= _NAME_MIN_CHARS:
-                out.append(_clip_to_line(fitz.Rect(
-                    min(line[k][0] for k in range(start, last + 1)),
-                    min(line[k][1] for k in range(start, last + 1)),
-                    max(line[k][2] for k in range(start, last + 1)),
-                    max(line[k][3] for k in range(start, last + 1)),
-                ), (line[start][5], line[start][6]), layout))
-    return out
-
-
-def _matches_case(rect: fitz.Rect, layout: _Layout, needle: str) -> bool:
-    """Is the text under `rect` written the same way as `needle`?
-
-    Accepts the needle as-is or fully upper-cased, which is how a name appears
-    in a resume heading.
-    """
-    covered = []
-    for w in layout.near(rect):
-        wr = fitz.Rect(w[0], w[1], w[2], w[3])
-        inter = wr & rect
-        if inter.is_empty or inter.width <= 0:
-            continue
-        if inter.height < min(wr.height, rect.height) * 0.5:
-            continue
-        covered.append(w[4])
-    text = " ".join(covered).strip(" .,;:()[]-")
-    return text in (needle, needle.upper())
-
-
 # --- labels ---------------------------------------------------------------
 # A redaction that removes only the value leaves the row saying what it was.
 # Clients report that as a defect in its own right ("the emailid tag is also
@@ -604,7 +338,7 @@ def _matches_case(rect: fitz.Rect, layout: _Layout, needle: str) -> bool:
 # label is not reliably on the left:
 #
 #     Phone number: (+91) 98765 43210 (Mobile)      <- trails the value
-#     Name  :        Rahul Sharma                   <- leads it, tab-aligned
+#     Email  :       rahul@example.com              <- leads it, tab-aligned
 #     Email id:-rahul@example.com                   <- glued into the same word
 #     + 91-9876543210                               <- a sign left by itself
 
@@ -617,9 +351,9 @@ _LABEL_SEPS = r"\s.:\-–—#|/+()\[\]"
 #: Enumerating whole labels is how a list ends up missing "Contact No." because
 #: nobody thought of it. Mining the resumes for what actually sits next to a
 #: masked value turned up, among others: "Email ID:", "Mobile No. :", "Ph. No.",
-#: "E_mail Id :-", "EmailID", "FATHER'S NAME", "S/o Shree ...", "C/O: Late.",
-#: "Name: Mr. ...". What those have in common is not a phrase, it is a handful
-#: of parts in any order, joined by anything or nothing at all.
+#: "E_mail Id :-", "EmailID", "Father's Mobile No.". What those have in common
+#: is not a phrase, it is a handful of parts in any order, joined by anything
+#: or nothing at all.
 #:
 #: So a label is matched as a SEQUENCE of these (see _LABEL_PART below), which
 #: gets "Contact Number", "ContactNo", "Mobile-No.", "E_mail Id" and every
@@ -632,14 +366,10 @@ _LABEL_WORDS = (
     # the qualifier in front of it
     r"alt(?:\.|ernat(?:e|ive))?|second(?:ary)?|primary|personal|official|"
     r"office|work|home|res(?:idence|idential)?|permanent|current|present|"
-    r"name|candidate|applicant|self|"
-    # whose name it is. "FATHER'S NAME" and "S/o" label a name just as much as
-    # "Name" does, and both were being left on the page with the name gone.
+    r"candidate|applicant|self|"
+    # whose number it is: "Father's Mobile No.", "Parent Contact". (Name
+    # labels and honorifics are gone: the name is no longer masked.)
     r"father|mother|husband|wife|spouse|guardian|parent|son|daughter|"
-    r"[sdwc]\s*/\s*o|care\s*of|"
-    # the honorific between the label and the value -- "Name: Mr. <name>" left
-    # "Name: Mr." standing, because the walk stopped at a word it did not know.
-    r"mr|mrs|ms|miss|shri|sri|smt|late|dr|prof|"
     # the trailing noun
     r"id|ids|i\.?d\.?|address|addr|detail(?:s)?|info(?:rmation)?|"
     r"no|nos|num(?:ber)?"
@@ -683,7 +413,7 @@ _LABEL_CONNECTOR_RE = re.compile(
 #: rect starts partway through the word and "id:-" stays on the masked page.
 _GLUED_LABEL_RE = re.compile(
     r"^(?:e[-\s]?mail|email|mail|mob(?:ile)?|ph(?:one)?|tel|contact|whats?app|"
-    r"name|id|no|alt|res)?"
+    r"id|no|alt|res)?"
     r"[\s.:\-–—#|()+]+",
     re.I,
 )
@@ -985,30 +715,21 @@ def _absorb_labels(rect: fitz.Rect, layout: _Layout) -> fitz.Rect:
 
 def _rects_for(page: fitz.Page, s: str, layout: _Layout) -> list[fitz.Rect]:
     """Every region of `page` that should be redacted for the PII string `s`,
-    using the matching strategy its kind calls for."""
+    using the matching strategy its kind calls for.
+
+    Only phones and emails are masked. Anything else -- a candidate's name,
+    which callers such as the Salesforce button may still send -- is left on
+    the page: the name is no longer masked.
+    """
     kind = pii.classify(s)
     if kind == pii.PHONE:
         found = _phone_rects(s, layout)
     elif kind == pii.EMAIL:
         found = [_clip_literal(r, layout) for r in page.search_for(s)]
     else:
-        # Name (and any literal a caller passed explicitly): whole-word only.
-        if len(s.strip()) < 3:
-            return []  # too short to match safely — would hit half the page
-        literal = [_clip_literal(r, layout) for r in page.search_for(s)
-                   if _covers_whole_words(r, layout)]
-        if len(_name_token_list(s)) < 2:
-            # A one-token name has to match case as written. search_for() is
-            # case-insensitive, so a candidate actually named Will, Rose or Mark
-            # otherwise has every ordinary occurrence of that word redacted out of
-            # their own resume ("I will manage delivery" -> "I  manage delivery").
-            # A heading still matches, as "Will" or as "WILL".
-            literal = [r for r in literal if _matches_case(r, layout, s)]
-        # Union, not either/or: a resume can print the name verbatim in one
-        # place and with an extra middle name in another, and both have to go.
-        found = _dedupe_rects(literal + _name_rects(s, layout))
-    # The label goes with the value, whatever kind it was: a "Candidate Name:"
-    # left standing over white space is the defect, not the fix.
+        return []
+    # The label goes with the value: an "Email ID:" left standing over white
+    # space is the defect, not the fix.
     return [_absorb_labels(r, layout) for r in found]
 
 
@@ -1092,7 +813,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
     """True-redact PII strings, then overlay watermark.
 
     Two passes, in this order and for a reason. The first removes the values
-    it was handed -- the Contact record's name/phone/email. The second
+    it was handed -- the Contact record's phone/email. The second
     (app/residual.py) then reads the page as it now stands and removes the
     phone numbers and addresses still on it: the alternate mobile that only
     ever existed in the resume body, and the address whose PDF word boxes
@@ -1102,7 +823,7 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
 
     Args:
         pdf_bytes: Raw resume PDF bytes.
-        mask_strings: Exact strings to redact (name, phone, email from parser).
+        mask_strings: Phones and emails to redact. Anything else (a name) is ignored.
         watermark_png: Client watermark image bytes (PNG/JPEG). Centered on every page.
         watermark_text: Fallback text watermark if no image provided.
         residual_sweep: Run the second pass. Off only for measuring what the
@@ -1177,9 +898,8 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         elif watermark_text:
             _watermark_text(page, watermark_text)
 
-    # Word writes the candidate's name into /Title and /Author from the
-    # original filename ("Rahul Sharma CV 2024.docx"), and it survives
-    # redaction untouched -- it is not on any page.
+    # A phone or email in the document metadata survives redaction untouched
+    # -- it is not on any page.
     if residual_sweep:
         residual.scrub_metadata(doc)
 

@@ -118,9 +118,11 @@ def _residual_report(masked: bytes) -> dict[str, list[str]]:
             uri = link.get("uri") or ""
             if uri.lower().startswith(("mailto:", "tel:")) or pii.scan_residual(uri):
                 found["links"].append(shape(uri))
+    # Metadata is no longer scrubbed (it carries the name, which is no longer
+    # masked) -- only a phone or email in it is a leak.
     meta = doc.metadata or {}
     for key in ("title", "author", "subject", "keywords"):
-        if meta.get(key):
+        if meta.get(key) and pii.scan_residual(meta[key]):
             found["metadata"].append(f"{key}: {shape(meta[key])}")
     doc.close()
     return found

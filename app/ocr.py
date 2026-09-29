@@ -4,7 +4,7 @@ Some resumes arrive as a PDF whose every page is a single image -- a Canva
 export saved as JPEG, a phone photo, a scan. There is no text layer, so every
 search the masking pipeline makes comes back empty: confirmed on JA-9635 and
 JA-9703, and on about 1% of recent applicants, the masked copy was uploaded
-with "ok" and the candidate's name, phone, email and address all still on it.
+with "ok" and the candidate's phone, email and address all still on it.
 
 This gives such a page a text layer. Tesseract reads the page image, and each
 word it finds is written back onto the page as INVISIBLE text sitting exactly
@@ -34,7 +34,7 @@ tests/ocr_benchmark.py):
       - a light median filter takes out JPEG ringing before Tesseract
         binarises.
 
-  * Snapping to known values. The Contact record says what the name, phone
+  * Snapping to known values. The Contact record says what the phone
     and email ARE; OCR only has to find where. A reading one or two
     characters off a known value ("gmaiI.com", one wrong digit) is rewritten
     to the value, so the exact matching in app/mask.py still finds it.
@@ -249,8 +249,10 @@ def _lev(a: str, b: str, cap: int = 3) -> int:
     return prev[-1]
 
 
-def _known(values) -> tuple[list[str], list[str], list[str]]:
-    emails, phones, names = [], [], []
+def _known(values) -> tuple[list[str], list[str]]:
+    """The emails and phones among the known values. Anything else (a name)
+    is ignored -- the name is no longer masked."""
+    emails, phones = [], []
     for v in values or ():
         v = str(v).strip()
         if "@" in v:
@@ -260,12 +262,10 @@ def _known(values) -> tuple[list[str], list[str], list[str]]:
                 d = re.sub(r"\D", "", part)
                 if len(d) >= 10:
                     phones.append(d[-10:])
-        else:
-            names += [t for t in re.findall(r"[A-Za-z]+", v) if len(t) >= 5]
-    return emails, phones, names
+    return emails, phones
 
 
-def _snap(line: list[tuple], emails, phones, names) -> list[tuple]:
+def _snap(line: list[tuple], emails, phones) -> list[tuple]:
     """Rewrite readings that are a character or two off a known value."""
     line = list(line)
     for e in emails:                               # 1-3 adjacent words -> one email
@@ -296,12 +296,6 @@ def _snap(line: list[tuple], emails, phones, names) -> list[tuple]:
                 line = [w for i, w in enumerate(line) if i not in idx[1:]]
                 line[idx[0]] = merged
                 break
-    for n in names:                                # one letter off, same case style
-        for i, w in enumerate(line):
-            core = re.sub(r"[^A-Za-z]", "", w[0])
-            if len(core) >= 5 and core.lower() != n.lower() and _lev(core.lower(), n.lower(), 1) <= 1:
-                fixed = n.upper() if core.isupper() else n
-                line[i] = (w[0].replace(core, fixed), *w[1:])
     return line
 
 
@@ -400,7 +394,7 @@ def add_text_layer(doc: fitz.Document, known=()) -> tuple[int, int]:
         logger.warning("%d image-only page(s) but OCR is unavailable (tesseract=%r, cv2=%s)",
                        needed, TESSERACT, cv2 is not None)
         return needed, 0
-    emails, phones, names = _known(known)
+    emails, phones = _known(known)
     renders = [_render(p) for p in targets]
     done = 0
     with ThreadPoolExecutor(min(4, max(1, len(renders)))) as pool:
@@ -408,7 +402,7 @@ def add_text_layer(doc: fitz.Document, known=()) -> tuple[int, int]:
     for page, (_, zoom), words in zip(targets, renders, results):
         if not words:
             continue
-        lines = [_snap(ln, emails, phones, names) for ln in _lines(words)]
+        lines = [_snap(ln, emails, phones) for ln in _lines(words)]
         # Read is read, even if every word it found was already real text.
         _write_layer(page, _drop_native(lines, page, zoom), zoom)
         done += 1

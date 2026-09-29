@@ -1,7 +1,7 @@
 """Second pass -- sweep the already-redacted page for PII that got through.
 
 The first pass (mask.py) removes the values it was *handed*: the Salesforce
-Contact's name/phone/email, plus whatever server.detect_pii() recognised in
+Contact's phone/email, plus whatever server.detect_pii() recognised in
 the resume text. That is a closed list, and three things routinely fall
 outside it:
 
@@ -20,12 +20,10 @@ off the word boxes rather than off a search string -- which is what fixes the
 third case, since a rect can be assembled from several words.
 
 Two non-text leaks are handled here as well, because they are the same defect
-(PII still in the delivered file) and neither is visible on the page:
-
-  * a mailto:/tel: link annotation, whose URI keeps the address verbatim
-    after the glyphs under it have been deleted;
-  * the document Info dictionary, where Word writes /Author and /Title from
-    the original filename -- "Rahul Sharma CV 2024.docx".
+(PII still in the delivered file) and neither is visible on the page: a
+mailto:/tel: link annotation, whose URI keeps the address verbatim after the
+glyphs under it have been deleted, and a phone or email in the document
+metadata.
 
 Geometry stays in mask.py. This module reports where a hit is and which text
 line it belongs to; the caller clips it to that line and absorbs the label in
@@ -70,13 +68,7 @@ def _line_layout(words: list) -> list[tuple[tuple[int, int], str, list]]:
 
 def find_residual_rects(page: fitz.Page,
                         words: list | None = None) -> list[tuple[fitz.Rect, tuple[int, int]]]:
-    """Every (rect, line_key) still holding a phone number or email address.
-
-    Names are deliberately not swept for. There is no way to tell a
-    candidate's name from any other capitalised words on the page, so a name
-    only ever comes from the Contact record -- guessing at one here would
-    blank out employers and universities.
-    """
+    """Every (rect, line_key) still holding a phone number or email address."""
     if words is None:
         words = page.get_text("words")
 
@@ -111,26 +103,32 @@ def scrub_links(page: fitz.Page) -> int:
     return removed
 
 
-#: Info-dictionary keys that carry candidate PII. Word fills /title and
-#: /author from the document properties and the original filename, so a
-#: masked resume routinely shipped with "Rahul Sharma" in its title bar.
-#: /producer and /creator name the software and are left alone.
+
+#: Info-dictionary keys that can carry contact details. Word fills /title and
+#: /author from the document properties and the original filename; /subject
+#: and /keywords are free text. /producer and /creator name the software.
 _PII_METADATA_KEYS = ("title", "author", "subject", "keywords")
 
 
 def scrub_metadata(doc: fitz.Document) -> int:
-    """Blank the PII-bearing document metadata. Returns the fields cleared."""
+    """Blank the metadata fields holding a phone number or email address.
+
+    Only those: the candidate's name, which Word routinely writes into /title
+    and /author from the filename, is no longer masked and is left alone.
+    Returns the fields cleared.
+    """
     meta = doc.metadata or {}
-    dirty = [k for k in _PII_METADATA_KEYS if meta.get(k)]
+    dirty = [k for k in _PII_METADATA_KEYS
+             if meta.get(k) and pii.scan_residual(str(meta[k]))]
     if dirty:
         doc.set_metadata({**{k: v for k, v in meta.items()
                              if k not in ("format", "encryption")},
-                          **{k: "" for k in _PII_METADATA_KEYS}})
-    # XMP carries its own copy of the same fields, and a reader that finds
-    # both prefers XMP -- clearing only the Info dictionary leaves the name
-    # in the file.
-    try:
-        doc.del_xml_metadata()
-    except Exception:
-        pass
+                          **{k: "" for k in dirty}})
+        # XMP carries its own copy of the same fields, and a reader that finds
+        # both prefers XMP -- clearing only the Info dictionary leaves the
+        # value in the file.
+        try:
+            doc.del_xml_metadata()
+        except Exception:
+            pass
     return len(dirty)

@@ -5,7 +5,8 @@ recruiting team's **"Generate Masking"** button.
 
 Given a **Job Applicant Id**, it:
 1. pulls the resume PDF from Salesforce (`simple-salesforce`, SOQL on `ContentVersion`),
-2. **true-redacts** the candidate PII — name / phone / email, and nothing else
+2. **true-redacts** the candidate's phone numbers and email addresses, and nothing else — the
+   candidate's **name is not masked** (it was, until 2026-09-29; a name sent in `mask_strings` is ignored)
    (glyphs deleted, not covered; the region is filled **white**, so the masked copy
    reads as blank space rather than a page of censor bars),
 3. stamps a **centered watermark** on every page,
@@ -48,9 +49,9 @@ under that client.
 | `app/worker.py` | The same consumer pool as a container of its own — `python -m app.worker`, same image, no HTTP server. Lets the API stop competing with masking for its own CPU (`MASK_RUN_WORKERS=0`) and lets the drain rate be scaled by adding replicas. The cap is a lease in Redis, so every container shares the one `MASK_MAX_CONCURRENT`. |
 | `app/pii.py` | PII detection & classification. Strict, precision-first phone detection (a digit run must carry positive evidence of being a phone), so employment date ranges, credential ids, ISO/IEEE/RFC numbers, versions, percentages and PIN codes are never reported as PII. Also holds the **second-pass scanners** (`scan_phones`/`scan_emails`), which decide from the Indian numbering plan rather than from evidence: ten national digits starting 6-9 is a mobile, so `91 9812345678` and `09812345678` are caught without a label, while Aadhaar/UAN/account numbers and ten-digit magnitudes are not. |
 | `app/residual.py` | **Second pass.** Runs on each page *after* the first pass has applied its redactions, and removes the phone numbers and addresses still on it — the alternate mobile that exists only in the resume body, and the address whose PDF word boxes `search_for()` could never match. Also strips `mailto:`/`tel:` link annotations (whose URI survives redaction) and the `/Title` + `/Author` metadata Word fills from the original filename. |
-| `app/mask.py` | Masking core — PyMuPDF true-redact (white fill) + centered watermark. Per-kind matching: email exact, phone by digit-equivalence, name whole-word only. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
+| `app/mask.py` | Masking core — PyMuPDF true-redact (white fill) + centered watermark. Per-kind matching: email exact, phone by digit-equivalence. Names are not masked. `mask_pdf` (path) + `mask_pdf_bytes` (in-memory, used by the service). PDF only. |
 | `app/ocr.py` | OCR for **image-only resumes**. Pages that are pictures get an invisible text layer from Tesseract (two passes — layout mode on the page, sparse mode on a cleaned copy with dark panels inverted and the background flattened by morphological closing — merged by confidence), with readings a character off the Contact's values snapped to them. The page's own typed text always wins over an OCR copy of it. Needs `tesseract-ocr` (in the Dockerfile). |
-| `app/template_resume.py` | For a Job Applicant with **no resume file at all**: builds one from the Contact record in the house template (the `Arvind_EMS-SME.pdf` layout), which `/mask` then watermarks and uploads exactly like a real one. Never reads name/email/phone; invents nothing (experience is only the current company, designation and years on record). Not used when files exist but are unreadable (e.g. a scanned image) — that is the candidate's real resume. |
+| `app/template_resume.py` | For a Job Applicant with **no resume file at all**: builds one from the Contact record in the house template (the `Arvind_EMS-SME.pdf` layout), which `/mask` then watermarks and uploads exactly like a real one. Never reads email/phone; invents nothing (experience is only the current company, designation and years on record). Not used when files exist but are unreadable (e.g. a scanned image) — that is the candidate's real resume. |
 | `app/docx_convert.py` | `.docx`/`.doc` → PDF via headless LibreOffice (`soffice`, installed in the Dockerfile) — real candidate resumes on this org are legacy Word attachments, not PDFs, so this runs before `app/mask.py` whenever the fetched resume isn't already a PDF. |
 | `app/sf_client.py` | Salesforce wrapper: `connect()`, `with_session()` (401-retry wrapper), `fetch_resume_pdf(id)` (checks modern Files + legacy Attachments, on the Job Applicant and its related Contact — returns `(bytes, extension)`), `upload_masked_pdf(id, bytes, filename)`. Creds from ENV or the Postgres-backed override (`register_default_credentials`). |
 | `app/server.py` | FastAPI app: `POST /mask`, `POST /mask/batch`, `POST /mask/inline`, `GET /health`, `detect_pii()` fallback. |
@@ -152,7 +153,7 @@ X-API-Key: <MASK_API_KEY, if you've set one — see below>
 (`SCSCHAMPS__Job_Applicant__c` is the RecruitChamp managed-package object — confirmed against the
 live org. Adjust if a different client org uses a different namespace.)
 
-Optionally include `"mask_strings": [...]` (the exact name/phone/email values from the on-prem resume
+Optionally include `"mask_strings": [...]` (the exact phone/email values from the on-prem resume
 parser — preferred, most accurate) and/or `"masking_profile": "<id>"`.
 
 **Watermark, set up client-side in Salesforce:** the client configures their logo as a File in Salesforce
@@ -271,7 +272,7 @@ Job list (per client) ──click Job Id──▶ joined view: job requirements 
 Preferred: the caller passes `mask_strings` (the on-prem parser's exact output → no missed chars, no
 over-masking). For `/mask` and `/mask/batch` (which have a live Salesforce session), the fallback when
 `mask_strings` is omitted is now two-layered: `sf_client.fetch_contact_pii_strings()` pulls the
-candidate's structured Name/Phone/Email straight from the related Contact record, merged with
+candidate's structured Phone/Email straight from the related Contact record, merged with
 `detect_pii()`'s regex email/phone scan of the PDF text layer. The Contact-field lookup exists because
 regex-on-text alone can silently miss real PII — confirmed on real candidate data: resumes built from
 Microsoft's built-in "Contoso" template render the phone/email via a Word content control that extracts
@@ -282,8 +283,8 @@ pass `mask_strings` explicitly there for full accuracy.
 **Scanned / image-only resumes** (a PDF whose pages are pictures — about 1% of recent applicants) are
 read with Tesseract first (`app/ocr.py`): the words go back onto the page as an invisible text layer,
 so everything below works on them unchanged, and redaction blanks the image pixels themselves. If a
-scan can't be read, or OCR runs but nothing is found to redact, `/mask` returns an error asking for a
-manual mask instead of uploading it — which is how such resumes used to go out unmasked with `"ok"`.
+scan can't be read, `/mask` returns an error asking for a manual mask instead of uploading it — which
+is how such resumes used to go out unmasked with `"ok"`.
 The response's `ocr_pages` says how many pages were read this way. Benchmark:
 `tests/ocr_benchmark.py` (run in the service image).
 
@@ -294,9 +295,7 @@ alternate mobile typed into the resume and nowhere else, a personal address alon
 an address whose PDF word boxes `page.search_for()` cannot match because the file kerned it apart.
 Phone decisions there come from the numbering plan rather than from formatting, so `91 9812345678`,
 `09812345678` and `0091 9876543210` are all recognised without a label, while Aadhaar, UAN, account
-numbers, timestamps and round magnitudes are not. Names are deliberately **not** swept for — there is
-no way to tell a candidate's name from any other capitalised words on a page, so a name still only ever
-comes from the Contact record.
+numbers, timestamps and round magnitudes are not.
 
 Removing a value is only half of it. What the reader sees is the **row** it sat in, and a row still
 reading `Phone number:` … `(Mobile)` or `Email ID:` over white space has told them exactly what was
@@ -305,7 +304,5 @@ in front of the value, behind it, glued into its word box, or left as a lone `+`
 the first word that is not part of a label, and what stopped it decides whether to commit: a field
 label is bounded by the edge of its line, by another field's value, or by a gap — never by lowercase
 prose, so `In case of any problem, please contact at: <address>` keeps its sentence while the address
-goes. A name the Contact abbreviates to an initial (`Karthik V` against a resume printing
-`Karthik Velayuthan`) is matched through the initial, and a profile link that spells the name out
-(`linkedin.com/in/karthikvelayuthan`) is redacted with it — a blank contact block above a link that
-still names the candidate is not anonymised.
+goes. A phone or email in the PDF's metadata is cleared too; the name Word copies into its Title and
+Author from the filename is left, like the name on the page.
