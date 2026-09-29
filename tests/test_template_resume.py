@@ -33,8 +33,20 @@ def test_renders_only_what_the_record_holds():
     assert "CAREER DETAILS" not in text and "Nationality" not in text
 
 
-def test_name_email_phone_are_never_read():
-    assert not {"Name", "Email", "PhoneNumber__c"} & set(template_resume.PROFILE_FIELDS)
+def test_email_and_phone_are_never_read():
+    assert not {"Email", "PhoneNumber__c", "Phone", "MobilePhone"} & set(template_resume.PROFILE_FIELDS)
+
+
+def test_name_heads_the_page():
+    text = _text(template_resume.render({**PROFILE, "Name": "Suraj Kumar"}))
+    assert text.lstrip().startswith("SURAJ KUMAR")
+    assert "CANDIDATE PROFILE" not in text
+    # No name on the record: the generic heading, never an empty one.
+    assert "CANDIDATE PROFILE" in _text(template_resume.render(PROFILE))
+
+
+def test_a_name_alone_is_not_enough_to_build_from():
+    assert not template_resume.has_enough({"Name": "Suraj Kumar"})
 
 
 def test_personal_details_alone_are_not_enough():
@@ -51,7 +63,8 @@ def test_mask_builds_template_when_no_resume(monkeypatch):
 
     monkeypatch.setattr(server.sf_client, "fetch_resume_pdf", no_resume)
     monkeypatch.setattr(server.sf_client, "resolve_contact_id", lambda jaid, sf=None: None)
-    monkeypatch.setattr(server.sf_client, "fetch_contact_profile", lambda jaid, fields, sf=None: PROFILE)
+    monkeypatch.setattr(server.sf_client, "fetch_contact_profile",
+                        lambda jaid, fields, sf=None: {**PROFILE, "Name": "Suraj Kumar"})
     monkeypatch.setattr(server.sf_client, "masked_file_url", lambda cvid, sf=None: None)
     # Same watermark as any masked resume: the client's logo, stamped centred.
     logo = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 40), False)
@@ -59,11 +72,14 @@ def test_mask_builds_template_when_no_resume(monkeypatch):
     monkeypatch.setattr(server.sf_client, "fetch_watermark_png",
                         lambda account_id=None, sf=None: logo.tobytes("png"))
 
-    body = TestClient(server.app).post("/mask", json={"job_applicant_id": "a0X000000000001"}).json()
+    # Even with the name sent for masking, as the Apex did: it stays.
+    body = TestClient(server.app).post("/mask", json={"job_applicant_id": "a0X000000000001",
+                                                      "mask_strings": ["Suraj Kumar"]}).json()
     assert body["status"] == "ok", body
     assert body["generated_from_template"] is True
     assert body["watermark_used"] == "image:global"
     assert "Testing Engineer" in _text(captured["pdf_bytes"])
+    assert "SURAJ KUMAR" in _text(captured["pdf_bytes"]), "the name was masked off the template"
     page = fitz.open(stream=captured["pdf_bytes"], filetype="pdf")[0]
     assert page.get_images(), "watermark not stamped"
 

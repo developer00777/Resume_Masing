@@ -15,10 +15,11 @@ Two rules shape everything here:
     current company, designation and years the record holds -- no bullets, no
     projects, no employers the record does not name.
 
-  * The name, email and phone are never read. The output is always masked, so
-    they are not in PROFILE_FIELDS at all and cannot end up on the page. The
-    masking pass run over the result afterwards is a safety net for the free
-    text fields (a phone typed into Educational_Details__c), not the defence.
+  * The email and phone are never read. They are always masked, so they are
+    not in PROFILE_FIELDS at all and cannot end up on the page. The masking
+    pass run over the result afterwards is a safety net for the free text
+    fields (a phone typed into Educational_Details__c), not the defence. The
+    name is no longer masked, so it heads the page, as on a real resume.
 """
 from __future__ import annotations
 
@@ -29,9 +30,10 @@ import re
 
 import fitz
 
-#: Contact fields read for the template, by API name. The name/email/phone
+#: Contact fields read for the template, by API name. The email and phone
 #: fields are deliberately absent -- see the module docstring.
 PROFILE_FIELDS = (
+    "Name",
     "CurrentDesignation__c", "CurrentCompany__c",
     "worked_experience__c", "Years_of_Experience__c",
     "Current_Location__c",
@@ -166,7 +168,8 @@ def build_html(profile: dict) -> str:
     yoe = _first(profile, _YOE)
     primary, other = _skills(profile)
 
-    out = ['<p class="title">CANDIDATE PROFILE</p>']
+    name = _text(profile.get("Name"))
+    out = [f'<p class="title">{_e(name.upper()) if name else "CANDIDATE PROFILE"}</p>']
     if designation:
         out.append(f'<p class="subtitle">{_e(designation)}</p>')
     meta = [x for x in (location, f"{_years(yoe)} experience" if yoe else "") if x]
