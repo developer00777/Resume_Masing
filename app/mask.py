@@ -756,9 +756,20 @@ _CORNER_MARK_BOTTOM = 0.3
 _CORNER_MARK_MAX_AREA = 0.2
 
 
+#: A word counts as written ON an image only when at least this much of it
+#: lies inside the image's box. A word merely brushing the edge of a logo's
+#: box -- its transparent margin, typically -- is beside the logo, not on it.
+_WORD_ON_IMAGE = 0.5
+
+
 def _words_over(box: fitz.Rect, layout: _Layout) -> bool:
     """Is anything written on top of `box`?"""
-    return any(fitz.Rect(w[:4]).intersects(box) for w in layout.words)
+    for w in layout.words:
+        wr = fitz.Rect(w[:4])
+        area = wr.get_area()
+        if area and (wr & box).get_area() >= _WORD_ON_IMAGE * area:
+            return True
+    return False
 
 
 def _corner_image_rects(page: fitz.Page,
@@ -777,11 +788,17 @@ def _corner_image_rects(page: fitz.Page,
     Three things keep this off content. The corner bounds above, which is the
     main one. Size, so a scanned resume -- one page-sized image, and the whole
     document -- survives untouched. And clear space: an image with words
-    printed over it is not standalone branding, and cannot be redacted anyway,
-    because apply_redactions() deletes every glyph that merely TOUCHES the
-    annotation. Such an image is left exactly as it is; deleting the image
-    instead is worse, not better, since a resume that whites out a stale value
-    with one would have the old text underneath revealed.
+    printed over it is not standalone branding. Such an image is left exactly
+    as it is: removing it is worse, not better, since a resume that whites out
+    a stale value with one would have the old text underneath revealed. Words
+    that only brush the image's edge do not count (see _words_over), and this
+    runs after both redaction passes, so neither does PII that sat under the
+    logo -- JA-9669 kept its agency logo because the candidate's own phone
+    number ran under its corner.
+
+    These rects are removed pixels-only (_remove_images), never through the
+    normal redaction, which deletes every glyph that merely TOUCHES the
+    annotation and would take the heading beside the logo with it.
     """
     rect = page.rect
     if rect.is_empty:
@@ -804,6 +821,18 @@ def _corner_image_rects(page: fitz.Page,
             continue
         out.append(box)
     return out
+
+
+def _remove_images(page: fitz.Page, rects: list[fitz.Rect]) -> None:
+    """Blank the image pixels under `rects` and nothing else: text and vector
+    art stay, and no fill is painted over them."""
+    if not rects:
+        return
+    for r in rects:
+        page.add_redact_annot(r, fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                          graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                          text=fitz.PDF_REDACT_TEXT_NONE)
 
 
 def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
@@ -853,9 +882,6 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
         page_rects: list[fitz.Rect] = []
         for s in wanted:
             page_rects.extend(_rects_for(page, s, layout))
-        # Whatever branding or photograph the resume already carries in its
-        # top corner goes too -- see _corner_image_rects.
-        page_rects.extend(_corner_image_rects(page, layout))
 
         for rect in _bridge_separators(_dedupe_rects(page_rects), layout):
             page.add_redact_annot(rect, fill=REDACT_FILL)
@@ -881,6 +907,14 @@ def mask_pdf_bytes(pdf_bytes: bytes, mask_strings: list[str],
             # The glyphs under a mailto: link are gone by now; the link's own
             # URI still holds the address until this runs.
             residual.scrub_links(page)
+
+        # Whatever branding or photograph the resume already carries in its
+        # top corner goes too -- see _corner_image_rects. Last, against the
+        # page as it now stands, so PII that ran under the logo (already
+        # redacted) no longer shields it.
+        corner = _corner_image_rects(page, _Layout(page.get_text("words"), _mark_rects(page)))
+        _remove_images(page, corner)
+        hits += len(corner)
 
         # Watermark only when the client actually has one. No stand-in text:
         # a "CONFIDENTIAL" default was being stamped on every masked resume

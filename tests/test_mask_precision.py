@@ -682,6 +682,32 @@ def test_branding_in_the_top_corner_is_removed():
     assert "Acme Corp" in text, "the page content was damaged"
 
 
+def test_corner_logo_goes_even_with_the_phone_running_under_it():
+    """JA-9669: the agency logo stayed on the masked copy because the
+    candidate's phone number ran under its lower-left corner, and any word
+    touching the image counted as text printed on it. The phone is redacted
+    anyway, and a heading merely beside the logo's box is not on it either --
+    the logo must go, and the heading must stay."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_image(fitz.Rect(444, 14, 522, 100), stream=_logo_png(100, 110))
+    page.insert_text((412, 100), "8827182941", fontsize=11)        # a third under the logo
+    page.insert_text((430, 115), "Associate for PS", fontsize=11)  # just below, touching its box
+    page.insert_text((56, 300), "Acme Corp 2019 - 2023", fontsize=11)
+    pdf = doc.tobytes()
+    doc.close()
+
+    masked, _ = mask.mask_pdf_bytes(pdf, ["8827182941"], watermark_text="")
+    doc = fitz.open(stream=masked, filetype="pdf")
+    page = doc[0]
+    images = page.get_image_info()
+    text = page.get_text()
+    doc.close()
+    assert not images, "the corner logo survived"
+    assert "8827182941" not in text
+    assert "Associate for PS" in text and "Acme Corp" in text, "text beside the logo was destroyed"
+
+
 def test_the_education_table_is_not_branding():
     """The reported regression: "now its masking dates also for no reason".
 
